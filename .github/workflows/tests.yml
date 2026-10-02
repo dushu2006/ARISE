@@ -1,0 +1,73 @@
+name: ARISE validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.11', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install backend and test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run backend lint
+        run: python -m ruff check src/arise tests
+      - name: Run backend tests
+        run: python -m pytest -q
+      - name: Run isolated simulator demo
+        run: python -m arise demo
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Verify development API tokens are excluded from production assets
+        run: |
+          canary='ARISE_CI_CANARY_0123456789abcdef0123456789abcdef'
+          VITE_API_TOKEN="$canary" npm run build
+          if grep -R -F "$canary" dist; then
+            echo "VITE_API_TOKEN leaked into production assets" >&2
+            exit 1
+          fi
+
+  windows-tauri-compile:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run build
+      - name: Compile Tauri shell on Windows
+        run: cargo check --manifest-path src-tauri/Cargo.toml

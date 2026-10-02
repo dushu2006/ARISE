@@ -195,9 +195,9 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#   and can be added to the global gitignore or merged into this file. However, if you prefer,
 #   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 # Temporary file for partial code execution
@@ -216,3 +216,37 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ARISE local state (never commit databases, task data, or event logs)
+.arise/
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite-journal
+*.sqlite3-journal
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+api.token
+*.token
+*.instance.lock
+
+# JavaScript / desktop build output
+node_modules/
+frontend/node_modules/
+frontend/dist/
+desktop/src-tauri/target/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+.desktop-build/
+
+# Local configuration, runtime databases, and generated credentials
+.env
+.env.*
+!.env.example
+data/
+*.pem
+*.p12
+*.pfx
