@@ -496,6 +496,7 @@
 - [x] COMPLETE — Replay suites pass (pytest replay/failure tests pass; harness replay probes ran under host guard).
 - [x] COMPLETE — Voice harness runs correctly and reports `ENVIRONMENT-LIMITED`/`BLOCKED` honestly on Linux (21 checks; no device/provider access).
 - [x] COMPLETE — No real-only claims made from replay tests (evidence labels and limitations remain explicit).
+- [-] IN PROGRESS — Resolve latest GitHub Actions failures: Ubuntu backend (3.11/3.12) and frontend pass, but Windows backend (3.11/3.12) and Windows Tauri compile fail. GitHub log retrieval hits EOF on Actions log storage, so the failure causes are not yet verified.
 - [-] IN PROGRESS — No fake success responses remain in production paths.
 - [-] IN PROGRESS — No accidental debug code remains.
 - [-] IN PROGRESS — No obsolete placeholders remain in production paths.
@@ -518,5 +519,5 @@
 - [-] IN PROGRESS — Implement every software-remediable production gap found by that search without removing legitimate tests; remaining gaps are enumerated in this checklist and `docs/forensic-audit.md`.
 
 ## Required final report
-- [x] COMPLETE — Re-opened and recounted the full checklist for this report: 460 total; 71 COMPLETE, 283 IN PROGRESS, 93 NOT STARTED, 8 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two closed final-report rows).
+- [x] COMPLETE — Re-opened and recounted the full checklist for this report after recording the failing Windows CI: 461 total; 71 COMPLETE, 284 IN PROGRESS, 93 NOT STARTED, 8 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two closed final-report rows).
 - [x] COMPLETE — Final report records changes/defects, exact test totals, REAL vs FAKE/REPLAY evidence, environment/external setup needs, Git status, and the commit/push/PR outcome. The user's later PR request authorizes committing and pushing this branch despite the earlier no-commit/no-push instruction.
