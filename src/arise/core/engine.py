@@ -22,6 +22,7 @@ from arise.core.contracts import (
     canonical_json,
     thaw_json,
     utc_now,
+    validate_safe_token,
 )
 from arise.core.events import EventEnvelope, EventSeverity, EventStore
 from arise.core.models import (
@@ -177,6 +178,7 @@ class TaskEngine:
         *,
         principal_id: str,
         session_id: str | None = None,
+        parent_task_id: str | None = None,
     ) -> TaskRecord:
         if self._closed:
             raise RuntimeError("task engine is not accepting requests")
@@ -192,13 +194,14 @@ class TaskEngine:
                 "session_id": chosen_session,
             }
         )
+        fingerprint_payload = safe_request.model_dump(
+            mode="json",
+            exclude={"request_id", "session_id", "received_at"},
+        )
+        if parent_task_id is not None:
+            fingerprint_payload["parent_task_id"] = parent_task_id
         request_fingerprint = hashlib.sha256(
-            canonical_json(
-                safe_request.model_dump(
-                    mode="json",
-                    exclude={"request_id", "session_id", "received_at"},
-                )
-            ).encode("utf-8")
+            canonical_json(fingerprint_payload).encode("utf-8")
         ).hexdigest()
         existing = self.tasks.get_by_request_id(
             principal_id=principal,
@@ -210,6 +213,28 @@ class TaskEngine:
             if existing.status is TaskStatus.QUEUED and existing.task_id not in self._requests:
                 self._schedule_accepted(existing, safe_request)
             return existing
+        if parent_task_id is not None:
+            validate_safe_token(parent_task_id, "parent_task_id")
+            parent = self.tasks.get(parent_task_id)
+            if parent is None:
+                raise TaskNotFoundError(parent_task_id)
+            parent_owner = (
+                parent.authorization.principal_id if parent.authorization is not None else None
+            )
+            if parent_owner != principal:
+                raise PermissionError("parent task does not belong to the authenticated principal")
+            if parent.session_id != chosen_session:
+                raise ValueError("child task must remain in the parent conversation session")
+            if parent.status in {
+                TaskStatus.COMPLETED,
+                TaskStatus.CANCELLED,
+                TaskStatus.FAILED,
+                TaskStatus.UNKNOWN,
+                TaskStatus.INTERRUPTED,
+                TaskStatus.BLOCKED,
+                TaskStatus.PARTIALLY_COMPLETED,
+            }:
+                raise ValueError("a terminal parent task cannot accept new child tasks")
         if self._queue.full():
             raise TaskQueueFull("the task queue is full; retry after current work completes")
         authority = AuthorizationContext(
@@ -223,12 +248,11 @@ class TaskEngine:
             authorization=authority,
             request_id=request.request_id,
             session_id=chosen_session,
+            parent_task_id=parent_task_id,
             correlation_id=request.request_id,
         )
         task.transition_to(TaskStatus.QUEUED, reason="Accepted and queued for planning.")
-        task, _ = self.tasks.create_or_get(
-            task, request_fingerprint=request_fingerprint
-        )
+        task, _ = self.tasks.create_or_get(task, request_fingerprint=request_fingerprint)
         if task.status is TaskStatus.QUEUED and task.task_id not in self._requests:
             self._schedule_accepted(task, safe_request)
         return self.tasks.get(task.task_id) or task
@@ -312,8 +336,8 @@ class TaskEngine:
             and task_id in self._clarification_tasks
         )
 
-    def list_tasks(self, *, limit: int = 100) -> list[TaskRecord]:
-        return self.tasks.list_recent(limit=limit)
+    def list_tasks(self, *, principal_id: str, limit: int = 100) -> list[TaskRecord]:
+        return self.tasks.list_for_principal(principal_id=principal_id, limit=limit)
 
     def pending_confirmations(self, task_id: str) -> tuple[ConfirmationRequest, ...]:
         now = utc_now()
@@ -348,6 +372,27 @@ class TaskEngine:
             if confirmation.task_id == task_id and confirmation_id in self._pending_confirmations
         )
 
+    def _require_pending_confirmation(
+        self, *, task_id: str, confirmation_id: str, approved_by: str
+    ) -> tuple[tuple[str, str, str], ConfirmationRequest]:
+        self.pending_confirmations(task_id)
+        pending = self._pending_confirmations.get(confirmation_id)
+        confirmation = self._confirmation_requests.get(confirmation_id)
+        if (
+            pending is None
+            or confirmation is None
+            or confirmation.expires_at <= utc_now()
+            or pending[0] != task_id
+            or pending[2] != approved_by
+        ):
+            raise PermissionError("confirmation is invalid, expired, or out of scope")
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(task_id)
+        if task.status is not TaskStatus.WAITING_USER:
+            raise PermissionError("task is no longer waiting for approval")
+        return pending, confirmation
+
     async def approve(
         self,
         *,
@@ -363,19 +408,31 @@ class TaskEngine:
             raise PermissionError("approval principal does not own this task")
         if not self._workers:
             await self.start()
+        self._require_pending_confirmation(
+            task_id=task_id, confirmation_id=confirmation_id, approved_by=approved_by
+        )
+
+        # A task can be durably marked WAITING_USER just before its worker has
+        # returned from the final bookkeeping for that turn. Let that processor
+        # and the worker's active-slot cleanup finish before queuing continuation.
+        current = asyncio.current_task()
+        while (active := self._active.get(task_id)) is not None:
+            if active is current:
+                raise RuntimeError("a task cannot approve itself while it is active")
+            if active.done():
+                await asyncio.sleep(0)
+            else:
+                await asyncio.gather(active, return_exceptions=True)
+                await asyncio.sleep(0)
+
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(task_id)
+        pending, _ = self._require_pending_confirmation(
+            task_id=task_id, confirmation_id=confirmation_id, approved_by=approved_by
+        )
         if self._queue.full():
             raise TaskQueueFull("the task queue is full; approval remains pending")
-        self.pending_confirmations(task_id)
-        pending = self._pending_confirmations.get(confirmation_id)
-        confirmation = self._confirmation_requests.get(confirmation_id)
-        if (
-            pending is None
-            or confirmation is None
-            or confirmation.expires_at <= utc_now()
-            or pending[0] != task_id
-            or pending[2] != approved_by
-        ):
-            raise PermissionError("confirmation is invalid, expired, or out of scope")
         _, action_id, _ = pending
         action = self._actions.get((task_id, action_id))
         plan_info = self._plans.get(task_id)
@@ -392,8 +449,6 @@ class TaskEngine:
         )
         if start_index is None:
             raise InvalidPlan("approved action no longer belongs to the in-memory plan")
-        if task_id in self._active:
-            raise RuntimeError("task already has an active operation")
         tool = self.tools.get(action.tool_name)
         grant: ApprovalGrant = self.policy.issue_approval(
             action,
@@ -434,6 +489,18 @@ class TaskEngine:
         owner = task.authorization.principal_id if task.authorization is not None else None
         if owner and owner != principal_id:
             raise PermissionError("task does not belong to the authenticated principal")
+        terminal_states = {
+            TaskStatus.COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+            TaskStatus.INTERRUPTED,
+            TaskStatus.BLOCKED,
+            TaskStatus.PARTIALLY_COMPLETED,
+        }
+        for child in self.tasks.list_for_principal(principal_id=principal_id, limit=5000):
+            if child.parent_task_id == task_id and child.status not in terminal_states:
+                await self.cancel(child.task_id, principal_id=principal_id)
         active = self._active.get(task_id)
         if active is not None:
             active.cancel()
@@ -690,15 +757,13 @@ class TaskEngine:
                 self._fail_before_dispatch(task_id, "Task execution exceeded its deadline.")
                 return
             try:
-                result: ActionRunResult = await asyncio.wait_for(
-                    self.runtime.execute_action(
+                async with asyncio.timeout(remaining):
+                    result: ActionRunResult = await self.runtime.execute_action(
                         action,
                         approval=approval if index == start_index else None,
                         final_action=final_action,
                         resource_wait_timeout=self.config.resource_wait_timeout_seconds,
-                    ),
-                    timeout=remaining,
-                )
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

@@ -8,6 +8,7 @@ from typing import get_args
 
 from arise.core import models
 from arise.core.events import EventEnvelope, EventSeverity
+from arise.core.extensions import MemoryKind
 from arise.core.models import CapabilityStatus, HealthStatus, TaskSnapshot, TaskStepSnapshot
 from arise.core.protocol import ServerFrame
 from arise.core.tasks import StepStatus, TaskStatus
@@ -16,9 +17,13 @@ from arise.core.tasks import StepStatus, TaskStatus
 class FrontendBackendContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.source = (Path(__file__).parents[1] / "frontend" / "src" / "types.ts").read_text(
-            encoding="utf-8"
-        )
+        frontend_source = Path(__file__).parents[1] / "frontend" / "src"
+        cls.source = (frontend_source / "types.ts").read_text(encoding="utf-8")
+        cls.api_source = (frontend_source / "api.ts").read_text(encoding="utf-8")
+        cls.app_source = (frontend_source / "App.tsx").read_text(encoding="utf-8")
+        backend_root = Path(__file__).parents[1] / "src" / "arise"
+        cls.server_source = (backend_root / "server.py").read_text(encoding="utf-8")
+        cls.models_source = (backend_root / "core" / "models.py").read_text(encoding="utf-8")
 
     def _type_expression_values(self, expression: str, seen: set[str] | None = None) -> set[str]:
         seen = set() if seen is None else seen
@@ -56,9 +61,7 @@ class FrontendBackendContractTests(unittest.TestCase):
             match.group(1),
             flags=re.DOTALL,
         )
-        self.assertIsNotNone(
-            property_match, f"{interface}.{property_name} contract is missing"
-        )
+        self.assertIsNotNone(property_match, f"{interface}.{property_name} contract is missing")
         return self._type_expression_values(property_match.group(1))
 
     def interface_properties(self, interface: str) -> set[str]:
@@ -82,9 +85,7 @@ class FrontendBackendContractTests(unittest.TestCase):
             match.group(1),
             flags=re.DOTALL,
         )
-        self.assertIsNotNone(
-            property_match, f"{interface}.{property_name} contract is missing"
-        )
+        self.assertIsNotNone(property_match, f"{interface}.{property_name} contract is missing")
         return set(
             re.findall(
                 r"^    ([A-Za-z_][A-Za-z0-9_]*)\s*:",
@@ -101,9 +102,7 @@ class FrontendBackendContractTests(unittest.TestCase):
         )
         self.assertIs(TaskSnapshot.model_fields["state"].annotation, TaskStatus)
         self.assertIs(TaskStepSnapshot.model_fields["status"].annotation, StepStatus)
-        verification_values = {
-            item.value for item in models.VerificationStatus
-        }
+        verification_values = {item.value for item in models.VerificationStatus}
         self.assertEqual(
             self.interface_property_union("TaskStep", "verification_status"),
             verification_values,
@@ -118,6 +117,8 @@ class FrontendBackendContractTests(unittest.TestCase):
             "EnvironmentSnapshot": models.EnvironmentSnapshot,
             "DiagnosticsSnapshot": models.DiagnosticsSnapshot,
             "HealthSnapshot": models.HealthSnapshot,
+            "VoiceStatusSnapshot": models.VoiceStatusSnapshot,
+            "VoiceMetricSnapshot": models.VoiceMetricSnapshot,
             "ConfirmationRequest": models.ConfirmationRequest,
             "Session": models.Session,
             "TaskStep": models.TaskStepSnapshot,
@@ -169,6 +170,18 @@ class FrontendBackendContractTests(unittest.TestCase):
             {item.value for item in HealthStatus},
         )
         self.assertEqual(
+            self.interface_property_union("VoiceStatusSnapshot", "state"),
+            {item.value for item in models.VoiceState},
+        )
+        self.assertEqual(
+            self.interface_property_union("VoiceStatusSnapshot", "microphone_status"),
+            {item.value for item in models.MicrophoneStatus},
+        )
+        self.assertEqual(
+            self.interface_property_union("VoiceStatusSnapshot", "provider_status"),
+            {item.value for item in models.VoiceProviderStatus},
+        )
+        self.assertEqual(
             self.interface_property_union("EventRecord", "severity"),
             {item.value for item in EventSeverity},
         )
@@ -207,6 +220,51 @@ class FrontendBackendContractTests(unittest.TestCase):
             (filename, module) for filename, module in imports if module in forbidden
         )
         self.assertEqual(violations, [])
+
+    def test_frontend_recovers_expired_and_bounded_event_replays(self) -> None:
+        self.assertIn("EVENT_CURSOR_EXPIRED", self.api_source)
+        self.assertIn("replayCursor = floor", self.api_source)
+        self.assertIn("EVENT_REPLAY_LIMIT", self.api_source)
+        self.assertIn("callbacks.onReplayReset?.()", self.api_source)
+        self.assertIn("Older event history was pruned", self.app_source)
+        self.assertIn("void refreshTasks(api)", self.app_source)
+
+    def test_text_composer_uses_intent_routed_interaction_contract(self) -> None:
+        self.assertIn("async interact(", self.api_source)
+        self.assertIn("'/interactions'", self.api_source)
+        self.assertIn("api.interact(", self.app_source)
+        self.assertNotIn("api.submitTask(", self.app_source)
+        self.assertIn("TextInteractionResponse", self.source)
+        self.assertIn("outcome: TextInteractionOutcome", self.source)
+        self.assertIn("NO TASK CREATED", self.app_source)
+
+    def test_parent_child_task_api_contract_is_typed(self) -> None:
+        self.assertIn("parent_task_id: string | null", self.source)
+        self.assertIn("parent_task_id: str | None", self.models_source)
+        self.assertIn("async listChildTasks(", self.api_source)
+        self.assertIn("async submitChildTask(", self.api_source)
+        self.assertIn("/children", self.api_source)
+        self.assertIn("/api/v1/tasks/{parent_task_id}/children", self.server_source)
+
+    def test_environment_discovery_is_typed_and_user_requested(self) -> None:
+        self.assertIn("audio_input_devices: string[]", self.source)
+        self.assertIn("audio_output_devices: string[]", self.source)
+        self.assertIn("async diagnostics(): Promise<DiagnosticsSnapshot>", self.api_source)
+        self.assertIn("api.diagnostics()", self.app_source)
+        self.assertIn("<EnvironmentDiagnosticsPanel snapshot={diagnostics} />", self.app_source)
+        self.assertIn("Refresh status &amp; local facts", self.app_source)
+
+    def test_user_controlled_memory_categories_match_backend(self) -> None:
+        self.assertEqual(self.union_values("MemoryKind"), {item.value for item in MemoryKind})
+        self.assertIn("async grantMemoryConsent(", self.api_source)
+        self.assertIn("await api.createMemory(draft, consent.consent_reference)", self.app_source)
+        self.assertIn("await api.deleteMemory(previousRecord.record_id)", self.app_source)
+        self.assertIn(
+            "The existing record will be deleted only after the replacement is saved successfully",
+            self.app_source,
+        )
+        self.assertIn("onClick={() => editMemory(record)}", self.app_source)
+        self.assertIn("cancelEdit", self.app_source)
 
     def test_protocol_frame_is_explicitly_versioned_as_v1(self) -> None:
         self.assertRegex(self.source, r"protocol_version\s*:\s*1\s*;")

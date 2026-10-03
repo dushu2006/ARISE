@@ -2,10 +2,46 @@ from __future__ import annotations
 
 import unittest
 
-from arise.core.tasks import InvalidTaskTransition, TaskRecord, TaskStatus
+from arise.core.contracts import AuthorizationContext, TrustLevel
+from arise.core.tasks import (
+    InMemoryTaskRepository,
+    InvalidTaskTransition,
+    TaskRecord,
+    TaskStatus,
+)
 
 
 class TaskStateTransitionTests(unittest.TestCase):
+    def test_in_memory_task_listing_is_scoped_to_authenticated_principal(self) -> None:
+        tasks = InMemoryTaskRepository()
+        own = TaskRecord.new(
+            "Own task",
+            authorization=AuthorizationContext(
+                principal_id="principal-a",
+                user_intent_id="request-a",
+                trust=TrustLevel.USER_INSTRUCTION,
+            ),
+            request_id="request-a",
+            session_id="session-a",
+        )
+        other = TaskRecord.new(
+            "Other task",
+            authorization=AuthorizationContext(
+                principal_id="principal-b",
+                user_intent_id="request-b",
+                trust=TrustLevel.USER_INSTRUCTION,
+            ),
+            request_id="request-b",
+            session_id="session-b",
+        )
+        tasks.create_or_get(own)
+        tasks.create_or_get(other)
+
+        self.assertEqual(
+            [task.task_id for task in tasks.list_for_principal(principal_id="principal-a")],
+            [own.task_id],
+        )
+
     def test_interrupted_task_can_be_reconciled_or_requeued(self) -> None:
         task = TaskRecord.new("Recover this task")
         task.transition_to(TaskStatus.QUEUED)

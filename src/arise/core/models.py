@@ -42,6 +42,64 @@ class RequestSource(StrEnum):
     SCHEDULE = "schedule"
 
 
+class VoiceState(StrEnum):
+    DORMANT = "dormant"
+    ACTIVATING = "activating"
+    LISTENING = "listening"
+    THINKING = "thinking"
+    SPEAKING = "speaking"
+    INTERRUPTED = "interrupted"
+    EXECUTING = "executing"
+    WAITING_FOR_USER = "waiting_for_user"
+    DEACTIVATING = "deactivating"
+    DISCONNECTED = "disconnected"
+    ERROR = "error"
+
+
+class MicrophoneStatus(StrEnum):
+    NOT_CONFIGURED = "not_configured"
+    UNKNOWN = "unknown"
+    AVAILABLE = "available"
+    PERMISSION_DENIED = "permission_denied"
+    UNAVAILABLE = "unavailable"
+    ERROR = "error"
+
+
+class VoiceProviderStatus(StrEnum):
+    UNCONFIGURED = "unconfigured"
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    RECONNECTING = "reconnecting"
+    AUTHENTICATION_FAILURE = "authentication_failure"
+    QUOTA_LIMITED = "quota_limited"
+    NETWORK_FAILURE = "network_failure"
+    PROVIDER_ERROR = "provider_error"
+
+
+class VoiceMetricSnapshot(ContractModel):
+    count: int = Field(default=0, ge=0)
+    last_latency_ms: float | None = Field(default=None, ge=0)
+    max_latency_ms: float | None = Field(default=None, ge=0)
+
+
+class VoiceStatusSnapshot(ContractModel):
+    """Safe operator snapshot; never contains transcript, audio, or credentials."""
+
+    state: VoiceState = VoiceState.DORMANT
+    microphone_status: MicrophoneStatus = MicrophoneStatus.NOT_CONFIGURED
+    provider_status: VoiceProviderStatus = VoiceProviderStatus.UNCONFIGURED
+    provider_id: str | None = Field(default=None, max_length=128)
+    wake_word: str = Field(default="ARISE", min_length=1, max_length=32)
+    wake_word_enabled: bool = False
+    active_session_id: str | None = Field(default=None, max_length=128)
+    active_task_id: str | None = Field(default=None, max_length=128)
+    inactivity_timeout_seconds: int = Field(default=30, ge=5, le=3600)
+    last_error_code: str | None = Field(default=None, max_length=64)
+    updated_at: datetime = Field(default_factory=_utc_now)
+    telemetry: dict[str, VoiceMetricSnapshot] = Field(default_factory=dict)
+
+
 class UserRequest(ContractModel):
     request_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -49,6 +107,7 @@ class UserRequest(ContractModel):
     source: RequestSource = RequestSource.TEXT
     received_at: datetime = Field(default_factory=_utc_now)
     locale: str | None = Field(default=None, max_length=32)
+    allow_web_research: bool = False
 
     @field_validator("text")
     @classmethod
@@ -246,25 +305,27 @@ class CapabilityStatus(StrEnum):
 
 
 class DisplayInfo(ContractModel):
-    display_id: str
+    display_id: str = Field(min_length=1, max_length=256)
     width: int | None = Field(default=None, ge=0)
     height: int | None = Field(default=None, ge=0)
     scale: float | None = Field(default=None, gt=0)
+    dpi_x: int | None = Field(default=None, gt=0)
+    dpi_y: int | None = Field(default=None, gt=0)
     primary: bool | None = None
     availability: CapabilityStatus | None = None
 
 
 class ActiveWindowInfo(ContractModel):
     available: bool
-    title: str | None = None
-    application: str | None = None
+    title: str | None = Field(default=None, max_length=2048)
+    application: str | None = Field(default=None, max_length=256)
     process_id: int | None = Field(default=None, gt=0)
-    window_id: str | None = None
-    reason_unavailable: str | None = None
+    window_id: str | None = Field(default=None, max_length=256)
+    reason_unavailable: str | None = Field(default=None, max_length=128)
 
 
 class ApplicationInfo(ContractModel):
-    name: str
+    name: str = Field(min_length=1, max_length=256)
     process_id: int | None = Field(default=None, gt=0)
     source: Literal["running_process", "installed_registry", "user_provided"] = "running_process"
     available: bool = True
@@ -278,15 +339,17 @@ class EnvironmentSnapshot(ContractModel):
     architecture: str
     cpu_count: int = Field(ge=1)
     total_memory_bytes: int | None = Field(default=None, ge=0)
-    gpu_names: tuple[str, ...] = ()
-    displays: tuple[DisplayInfo, ...] = ()
+    gpu_names: tuple[str, ...] = Field(default=(), max_length=32)
+    displays: tuple[DisplayInfo, ...] = Field(default=(), max_length=32)
     active_window: ActiveWindowInfo | None = None
-    running_applications: tuple[ApplicationInfo, ...] = ()
-    installed_applications: tuple[ApplicationInfo, ...] = ()
-    browsers: tuple[str, ...] = ()
-    terminals: tuple[str, ...] = ()
+    running_applications: tuple[ApplicationInfo, ...] = Field(default=(), max_length=512)
+    installed_applications: tuple[ApplicationInfo, ...] = Field(default=(), max_length=512)
+    browsers: tuple[str, ...] = Field(default=(), max_length=64)
+    terminals: tuple[str, ...] = Field(default=(), max_length=64)
+    audio_input_devices: tuple[str, ...] = Field(default=(), max_length=64)
+    audio_output_devices: tuple[str, ...] = Field(default=(), max_length=64)
     network_status: Literal["online", "offline", "unknown"] = "unknown"
-    unavailable_fields: tuple[str, ...] = ()
+    unavailable_fields: tuple[str, ...] = Field(default=(), max_length=128)
 
 
 class ModelRole(StrEnum):
@@ -510,6 +573,7 @@ class TaskSnapshot(ContractModel):
     task_id: str
     request_id: str
     session_id: str
+    parent_task_id: str | None = None
     correlation_id: str
     goal: str
     state: TaskStatus
@@ -525,6 +589,7 @@ class TaskSnapshot(ContractModel):
             task_id=record.task_id,
             request_id=record.request_id,
             session_id=record.session_id,
+            parent_task_id=record.parent_task_id,
             correlation_id=record.correlation_id,
             goal=record.goal,
             state=record.status.value,

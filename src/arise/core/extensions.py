@@ -6,9 +6,13 @@ through retrieval ports is context only: it carries no task authority and must r
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 import re
+import time
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
@@ -30,10 +34,13 @@ class AudioChunk:
     sample_rate_hz: int
     channels: int
     data: bytes
+    captured_at_monotonic_ns: int = field(default_factory=time.monotonic_ns)
 
     def __post_init__(self) -> None:
         if self.sequence < 0:
             raise ValueError("audio sequence cannot be negative")
+        if self.captured_at_monotonic_ns < 0:
+            raise ValueError("audio capture monotonic timestamp cannot be negative")
         if not _AUDIO_FORMAT.fullmatch(self.codec):
             raise ValueError("audio codec must be a short, lowercase format token")
         if not 8_000 <= self.sample_rate_hz <= 192_000:
@@ -144,25 +151,121 @@ class RetrievedContext:
             raise ValueError("context relevance must be between zero and one")
 
 
+class MemoryKind(StrEnum):
+    """User-controlled categories; none grants authority to execute an action."""
+
+    SEMANTIC = "semantic"
+    PREFERENCE = "preference"
+    EPISODIC = "episodic"
+    PROCEDURAL = "procedural"
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryEntry:
-    """A proposed memory write, requiring an explicit consent reference and expiry."""
+    """A proposed memory write, requiring exact-scope consent and an expiry."""
 
     principal_id: str
     text: str
     consent_reference: str
     expires_at: datetime
     source_task_id: str | None = None
+    kind: MemoryKind = MemoryKind.SEMANTIC
 
     def __post_init__(self) -> None:
         validate_safe_token(self.principal_id, "memory principal_id")
         validate_safe_token(self.consent_reference, "memory consent_reference")
-        if not self.text.strip() or len(self.text) > MAX_CONTEXT_TEXT_CHARS:
+        if (
+            not isinstance(self.text, str)
+            or not self.text.strip()
+            or len(self.text) > MAX_CONTEXT_TEXT_CHARS
+        ):
             raise ValueError("memory text must be non-empty and bounded")
+        object.__setattr__(self, "text", self.text.strip())
         if self.expires_at.tzinfo is None:
             raise ValueError("memory expiry must be timezone-aware")
+        if not isinstance(self.kind, MemoryKind):
+            raise ValueError("memory kind must be a MemoryKind")
         if self.source_task_id is not None:
             validate_safe_token(self.source_task_id, "memory source_task_id")
+
+
+def memory_entry_fingerprint(entry: MemoryEntry) -> str:
+    """Stable consent scope for exact principal, text, kind, source, and retention."""
+
+    material = json.dumps(
+        {
+            "principal_id": entry.principal_id,
+            "text": entry.text,
+            "kind": entry.kind.value,
+            "source_task_id": entry.source_task_id,
+            "expires_at": entry.expires_at.isoformat(),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRecord:
+    """Persisted, principal-scoped memory metadata and redacted user content."""
+
+    record_id: str
+    principal_id: str
+    text: str
+    kind: MemoryKind
+    provenance: str
+    created_at: datetime
+    expires_at: datetime
+    source_task_id: str | None = None
+    embedding: tuple[float, ...] | None = None
+    embedding_model_id: str | None = None
+
+    def __post_init__(self) -> None:
+        validate_safe_token(self.record_id, "memory record_id")
+        validate_safe_token(self.principal_id, "memory principal_id")
+        if not isinstance(self.kind, MemoryKind):
+            raise ValueError("memory record kind must be a MemoryKind")
+        if not self.text.strip() or len(self.text) > MAX_CONTEXT_TEXT_CHARS:
+            raise ValueError("memory record text must be non-empty and bounded")
+        if not self.provenance.strip() or len(self.provenance) > 2048:
+            raise ValueError("memory provenance must be non-empty and bounded")
+        if self.created_at.tzinfo is None or self.expires_at.tzinfo is None:
+            raise ValueError("memory timestamps must be timezone-aware")
+        if self.source_task_id is not None:
+            validate_safe_token(self.source_task_id, "memory source_task_id")
+        if (self.embedding is None) != (self.embedding_model_id is None):
+            raise ValueError("memory embedding and model ID must be supplied together")
+        if self.embedding is not None and self.embedding_model_id is not None:
+            checked = EmbeddingResult(self.embedding_model_id, self.embedding)
+            object.__setattr__(self, "embedding", checked.vector)
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingResult:
+    """Finite, bounded numeric vector from an explicitly configured provider."""
+
+    model_id: str
+    vector: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        if not self.model_id.strip() or len(self.model_id) > 256:
+            raise ValueError("embedding model_id must be non-empty and bounded")
+        if not 1 <= len(self.vector) <= 8192:
+            raise ValueError("embedding vector dimension must be between 1 and 8192")
+        values = tuple(float(value) for value in self.vector)
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError("embedding values must be finite")
+        if sum(value * value for value in values) <= 1e-18:
+            raise ValueError("embedding vector cannot be all zeroes")
+        object.__setattr__(self, "vector", values)
+
+
+class EmbeddingPort(Protocol):
+    """Optional provider for semantic ranking; implementations must obey egress policy."""
+
+    async def embed(self, text: str, *, correlation_id: str) -> EmbeddingResult: ...
 
 
 class MemoryConsentError(PermissionError):
@@ -170,18 +273,14 @@ class MemoryConsentError(PermissionError):
 
 
 class MemoryConsentPort(Protocol):
-    """Atomically validate and consume a one-time memory-write consent reference.
-
-    Implementations must verify the reference, principal, write scope, and consent expiry in
-    the same atomic operation that marks the reference consumed. Consent must not be inferred
-    from model output, a task result, or the presence of a non-empty reference string.
-    """
+    """Atomically validate and consume a one-time, exact-scope memory consent grant."""
 
     async def consume_write_consent(
         self,
         *,
         principal_id: str,
         consent_reference: str,
+        entry_fingerprint: str,
         now: datetime,
     ) -> bool: ...
 
@@ -194,8 +293,8 @@ async def require_memory_write_consent(
 ) -> None:
     """Reject expired proposals and require an atomic, one-time consent check.
 
-    This guard does not persist or retrieve memories. Future memory adapters must call it
-    immediately before a write and must not retry the write if its outcome is unknown.
+    Adapters must call this immediately before persistence and must not retry a write whose
+    outcome is unknown. The consumed grant is deliberately not restored after a storage error.
     """
 
     checked_at = now or datetime.now(UTC)
@@ -206,6 +305,7 @@ async def require_memory_write_consent(
     if consent is None or not await consent.consume_write_consent(
         principal_id=entry.principal_id,
         consent_reference=entry.consent_reference,
+        entry_fingerprint=memory_entry_fingerprint(entry),
         now=checked_at,
     ):
         raise MemoryConsentError("valid, unexpired, unused memory-write consent is required")

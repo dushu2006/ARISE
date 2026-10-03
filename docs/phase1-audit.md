@@ -2,6 +2,8 @@
 
 **Scope:** the complete checked-out workspace at the time of the Phase 1 baseline, including the then-new/untracked source tree. This is a historical Phase 1 audit, not the current capability report. Phase 2 work is now tracked in `docs/architecture.md`, `docs/roadmap.md`, and ADR-0002; this document preserves the earlier baseline.
 
+**Current-state correction (2026-10-03):** Baseline statements below such as “Phase 2–6 work was not started” and “memory, voice, and research remain unimplemented” describe the original audit snapshot only and are superseded. Subsequent code adds consented local SQLite memory, gated Brave research, a dormant-first optional voice runtime/TaskEngine bridge, bounded history/backup, diagnostics, and an optional Playwright prototype. The current `docs/master-completion-checklist.md` is authoritative for exact status: real Windows UIA/browser/audio/provider execution and several memory/recovery/packaging paths remain incomplete or environment/configuration limited.
+
 ## A. Executive verdict and evidence labels
 
 ARISE has a tested Phase 1 local control plane and a deliberately small desktop shell boundary. It is **not** a working Windows/browser automation agent: production registers no host-control tools, and the simulator is isolated to the demo/tests. The control plane fails closed when planning or action capabilities are absent.

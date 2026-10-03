@@ -404,6 +404,7 @@ class TaskRecord:
     authorization: AuthorizationContext | None = None
     request_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    parent_task_id: str | None = None
     correlation_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
@@ -416,6 +417,10 @@ class TaskRecord:
         validate_safe_token(self.task_id, "task_id")
         validate_safe_token(self.request_id, "request_id")
         validate_safe_token(self.session_id, "session_id")
+        if self.parent_task_id is not None:
+            validate_safe_token(self.parent_task_id, "parent_task_id")
+            if self.parent_task_id == self.task_id:
+                raise ValueError("a task cannot be its own parent")
         validate_safe_token(self.correlation_id, "correlation_id")
         if not self.goal.strip():
             raise ValueError("task goal cannot be blank")
@@ -444,6 +449,7 @@ class TaskRecord:
         authorization: AuthorizationContext | None = None,
         request_id: str | None = None,
         session_id: str | None = None,
+        parent_task_id: str | None = None,
         correlation_id: str | None = None,
     ) -> TaskRecord:
         return cls(
@@ -452,6 +458,7 @@ class TaskRecord:
             authorization=authorization,
             request_id=request_id or str(uuid.uuid4()),
             session_id=session_id or str(uuid.uuid4()),
+            parent_task_id=parent_task_id,
             correlation_id=correlation_id or str(uuid.uuid4()),
         )
 
@@ -464,6 +471,7 @@ class TaskRecord:
         authorization: AuthorizationContext | None = None,
         request_id: str | None = None,
         session_id: str | None = None,
+        parent_task_id: str | None = None,
         correlation_id: str | None = None,
     ) -> TaskRecord:
         """Create a task at the boundary after intent understanding and planning."""
@@ -476,6 +484,7 @@ class TaskRecord:
             authorization=authorization,
             request_id=request_id or str(uuid.uuid4()),
             session_id=session_id or str(uuid.uuid4()),
+            parent_task_id=parent_task_id,
             correlation_id=correlation_id or str(uuid.uuid4()),
             created_at=now,
             updated_at=now,
@@ -534,6 +543,7 @@ class TaskRecord:
             else None,
             "request_id": self.request_id,
             "session_id": self.session_id,
+            "parent_task_id": self.parent_task_id,
             "correlation_id": self.correlation_id,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -557,6 +567,9 @@ class TaskRecord:
             ),
             request_id=str(data.get("request_id", uuid.uuid4())),
             session_id=str(data.get("session_id", uuid.uuid4())),
+            parent_task_id=(
+                str(data["parent_task_id"]) if data.get("parent_task_id") is not None else None
+            ),
             correlation_id=str(data.get("correlation_id", uuid.uuid4())),
             created_at=datetime.fromisoformat(str(data["created_at"])),
             updated_at=datetime.fromisoformat(str(data["updated_at"])),
@@ -602,6 +615,8 @@ class TaskRepository(Protocol):
     ) -> list[TaskRecord]: ...
 
     def list_recent(self, *, limit: int = 100) -> list[TaskRecord]: ...
+
+    def list_for_principal(self, *, principal_id: str, limit: int = 5000) -> list[TaskRecord]: ...
 
 
 class InMemoryTaskRepository:
@@ -709,9 +724,7 @@ class InMemoryTaskRepository:
                 and request_fingerprint is not None
                 and existing_fingerprint != request_fingerprint
             ):
-                raise DuplicateTaskRequestError(
-                    "request ID was reused with different task content"
-                )
+                raise DuplicateTaskRequestError("request ID was reused with different task content")
             stored = self._tasks.get(task_id)
             return TaskRecord.from_dict(stored) if stored is not None else None
 
@@ -736,5 +749,18 @@ class InMemoryTaskRepository:
             raise ValueError("limit must be positive")
         with self._lock:
             tasks = [TaskRecord.from_dict(value) for value in self._tasks.values()]
+        tasks.sort(key=lambda task: task.updated_at, reverse=True)
+        return tasks[:limit]
+
+    def list_for_principal(self, *, principal_id: str, limit: int = 5000) -> list[TaskRecord]:
+        if not principal_id.strip() or limit < 1:
+            raise ValueError("principal_id and positive task-history limit are required")
+        with self._lock:
+            tasks = [
+                TaskRecord.from_dict(value)
+                for value in self._tasks.values()
+                if value.get("authorization") is not None
+                and value["authorization"].get("principal_id") == principal_id
+            ]
         tasks.sort(key=lambda task: task.updated_at, reverse=True)
         return tasks[:limit]

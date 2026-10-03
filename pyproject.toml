@@ -27,11 +27,21 @@ dev = [
 ]
 secure-secrets = ["keyring>=25,<27"]
 browser = ["playwright>=1.45,<2"]
+voice = ["google-genai>=1.55,<2"]
+voice-local = [
+  "kokoro-onnx>=0.6,<1",
+  "numpy>=1.26,<3",
+  "soxr>=0.5,<1",
+  "sounddevice>=0.5,<1",
+  "vosk>=0.3.45,<1",
+  "webrtcvad-wheels>=2.0.14,<3",
+]
 packaging = ["pyinstaller>=6,<7"]
 
 [project.scripts]
 arise = "arise.cli:main"
 arise-backend = "arise.server:main"
+arise-voice-check = "arise.adapters.windows_voice_validation:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

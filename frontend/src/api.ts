@@ -2,9 +2,18 @@ import type {
   Capability,
   DiagnosticsSnapshot,
   HealthSnapshot,
+  MemoryConsent,
+  MemoryRecord,
+  MemorySearchResult,
+  MemoryWriteDraft,
   Session,
   TaskDetail,
+  TaskHistoryClearResult,
+  TaskHistoryExport,
   TaskSnapshot,
+  TextInteractionResponse,
+  VoiceStatusSnapshot,
+  WebResearchResponse,
 } from './types';
 
 const API_PREFIX = '/api/v1';
@@ -44,16 +53,115 @@ export class AriseApi {
     return this.get<Capability[]>('/capabilities');
   }
 
+  async voiceStatus(): Promise<VoiceStatusSnapshot> {
+    return this.get<VoiceStatusSnapshot>('/voice/status');
+  }
+
+  async startVoiceListening(): Promise<VoiceStatusSnapshot> {
+    return this.post<VoiceStatusSnapshot>('/voice/listening/start', {});
+  }
+
+  async stopVoiceListening(): Promise<VoiceStatusSnapshot> {
+    return this.post<VoiceStatusSnapshot>('/voice/listening/stop', {});
+  }
+
   async diagnostics(): Promise<DiagnosticsSnapshot> {
     return this.get<DiagnosticsSnapshot>('/diagnostics');
+  }
+
+  async searchWebResearch(
+    query: string,
+    maxResults: number = 8,
+    allowedDomains: string[] = [],
+  ): Promise<WebResearchResponse> {
+    return this.post<WebResearchResponse>('/research/search', {
+      query,
+      max_results: maxResults,
+      allowed_domains: allowedDomains,
+    });
+  }
+
+  async listMemories(): Promise<MemoryRecord[]> {
+    return this.get<MemoryRecord[]>('/memory');
+  }
+
+  async grantMemoryConsent(draft: MemoryWriteDraft): Promise<MemoryConsent> {
+    return this.post<MemoryConsent>('/memory/consents', draft);
+  }
+
+  async createMemory(draft: MemoryWriteDraft, consentReference: string): Promise<MemoryRecord> {
+    return this.post<MemoryRecord>('/memory', {
+      ...draft,
+      consent_reference: consentReference,
+    });
+  }
+
+  async searchMemories(query: string): Promise<MemorySearchResult[]> {
+    const params = new URLSearchParams({ query });
+    const result = await this.get<{ results: MemorySearchResult[]; authority: string }>(
+      `/memory/search?${params.toString()}`,
+    );
+    return result.results;
+  }
+
+  async exportMemories(): Promise<{ exported_at: string; memories: MemoryRecord[] }> {
+    return this.get<{ exported_at: string; memories: MemoryRecord[] }>('/memory/export');
+  }
+
+  async deleteMemory(recordId: string): Promise<void> {
+    await this.fetchJson<{ deleted: boolean }>(
+      `${API_PREFIX}/memory/${encodeURIComponent(recordId)}`,
+      { method: 'DELETE' },
+    );
+  }
+
+  async clearMemories(): Promise<number> {
+    const result = await this.fetchJson<{ deleted: number }>(`${API_PREFIX}/memory`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    return result.deleted;
   }
 
   async listTasks(): Promise<TaskSnapshot[]> {
     return this.get<TaskSnapshot[]>('/tasks');
   }
 
+  async exportTaskHistory(): Promise<TaskHistoryExport> {
+    return this.get<TaskHistoryExport>('/tasks/export');
+  }
+
+  async clearTaskHistory(): Promise<TaskHistoryClearResult> {
+    return this.fetchJson<TaskHistoryClearResult>(`${API_PREFIX}/tasks/history`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+  }
+
   async getTask(taskId: string): Promise<TaskDetail> {
     return this.get<TaskDetail>(`/tasks/${encodeURIComponent(taskId)}`);
+  }
+
+  async listChildTasks(parentTaskId: string): Promise<TaskSnapshot[]> {
+    return this.get<TaskSnapshot[]>(`/tasks/${encodeURIComponent(parentTaskId)}/children`);
+  }
+
+  async submitChildTask(
+    parentTaskId: string,
+    text: string,
+    sessionId: string,
+    stableRequestId: string = requestId(),
+  ): Promise<TaskSnapshot> {
+    return this.post<TaskSnapshot>(`/tasks/${encodeURIComponent(parentTaskId)}/children`, {
+      request_id: stableRequestId,
+      session_id: sessionId,
+      text,
+      source: 'text',
+      locale: navigator.language || 'en',
+      allow_web_research: false,
+    });
   }
 
   async listSessions(): Promise<Session[]> {
@@ -64,10 +172,27 @@ export class AriseApi {
     return this.post<Session>('/sessions', { locale: navigator.language || 'en' });
   }
 
+  async interact(
+    text: string,
+    sessionId: string,
+    stableRequestId: string = requestId(),
+    allowWebResearch: boolean = false,
+  ): Promise<TextInteractionResponse> {
+    return this.post<TextInteractionResponse>('/interactions', {
+      request_id: stableRequestId,
+      session_id: sessionId,
+      text,
+      source: 'text',
+      locale: navigator.language || 'en',
+      allow_web_research: allowWebResearch,
+    });
+  }
+
   async submitTask(
     text: string,
     sessionId: string,
     stableRequestId: string = requestId(),
+    allowWebResearch: boolean = false,
   ): Promise<TaskSnapshot> {
     return this.post<TaskSnapshot>('/tasks', {
       request_id: stableRequestId,
@@ -75,6 +200,7 @@ export class AriseApi {
       text,
       source: 'text',
       locale: navigator.language || 'en',
+      allow_web_research: allowWebResearch,
     });
   }
 
@@ -189,16 +315,8 @@ export function connectProtocol(
           const payload = frame.payload as Record<string, unknown> | undefined;
           const currentSequence = Number(payload?.current_event_sequence);
           if (Number.isFinite(currentSequence) && replayCursor > currentSequence) {
-            replayCursor = 0;
+            replayCursor = Math.max(0, currentSequence);
             callbacks.onReplayReset?.();
-            socket?.send(
-              JSON.stringify({
-                protocol_version: 1,
-                message_id: requestId(),
-                type: 'events.subscribe',
-                after_sequence: 0,
-              }),
-            );
           }
           const heartbeatSeconds = Number(payload?.heartbeat_interval_seconds);
           welcomed = true;
@@ -224,6 +342,28 @@ export function connectProtocol(
           const eventRecord = payload?.event as Record<string, unknown> | undefined;
           const sequence = Number(eventRecord?.sequence);
           if (Number.isFinite(sequence) && sequence > replayCursor) replayCursor = sequence;
+        }
+        if (frame.type === 'protocol.error') {
+          const payload = frame.payload as Record<string, unknown> | undefined;
+          const code = String(payload?.code ?? '');
+          if (code === 'EVENT_CURSOR_EXPIRED') {
+            const floor = Number(payload?.replay_floor);
+            if (Number.isSafeInteger(floor) && floor >= 0) {
+              replayCursor = floor;
+              callbacks.onReplayReset?.();
+            }
+          } else if (code === 'INVALID_EVENT_CURSOR') {
+            const currentSequence = Number(payload?.latest_event_sequence);
+            if (Number.isSafeInteger(currentSequence) && currentSequence >= 0) {
+              replayCursor = currentSequence;
+              callbacks.onReplayReset?.();
+            }
+          } else if (code === 'EVENT_REPLAY_LIMIT') {
+            const afterSequence = Number(payload?.after_sequence);
+            if (Number.isSafeInteger(afterSequence) && afterSequence > replayCursor) {
+              replayCursor = afterSequence;
+            }
+          }
         }
         callbacks.onFrame(frame);
       } catch {
