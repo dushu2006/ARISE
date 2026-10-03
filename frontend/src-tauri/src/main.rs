@@ -8,17 +8,35 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 
+const BACKEND_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 struct BackendProcess(Mutex<Option<Child>>);
+
+fn shutdown_backend(child: &mut Child, grace_period: Duration) {
+    // The supervised Python process watches stdin for EOF so it can stop Uvicorn
+    // and release its database/process lock before the desktop shell exits.
+    drop(child.stdin.take());
+    let deadline = Instant::now() + grace_period;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // A wedged backend must not keep desktop shutdown blocked indefinitely.
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 impl Drop for BackendProcess {
     fn drop(&mut self) {
         if let Ok(slot) = self.0.get_mut() {
             if let Some(child) = slot.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
+                shutdown_backend(child, BACKEND_SHUTDOWN_GRACE);
             }
         }
     }
@@ -169,4 +187,36 @@ fn main() {
         })
         .run(tauri::generate_context!())
         .expect("ARISE desktop shell failed to start");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{shutdown_backend, Command, Stdio};
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_closes_supervision_pipe_and_waits_for_graceful_exit() {
+        let mut child = Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn pipe-reading child");
+
+        shutdown_backend(&mut child, Duration::from_secs(1));
+
+        assert!(child.try_wait().expect("wait for child").is_some());
+    }
+
+    #[test]
+    fn shutdown_kills_a_child_that_ignores_pipe_eof_after_deadline() {
+        let mut child = Command::new("sh")
+            .args(["-c", "exec sleep 10"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("spawn non-cooperative child");
+
+        shutdown_backend(&mut child, Duration::from_millis(25));
+
+        assert!(child.try_wait().expect("wait for child").is_some());
+    }
 }

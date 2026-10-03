@@ -136,6 +136,22 @@ class SQLiteMemoryRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("apples", results[0].text)
         self.assertGreater(results[0].relevance or 0, results[1].relevance or 0)
 
+    async def test_invalid_consent_is_rejected_before_embedding_egress(self) -> None:
+        class RecordingEmbedding:
+            calls = 0
+
+            async def embed(self, text: str, *, correlation_id: str) -> EmbeddingResult:
+                del text, correlation_id
+                self.calls += 1
+                return EmbeddingResult("recording-model", (1.0, 0.0))
+
+        embedding = RecordingEmbedding()
+        repository = SQLiteMemoryRepository(self.database, embedding=embedding)
+        with self.assertRaises(MemoryConsentError):
+            await repository.store(self.entry(consent_reference="unissued-consent"))
+        self.assertEqual(embedding.calls, 0)
+        self.assertEqual(repository.list_records(principal_id="user-a"), [])
+
     async def test_embedding_failure_falls_back_to_lexical_memory_search(self) -> None:
         class FailingEmbedding:
             async def embed(self, text: str, *, correlation_id: str) -> EmbeddingResult:

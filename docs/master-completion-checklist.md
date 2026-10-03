@@ -35,13 +35,13 @@
 - [x] COMPLETE — History retention implemented (opt-in daily retention prunes only settled tasks; startup pass/repository tests pass; disabled by default).
 - [x] COMPLETE — History deletion implemented (settled-history purge preserves unresolved/recoverable tasks, their required events, and idempotency tombstones; tests pass).
 - [x] COMPLETE — History export implemented (bounded task/event JSON export with truncation indicators; tests pass).
-- [x] COMPLETE — History backup strategy implemented (`arise backup` takes a locked SQLite snapshot, validates integrity, and publishes without overwriting; CLI/adapter tests pass).
+- [x] COMPLETE — `arise backup` takes a locked, integrity-checked SQLite snapshot and atomically publishes without overwriting; tests cover POSIX permissions, same-path/symlink aliases, concurrent destination races, and failure cleanup. Supported-Windows ACL/per-user behavior remains environment-limited below.
 - [-] IN PROGRESS — Bounded history/replay implemented (WebSocket replay is capped per connection and pruned cursors fail explicitly; settled-task retention is opt-in; active/unresolved history and default retention remain unbounded).
 - [-] IN PROGRESS — Single-instance protection implemented.
 - [-] IN PROGRESS — Stale-lock recovery implemented (OS lock release/reacquisition needs platform-specific validation).
 - [-] IN PROGRESS — Process lifecycle management implemented.
 - [-] IN PROGRESS — Port conflict handling implemented.
-- [-] IN PROGRESS — Startup/shutdown cleanup implemented.
+- [-] IN PROGRESS — Tauri shutdown now closes the supervised backend stdin pipe, waits up to three seconds for graceful Uvicorn/SQLite cleanup, then kills/waits on timeout; Unix Rust unit tests were added but cannot be run here because `cargo`/`rustc` are unavailable.
 - [-] IN PROGRESS — Configuration system implemented.
 - [-] IN PROGRESS — Secret handling implemented.
 - [-] IN PROGRESS — No secrets in frontend bundle.
@@ -204,8 +204,8 @@
 - [x] COMPLETE — CONVERSATION classification implemented; non-action text routes to the informational provider path without granting execution authority.
 - [x] COMPLETE — AMBIGUOUS classification implemented; low-confidence action-like text receives clarification and creates no task, covered by server integration test.
 - [x] COMPLETE — Intent confidence implemented as an advisory deterministic score; classifier tests pass and it grants no execution authority.
-- [ ] NOT STARTED — Structured entities implemented.
-- [ ] NOT STARTED — Structured command representation implemented.
+- [x] COMPLETE — Structured entities are derived as bounded action targets, quoted-text spans, and URL spans from the user request; intent tests verify offsets and question requests receive no action entities.
+- [x] COMPLETE — Structured command hints contain deterministic action/target phrases and are passed to GatewayTaskPlanner only as explicitly untrusted context; planner regression tests verify the hint does not add authority or supersede the original request.
 - [-] IN PROGRESS — Planner implemented.
 - [-] IN PROGRESS — Single-step planning implemented.
 - [-] IN PROGRESS — Multi-step planning implemented.
@@ -298,20 +298,20 @@
 - [ ] NOT STARTED — Procedural memory implemented.
 - [-] IN PROGRESS — Working memory expires correctly.
 - [-] IN PROGRESS — Short-term memory is bounded.
-- [-] IN PROGRESS — Semantic memory stores only explicitly approved information.
+- [x] COMPLETE — Semantic memory writes are gated by exact, one-use user consent; API and SQLite tests cover mismatch, replay, expiry, and successful storage.
 - [ ] NOT STARTED — Episodic memory stores useful task history.
 - [ ] NOT STARTED — Procedural memory stores reusable workflows.
-- [-] IN PROGRESS — Memory provenance implemented.
-- [-] IN PROGRESS — Memory consent implemented.
-- [-] IN PROGRESS — Consent reference stored safely.
-- [-] IN PROGRESS — Memory timestamp stored.
-- [-] IN PROGRESS — Memory confidence stored.
-- [-] IN PROGRESS — Memory expiry implemented where appropriate.
-- [-] IN PROGRESS — Memory list UI/API implemented.
-- [-] IN PROGRESS — Memory inspection implemented.
-- [-] IN PROGRESS — Memory deletion implemented.
-- [-] IN PROGRESS — Memory clearing implemented.
-- [-] IN PROGRESS — Memory disabling implemented.
+- [x] COMPLETE — Memory records retain explicit-user-consent provenance, category, timestamps, expiry, and optional source-task linkage; retrieval preserves source ID/provenance in tests.
+- [x] COMPLETE — Memory writes require an exact, principal-scoped, expiring, one-use consent; repository and authenticated API tests pass, including no embedding-provider call before a valid grant is consumed.
+- [x] COMPLETE — Consent references are stored only as SHA-256 hashes with principal, entry fingerprint, expiry, and consumption state; SQLite consent tests pass.
+- [x] COMPLETE — Memory creation timestamps and expiry timestamps are persisted and returned by the authenticated memory API.
+- [-] IN PROGRESS — Memory confidence stored (no confidence/uncertainty field or user-facing controls are implemented).
+- [x] COMPLETE — Expiry is enforced on reads/retrieval and explicit purge; SQLite tests cover expired records and grants.
+- [x] COMPLETE — Authenticated memory list/search/export APIs and typed Memory UI list/category/expiry controls are implemented; API and frontend contract tests pass.
+- [x] COMPLETE — Users can inspect saved memory text, category, provenance, creation time, and expiry in the Memory UI.
+- [x] COMPLETE — Per-record deletion is principal-scoped; the UI asks before delete and authenticated API/SQLite tests cover deletion.
+- [x] COMPLETE — Clear-all requires explicit confirmation and removes both memory records and outstanding consent grants; API tests pass.
+- [x] COMPLETE — With `memory.enabled=false`, memory APIs reject requests and the planner receives no memory port; configured embedding adapters are not constructed, verified by server-composition regression tests.
 - [-] IN PROGRESS — Secrets excluded from normal memory.
 - [-] IN PROGRESS — Passwords excluded from normal memory.
 - [-] IN PROGRESS — API keys excluded from normal memory.
@@ -321,7 +321,7 @@
 - [-] IN PROGRESS — Vector/semantic storage implemented.
 - [-] IN PROGRESS — Semantic search implemented.
 - [-] IN PROGRESS — Relevance filtering implemented.
-- [-] IN PROGRESS — Memory retrieval integrated with planner.
+- [x] COMPLETE — GatewayTaskPlanner retrieves principal-scoped consented SQLite memory and labels it as untrusted context; an integration test exercises consent → real SQLite persistence/lexical retrieval → planner serialization with a FAKE model provider (live embedding configuration is tracked separately).
 - [-] IN PROGRESS — Current user request takes priority over stale memory.
 - [-] IN PROGRESS — Memory cannot weaken security.
 - [-] IN PROGRESS — Memory cannot override policy.
@@ -331,7 +331,7 @@
 ## Phase 5 — Personalization and learning
 - [ ] NOT STARTED — Preferred browser can be remembered.
 - [ ] NOT STARTED — Preferred application can be remembered.
-- [ ] NOT STARTED — Response preferences can be remembered.
+- [x] COMPLETE — A user-saved, exact-consent `preference` memory is retrieved as explicitly untrusted context for local informational answers; authenticated API tests verify the separate cloud-context opt-in gate, keep the current request as the final user message, and admit no task. Real-model adherence is unverified.
 - [ ] NOT STARTED — Approved workflow preferences can be remembered.
 - [ ] NOT STARTED — TTS preferences can be remembered.
 - [ ] NOT STARTED — Procedural workflow retrieval implemented.
@@ -341,8 +341,8 @@
 - [ ] NOT STARTED — Re-grounding of stale procedures implemented.
 - [ ] NOT STARTED — Successful workflow adaptation implemented.
 - [ ] NOT STARTED — Failed workflow does not blindly repeat forever.
-- [ ] NOT STARTED — Learned workflow remains editable.
-- [ ] NOT STARTED — Learned workflow remains deletable.
+- [x] COMPLETE — Procedural-category records are editable through an exact-consent replacement flow; the UI deletes the prior record only after the new record is saved (frontend contract/typecheck evidence).
+- [x] COMPLETE — Procedural-category records can be deleted individually after confirmation or removed with explicit clear-all consent; authenticated API/SQLite tests cover the operations.
 - [ ] NOT STARTED — Learned workflow never bypasses policy.
 
 ## Security checklist
@@ -428,11 +428,11 @@
 - [-] IN PROGRESS — Voice command → real intent → real task admission → TaskEngine → planner → policy → executor → verifier → completion (bridge path exists; no real voice/runtime evidence and no production action tools).
 - [x] COMPLETE — Question → informational answer → NO task admission is integrated through FastAPI, ModelRouter, session persistence, and real TaskEngine storage; server tests inject a fake model provider and prove no task exists. Live provider behavior remains external/unverified.
 - [-] IN PROGRESS — Browser task → browser adapter → semantic target → execution → verification (optional adapter exists; production registration/real browser absent).
-- [-] IN PROGRESS — Research → search → sources → provenance → synthesis → citations (adapter exists; live provider and integrated synthesis unverified).
-- [-] IN PROGRESS — Memory → consent → persistence → embedding → retrieval → planner integration (local consent/persistence exists; live embedding and full planner integration require verification).
+- [-] IN PROGRESS — Research → search → sources → provenance → synthesis → citations (authenticated API synthesis/source metadata is FAKE-provider tested; a live Brave request and configured answer-provider behavior remain unverified).
+- [-] IN PROGRESS — Memory → consent → persistence → embedding → retrieval → planner integration (consented local SQLite → lexical retrieval → planner context is tested; optional live embedding endpoint/model remains unconfigured and unverified).
 - [ ] NOT STARTED — Procedural memory → retrieve workflow → execute semantically → verify → adapt when stale.
 - [-] IN PROGRESS — Voice interruption → VAD → barge-in → playback stop → generation cancellation → stale-output rejection → new request (fake/replay scope only; real path unverified).
-- [-] IN PROGRESS — Provider failure → failure detection → fallback/recovery → user-visible status (provider fakes/tests exist; integrated real provider path unverified).
+- [-] IN PROGRESS — Provider failure → failure detection → fallback/recovery → user-visible status is covered through authenticated FastAPI + real ModelRouter routing and a persisted fallback event with FAKE providers; live provider fault/recovery remains unverified.
 
 ## Acceptance scenarios (must remain general; do not hard-code them)
 - [-] IN PROGRESS — Scenario 1: “Open Chrome.” is classified as a command; task is planned, policy-checked, executed, independently verified, and only then reported complete/spoken. Real desktop execution is not available here.
@@ -450,8 +450,8 @@
 - [-] IN PROGRESS — Unit tests for cancellation.
 - [-] IN PROGRESS — Unit tests for generation fences.
 - [-] IN PROGRESS — Unit tests for model routing.
-- [-] IN PROGRESS — Unit tests for memory consent.
-- [-] IN PROGRESS — Unit tests for semantic retrieval.
+- [x] COMPLETE — Memory-consent unit/API tests use real SQLite and the authenticated FastAPI app to cover exact scope, expiry, replay, cross-principal rejection, concurrent consumption, and no embedding egress before valid consent.
+- [-] IN PROGRESS — Unit tests for semantic retrieval (ranking tests use deterministic FAKE embeddings; the live configured provider/model remains unverified).
 - [-] IN PROGRESS — Unit tests for research provenance.
 - [-] IN PROGRESS — API-level research prompt-injection regression exists; planner and real-provider behavior still need testing.
 - [x] COMPLETE — Voice integration tests include a real in-process TaskEngine/AgentRuntime/PolicyEngine/resource/verifier path; environment/tool are FAKE and no microphone or host automation is claimed.
@@ -465,13 +465,13 @@
 - [-] IN PROGRESS — Verifier → completion test.
 - [-] IN PROGRESS — Browser integration tests (fakes only; real Playwright/Chromium unverified).
 - [ ] NOT STARTED — UIA integration tests.
-- [-] IN PROGRESS — Memory integration tests.
+- [x] COMPLETE — Consent → real SQLite write/retrieval → GatewayTaskPlanner context integration is tested; the planner provider is FAKE and no live embedding/provider behavior is claimed.
 - [-] IN PROGRESS — Research integration tests.
 - [-] IN PROGRESS — Recovery tests.
 - [-] IN PROGRESS — Failure-injection tests.
 - [-] IN PROGRESS — Replay tests.
 - [x] COMPLETE — Frontend/backend contract tests cover task/event models, bounded replay recovery, and the `/interactions` TypeScript API/UI contract; relevant tests and build pass.
-- [-] IN PROGRESS — Provider failure tests.
+- [-] IN PROGRESS — Provider unit tests and authenticated question→ModelRouter fallback tests cover sanitized failure, fallback event, and user-visible answer with FAKE providers; live provider faults remain unverified.
 - [-] IN PROGRESS — Provider timeout tests.
 - [-] IN PROGRESS — Provider cancellation tests.
 - [-] IN PROGRESS — Stale-target tests.
@@ -484,9 +484,9 @@
 
 ## Quality checklist
 - [x] COMPLETE — Ruff check passes (`.venv/bin/ruff check .`).
-- [x] COMPLETE — Changed Python formatting passes (`ruff format --check` on all changed/untracked Python files; 45 files already formatted).
-- [x] COMPLETE — Python compile passes (`python -m compileall -q src tests`).
-- [x] COMPLETE — Full pytest passes (280 tests and 64 subtests; one upstream Starlette/httpx deprecation warning).
+- [x] COMPLETE — Python formatting passes (`ruff format --check src tests`; 80 files already formatted).
+- [x] COMPLETE — Python compile passes (`python -m compileall -q src tests scripts`).
+- [x] COMPLETE — Full pytest passes (293 tests and 64 subtests; one upstream Starlette/httpx deprecation warning).
 - [x] COMPLETE — Frontend typecheck passes (`npm run typecheck`).
 - [x] COMPLETE — Frontend production build passes (`npm run build`).
 - [x] COMPLETE — Secret/token scan passes (no high-confidence credential patterns in source/config/docs; dependency/build dirs excluded).
@@ -494,9 +494,9 @@
 - [x] COMPLETE — Whitespace checks pass.
 - [x] COMPLETE — Simulator passes (`arise demo`; FAKE/test-only execution, not host automation).
 - [x] COMPLETE — Replay suites pass (pytest replay/failure tests pass; harness replay probes ran under host guard).
-- [x] COMPLETE — Voice harness runs correctly and reports `ENVIRONMENT-LIMITED`/`BLOCKED` honestly on Linux (21 checks; no device/provider access).
+- [x] COMPLETE — Voice harness runs on Linux with the optional local extra; synthetic VAD and deterministic REPLAY/FAKE probes pass, while hardware/TaskEngine-composition probes report `ENVIRONMENT-LIMITED`/`BLOCKED` and Gemini is skipped (21 stages; no device/provider access).
 - [x] COMPLETE — No real-only claims made from replay tests (evidence labels and limitations remain explicit).
-- [x] COMPLETE — GitHub Actions run 37135316889 passes Ubuntu/Windows backend (Python 3.11/3.12), frontend, and Windows Tauri `cargo check`. Windows path/order/approval fixes and the NSIS install-mode correction are covered; installer and desktop runtime validation remain separate.
+- [-] IN PROGRESS — Prior GitHub Actions run 37135316889 passed Ubuntu/Windows backend, frontend, and Windows Tauri `cargo check` for an earlier pushed SHA; the current uncommitted continuation patch has no CI run, and this user explicitly forbids commit/push. Current local Python/frontend checks are rerun separately; Rust/Cargo validation is unavailable here.
 - [-] IN PROGRESS — No fake success responses remain in production paths.
 - [-] IN PROGRESS — No accidental debug code remains.
 - [-] IN PROGRESS — No obsolete placeholders remain in production paths.
@@ -519,5 +519,5 @@
 - [-] IN PROGRESS — Implement every software-remediable production gap found by that search without removing legitimate tests; remaining gaps are enumerated in this checklist and `docs/forensic-audit.md`.
 
 ## Required final report
-- [x] COMPLETE — Re-opened and recounted the full checklist for this report after the Windows CI rerun: 461 total; 73 COMPLETE, 282 IN PROGRESS, 93 NOT STARTED, 8 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two closed final-report rows).
-- [x] COMPLETE — Final report records changes/defects, exact test totals, REAL vs FAKE/REPLAY evidence, environment/external setup needs, Git status, and the commit/push/PR outcome. The user's later PR request authorizes committing and pushing this branch despite the earlier no-commit/no-push instruction.
+- [x] COMPLETE — Re-opened and recounted the full checklist for this report after the latest implementation/tests: 461 total; 91 COMPLETE, 269 IN PROGRESS, 88 NOT STARTED, 8 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two final-report rows).
+- [x] COMPLETE — Final report records changes/defects, exact test totals, REAL vs FAKE/REPLAY evidence, remaining software work, blockers/setup needs, and actual Git status; no commit, push, merge, or PR action was performed, as explicitly instructed.

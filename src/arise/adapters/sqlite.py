@@ -1045,6 +1045,9 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
         safe_text = self.redactor.redact(entry.text).strip()
         if not safe_text:
             raise ValueError("memory text was empty after redaction")
+        # Consume exact-content consent before any optional embedding provider sees the text.
+        # A caller with a missing, expired, replayed, or wrong-scope grant must cause no egress.
+        await require_memory_write_consent(entry, self)
         record_id = str(uuid.uuid4())
         embedding: EmbeddingResult | None = None
         if self.embedding is not None:
@@ -1053,7 +1056,6 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
             except Exception:
                 # Semantic enrichment is optional; explicit local storage can use lexical search.
                 embedding = None
-        await require_memory_write_consent(entry, self)
         created_at = utc_now()
         provenance = "explicit user-approved local memory"
         embedding_json = (

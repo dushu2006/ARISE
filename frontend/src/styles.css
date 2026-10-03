@@ -353,6 +353,10 @@ h1, h2, h3, p { margin-top: 0; }
 .memory-record-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
 .memory-record { min-width: 0; padding: 11px; border: 1px solid rgba(165,177,204,.085); border-radius: 8px; background: rgba(255,255,255,.018); }
 .memory-record-top { display: flex; align-items: center; justify-content: space-between; }
+.memory-record-tools { display: flex; align-items: center; gap: 5px; }
+.memory-edit { display: flex; align-items: center; gap: 4px; padding: 4px 6px; border: 0; border-radius: 5px; color: #8d9fca; background: transparent; font-size: 9px; cursor: pointer; }
+.memory-edit:hover:not(:disabled) { color: #c1d0fa; background: rgba(148,173,255,.08); }
+.memory-edit:disabled, .memory-delete:disabled { opacity: .45; cursor: not-allowed; }
 .memory-kind { padding: 4px 6px; border: 1px solid rgba(148,173,255,.13); border-radius: 4px; color: #aab8df; background: rgba(148,173,255,.045); font: 7px var(--mono); text-transform: uppercase; }
 .memory-kind.preference { border-color: rgba(200,241,122,.17); color: #c4e19c; background: rgba(200,241,122,.04); }
 .memory-kind.episodic { border-color: rgba(225,177,121,.17); color: #d9b58d; background: rgba(225,177,121,.04); }

@@ -76,6 +76,63 @@ class SQLiteAdapterTests(unittest.TestCase):
             snapshot.close()
             database.close()
 
+    def test_backup_rejects_a_symlink_alias_of_the_live_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = SQLiteDatabase(root / "live.sqlite3")
+            alias = root / "live-alias.sqlite3"
+            try:
+                alias.symlink_to(database.path)
+            except OSError as exc:
+                database.close()
+                self.skipTest(f"symlink creation is unavailable: {type(exc).__name__}")
+
+            try:
+                with self.assertRaisesRegex(ValueError, "cannot be the live database"):
+                    database.backup_to(alias)
+            finally:
+                database.close()
+
+    def test_backup_race_does_not_overwrite_winner_or_leave_partial_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = SQLiteDatabase(root / "live.sqlite3")
+            destination = root / "snapshot.sqlite3"
+
+            def create_winner_then_fail(_source: Path, target: Path) -> None:
+                target.write_text("another process won", encoding="utf-8")
+                raise FileExistsError(target)
+
+            try:
+                with (
+                    patch("arise.adapters.sqlite.os.link", side_effect=create_winner_then_fail),
+                    self.assertRaises(FileExistsError),
+                ):
+                    database.backup_to(destination)
+                self.assertEqual(destination.read_text(encoding="utf-8"), "another process won")
+                self.assertEqual(list(root.glob(f".{destination.name}.*.partial")), [])
+            finally:
+                database.close()
+
+    def test_backup_failure_cleans_temporary_file_and_never_publishes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = SQLiteDatabase(root / "live.sqlite3")
+            destination = root / "snapshot.sqlite3"
+            try:
+                with (
+                    patch(
+                        "arise.adapters.sqlite.sqlite3.connect",
+                        side_effect=sqlite3.OperationalError("injected backup failure"),
+                    ),
+                    self.assertRaisesRegex(sqlite3.OperationalError, "injected backup failure"),
+                ):
+                    database.backup_to(destination)
+                self.assertFalse(destination.exists())
+                self.assertEqual(list(root.glob(f".{destination.name}.*.partial")), [])
+            finally:
+                database.close()
+
     def test_managed_instance_lock_precedes_connection_and_releases_on_close(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "owned.db"

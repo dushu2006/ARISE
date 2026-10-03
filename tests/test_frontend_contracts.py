@@ -8,6 +8,7 @@ from typing import get_args
 
 from arise.core import models
 from arise.core.events import EventEnvelope, EventSeverity
+from arise.core.extensions import MemoryKind
 from arise.core.models import CapabilityStatus, HealthStatus, TaskSnapshot, TaskStepSnapshot
 from arise.core.protocol import ServerFrame
 from arise.core.tasks import StepStatus, TaskStatus
@@ -252,6 +253,18 @@ class FrontendBackendContractTests(unittest.TestCase):
         self.assertIn("api.diagnostics()", self.app_source)
         self.assertIn("<EnvironmentDiagnosticsPanel snapshot={diagnostics} />", self.app_source)
         self.assertIn("Refresh status &amp; local facts", self.app_source)
+
+    def test_user_controlled_memory_categories_match_backend(self) -> None:
+        self.assertEqual(self.union_values("MemoryKind"), {item.value for item in MemoryKind})
+        self.assertIn("async grantMemoryConsent(", self.api_source)
+        self.assertIn("await api.createMemory(draft, consent.consent_reference)", self.app_source)
+        self.assertIn("await api.deleteMemory(previousRecord.record_id)", self.app_source)
+        self.assertIn(
+            "The existing record will be deleted only after the replacement is saved successfully",
+            self.app_source,
+        )
+        self.assertIn("onClick={() => editMemory(record)}", self.app_source)
+        self.assertIn("cancelEdit", self.app_source)
 
     def test_protocol_frame_is_explicitly_versioned_as_v1(self) -> None:
         self.assertRegex(self.source, r"protocol_version\s*:\s*1\s*;")

@@ -24,10 +24,62 @@ class IntentKind(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class IntentEntity:
+    """A lexical span extracted for routing/planning context, never an authority grant."""
+
+    kind: str
+    value: str
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if not self.kind or len(self.kind) > 32:
+            raise ValueError("intent entity kind must be a short token")
+        if not self.value or len(self.value) > 2048:
+            raise ValueError("intent entity value must be non-empty and bounded")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError("intent entity source span is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class IntentActionStep:
+    """One advisory action phrase from the user's text; this is not an executable plan step."""
+
+    operation: str
+    target_text: str | None
+    start: int
+    end: int
+
+    def __post_init__(self) -> None:
+        if not self.operation or len(self.operation) > 64:
+            raise ValueError("intent operation must be non-empty and bounded")
+        if self.target_text is not None and len(self.target_text) > 2048:
+            raise ValueError("intent target hint exceeds the configured limit")
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError("intent action source span is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredCommand:
+    """Lossy, deterministic command outline; TaskEngine and PolicyEngine remain authoritative."""
+
+    steps: tuple[IntentActionStep, ...]
+    entities: tuple[IntentEntity, ...]
+
+    def __post_init__(self) -> None:
+        if not self.steps or len(self.steps) > 32:
+            raise ValueError("structured command must contain between one and 32 action hints")
+        if len(self.entities) > 96:
+            raise ValueError("structured command contains too many extracted entities")
+
+
+@dataclass(frozen=True, slots=True)
 class IntentClassification:
     kind: IntentKind
     confidence: float
     reason_code: str
+    entities: tuple[IntentEntity, ...] = ()
+    structured_command: StructuredCommand | None = None
 
     @property
     def may_require_runtime_task(self) -> bool:
@@ -72,11 +124,27 @@ class IntentClassifier:
         r"\b(?:open|launch|start|close|quit|switch|focus|search|find|look up|"
         r"navigate|browse|click|tap|type|enter|fill|select|scroll|save|create|"
         r"delete|remove|rename|move|copy|send|download|upload|install|compare|"
-        r"summari[sz]e|research|organize|schedule|set up|turn on|turn off)\b"
+        r"summari[sz]e|research|organize|schedule|set up|turn on|turn off)\b",
+        re.IGNORECASE,
     )
     _step_joiner = re.compile(r"\b(?:and then|then|after that|plus)\b")
 
     def classify(self, text: str) -> IntentClassification:
+        result = self._classify_surface(text)
+        if not isinstance(text, str) or not result.may_require_runtime_task:
+            return result
+        structured = self._structured_command(text)
+        if structured is None:
+            return result
+        return IntentClassification(
+            kind=result.kind,
+            confidence=result.confidence,
+            reason_code=result.reason_code,
+            entities=structured.entities,
+            structured_command=structured,
+        )
+
+    def _classify_surface(self, text: str) -> IntentClassification:
         if not isinstance(text, str) or not text.strip():
             return IntentClassification(IntentKind.CLARIFICATION, 1.0, "empty_input")
         normalized = " ".join(text.casefold().split())
@@ -173,5 +241,77 @@ class IntentClassifier:
             return IntentClassification(IntentKind.CLARIFICATION, 0.95, "no_usable_intent")
         return IntentClassification(IntentKind.CASUAL_CONVERSATION, 0.65, "conversational_fallback")
 
+    _quoted_value = re.compile(
+        r'"(?P<double>[^"\n]{1,512})"|'
+        r"'(?P<single>[^'\n]{1,512})'|"
+        r"“(?P<curly_double>[^”\n]{1,512})”|"
+        r"‘(?P<curly_single>[^’\n]{1,512})’"
+    )
+    _url_value = re.compile(r"""https?://[^\s<>"']{1,2048}""", re.IGNORECASE)
+    _trailing_joiner = re.compile(
+        r"(?:\s*,?\s+)(?:and\s+then|after\s+that|then|plus|and)\s*$",
+        re.IGNORECASE,
+    )
 
-__all__ = ["IntentClassification", "IntentClassifier", "IntentKind"]
+    def _structured_command(self, text: str) -> StructuredCommand | None:
+        bounded = text[:16_384]
+        matches = list(self._action.finditer(bounded))[:32]
+        if not matches:
+            return None
+        steps: list[IntentActionStep] = []
+        entities: list[IntentEntity] = []
+        for index, match in enumerate(matches):
+            segment_end = matches[index + 1].start() if index + 1 < len(matches) else len(bounded)
+            segment = bounded[match.end() : segment_end]
+            target_limit = len(segment)
+            if index + 1 < len(matches):
+                joiner = self._trailing_joiner.search(segment)
+                if joiner is not None:
+                    target_limit = joiner.start()
+            target_source = segment[:target_limit]
+            leading = len(target_source) - len(target_source.lstrip())
+            trailing = len(target_source.rstrip())
+            while leading < trailing and target_source[leading] in ",;:-":
+                leading += 1
+            while trailing > leading and target_source[trailing - 1] in ",.;:!?":
+                trailing -= 1
+            target = target_source[leading:trailing].strip()[:2048]
+            target_start = match.end() + leading
+            operation = " ".join(match.group(0).casefold().split())
+            steps.append(
+                IntentActionStep(
+                    operation=operation,
+                    target_text=target or None,
+                    start=match.start(),
+                    end=match.end(),
+                )
+            )
+            if target:
+                entities.append(
+                    IntentEntity("target", target, target_start, target_start + len(target))
+                )
+
+        for match in self._quoted_value.finditer(bounded):
+            value = next((item for item in match.groupdict().values() if item is not None), None)
+            if value:
+                entities.append(
+                    IntentEntity("quoted_text", value, match.start() + 1, match.end() - 1)
+                )
+        for match in self._url_value.finditer(bounded):
+            value = match.group(0).rstrip(".,;:!?)]")
+            if value:
+                entities.append(
+                    IntentEntity("url", value, match.start(), match.start() + len(value))
+                )
+        entities.sort(key=lambda item: (item.start, item.end, item.kind))
+        return StructuredCommand(tuple(steps), tuple(entities[:96]))
+
+
+__all__ = [
+    "IntentActionStep",
+    "IntentClassification",
+    "IntentClassifier",
+    "IntentEntity",
+    "IntentKind",
+    "StructuredCommand",
+]

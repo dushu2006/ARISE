@@ -20,6 +20,7 @@ import {
   LoaderCircle,
   LockKeyhole,
   MessageSquareText,
+  Pencil,
   Mic,
   Monitor,
   Radio,
@@ -791,6 +792,7 @@ function ResearchPage({ api, notify }: { api: AriseApi; notify: (message: string
 
 function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; notify: (message: string) => void; semanticMemoryEnabled: boolean }) {
   const [records, setRecords] = useState<MemoryRecord[]>([]);
+  const [editingRecord, setEditingRecord] = useState<MemoryRecord | null>(null);
   const [text, setText] = useState('');
   const [kind, setKind] = useState<MemoryKind>('preference');
   const [retentionDays, setRetentionDays] = useState(365);
@@ -820,7 +822,8 @@ function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; not
 
   const saveMemory = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!text.trim() || !consentChecked || saving) return;
+    if (!text.trim() || !consentChecked || saving || deleting) return;
+    const previousRecord = editingRecord;
     const draft: MemoryWriteDraft = {
       text: text.trim(),
       kind,
@@ -833,15 +836,49 @@ function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; not
         throw new Error('The one-time memory consent expired before storage. Please try again.');
       }
       await api.createMemory(draft, consent.consent_reference);
+      if (previousRecord) {
+        try {
+          await api.deleteMemory(previousRecord.record_id);
+        } catch {
+          setText('');
+          setEditingRecord(null);
+          setConsentChecked(false);
+          notify('The replacement was saved, but the original could not be removed. Delete it from the saved list.');
+          await refresh();
+          return;
+        }
+      }
       setText('');
+      setEditingRecord(null);
       setConsentChecked(false);
-      notify('Saved locally with explicit consent.');
+      notify(previousRecord ? 'Memory replaced with explicit consent.' : 'Saved locally with explicit consent.');
       await refresh();
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Memory could not be saved. No automatic retry was made.');
     } finally {
       setSaving(false);
     }
+  };
+
+  const editMemory = (record: MemoryRecord) => {
+    if (saving || deleting) return;
+    const retentionOptions = [30, 365, 1095, 3650];
+    const remainingDays = Math.max(
+      30,
+      Math.ceil((Date.parse(record.expires_at) - Date.now()) / 86_400_000),
+    );
+    const selectedRetention = retentionOptions.find((days) => days >= remainingDays) ?? 3650;
+    setEditingRecord(record);
+    setText(record.text);
+    setKind(record.kind);
+    setRetentionDays(selectedRetention);
+    setConsentChecked(false);
+  };
+
+  const cancelEdit = () => {
+    setEditingRecord(null);
+    setText('');
+    setConsentChecked(false);
   };
 
   const search = async (event: FormEvent<HTMLFormElement>) => {
@@ -859,10 +896,11 @@ function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; not
   };
 
   const removeMemory = async (record: MemoryRecord) => {
-    if (!window.confirm('Delete this saved memory permanently?')) return;
+    if (saving || deleting || !window.confirm('Delete this saved memory permanently?')) return;
     try {
       await api.deleteMemory(record.record_id);
       setRecords((current) => current.filter((item) => item.record_id !== record.record_id));
+      if (editingRecord?.record_id === record.record_id) cancelEdit();
       notify('Memory deleted.');
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Memory could not be deleted.');
@@ -870,11 +908,16 @@ function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; not
   };
 
   const clearAll = async () => {
-    if (!window.confirm('Delete every saved memory and any outstanding write consents? This cannot be undone.')) return;
+    if (
+      saving ||
+      deleting ||
+      !window.confirm('Delete every saved memory and any outstanding write consents? This cannot be undone.')
+    ) return;
     setDeleting(true);
     try {
       const count = await api.clearMemories();
       setRecords([]);
+      cancelEdit();
       setSearchResults([]);
       setDidSearch(false);
       notify(`Deleted ${count} saved ${count === 1 ? 'memory' : 'memories'}.`);
@@ -910,15 +953,15 @@ function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; not
       <div className="memory-privacy-note"><LockKeyhole size={15} /><span>Memory is never inferred from model output. Each write requires a one-time, exact-content consent; records stay in local SQLite, are redacted on storage, and expire automatically.</span></div>
 
       <section className="memory-panel">
-        <div className="memory-panel-heading"><div><span className="eyebrow">EXPLICIT SAVE</span><h2>Add a memory</h2></div><Brain size={18} /></div>
+        <div className="memory-panel-heading"><div><span className="eyebrow">EXPLICIT SAVE</span><h2>{editingRecord ? 'Replace a memory' : 'Add a memory'}</h2></div><Brain size={18} /></div>
         <form className="memory-form" onSubmit={saveMemory}>
           <label className="memory-field"><span>What should ARISE remember?</span><textarea value={text} onChange={(event) => setText(event.target.value)} maxLength={16_384} rows={3} placeholder="For example: I prefer concise status updates." /></label>
           <div className="memory-form-options">
             <label className="memory-field"><span>Category</span><select value={kind} onChange={(event) => setKind(event.target.value as MemoryKind)}><option value="preference">Preference</option><option value="semantic">General fact</option><option value="episodic">Episode / event</option><option value="procedural">Procedure / workflow</option></select></label>
             <label className="memory-field"><span>Keep for</span><select value={retentionDays} onChange={(event) => setRetentionDays(Number(event.target.value))}><option value={30}>30 days</option><option value={365}>1 year</option><option value={1095}>3 years</option><option value={3650}>10 years</option></select></label>
           </div>
-          <label className="memory-consent-check"><input type="checkbox" checked={consentChecked} onChange={(event) => setConsentChecked(event.target.checked)} /><span>I explicitly consent to save this text and category locally until the selected expiry. I understand redaction is best-effort.</span></label>
-          <div className="memory-form-footer"><span>Secrets and sensitive data should not be stored here.</span><button className="button primary" type="submit" disabled={!text.trim() || !consentChecked || saving}>{saving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}Save with consent</button></div>
+          <label className="memory-consent-check"><input type="checkbox" checked={consentChecked} onChange={(event) => setConsentChecked(event.target.checked)} /><span>{editingRecord ? 'I explicitly consent to save this replacement locally. The existing record will be deleted only after the replacement is saved successfully. Redaction is best-effort.' : 'I explicitly consent to save this text and category locally until the selected expiry. I understand redaction is best-effort.'}</span></label>
+          <div className="memory-form-footer"><span>Secrets and sensitive data should not be stored here.</span><div className="memory-actions">{editingRecord && <button className="button secondary" type="button" onClick={cancelEdit} disabled={saving || deleting}>Cancel</button>}<button className="button primary" type="submit" disabled={!text.trim() || !consentChecked || saving || deleting}>{saving ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}{editingRecord ? 'Replace with consent' : 'Save with consent'}</button></div></div>
         </form>
       </section>
 
@@ -930,8 +973,8 @@ function MemoryPage({ api, notify, semanticMemoryEnabled }: { api: AriseApi; not
       </section>
 
       <section className="memory-panel memory-list-panel">
-        <div className="memory-panel-heading"><div><span className="eyebrow">PERSISTED LOCALLY</span><h2>Your saved memories</h2></div><div className="memory-actions"><button className="button secondary small" onClick={() => void exportMemories()} disabled={loading || records.length === 0}><Download size={13} />Export</button><button className="button danger small" onClick={() => void clearAll()} disabled={deleting || records.length === 0}><Trash2 size={13} />Delete all</button></div></div>
-        {loading ? <div className="memory-empty-state"><LoaderCircle className="spin" size={17} />Loading local memory…</div> : records.length === 0 ? <div className="memory-empty-state"><Database size={17} /><span>No saved memories. Nothing is collected automatically.</span></div> : <div className="memory-record-list">{records.map((record) => <article className="memory-record" key={record.record_id}><div className="memory-record-top"><span className={`memory-kind ${record.kind}`}>{record.kind}</span><button className="memory-delete" onClick={() => void removeMemory(record)} aria-label="Delete memory"><Trash2 size={14} /></button></div><p>{record.text}</p><div className="memory-record-meta"><span>Saved {new Date(record.created_at).toLocaleDateString()}</span><span>Expires {new Date(record.expires_at).toLocaleDateString()}</span></div></article>)}</div>}
+        <div className="memory-panel-heading"><div><span className="eyebrow">PERSISTED LOCALLY</span><h2>Your saved memories</h2></div><div className="memory-actions"><button className="button secondary small" onClick={() => void exportMemories()} disabled={loading || records.length === 0}><Download size={13} />Export</button><button className="button danger small" onClick={() => void clearAll()} disabled={deleting || saving || records.length === 0}><Trash2 size={13} />Delete all</button></div></div>
+        {loading ? <div className="memory-empty-state"><LoaderCircle className="spin" size={17} />Loading local memory…</div> : records.length === 0 ? <div className="memory-empty-state"><Database size={17} /><span>No saved memories. Nothing is collected automatically.</span></div> : <div className="memory-record-list">{records.map((record) => <article className="memory-record" key={record.record_id}><div className="memory-record-top"><span className={`memory-kind ${record.kind}`}>{record.kind}</span><div className="memory-record-tools"><button className="memory-edit" type="button" onClick={() => editMemory(record)} disabled={saving || deleting}><Pencil size={12} /><span>Edit</span></button><button className="memory-delete" type="button" onClick={() => void removeMemory(record)} aria-label="Delete memory" disabled={saving || deleting}><Trash2 size={14} /></button></div></div><p>{record.text}</p><div className="memory-record-meta"><span>Saved {new Date(record.created_at).toLocaleDateString()}</span><span>Expires {new Date(record.expires_at).toLocaleDateString()}</span></div></article>)}</div>}
       </section>
       <p className="memory-disclaimer"><Clock3 size={13} />{semanticMemoryEnabled ? 'Semantic ranking uses the explicitly configured embedding endpoint; failures or incompatible vectors fall back to local lexical ranking. Automatic memory suggestions remain disabled.' : 'Retrieval currently uses local lexical ranking. Optional semantic embeddings are not configured, and automatic memory suggestions remain disabled.'}</p>
     </>

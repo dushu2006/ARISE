@@ -53,9 +53,7 @@ class DatabaseInstanceLock:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             stream.close()
-            raise InstanceLockError(
-                "Another ARISE backend already owns this database."
-            ) from exc
+            raise InstanceLockError("Another ARISE backend already owns this database.") from exc
         except BaseException:
             stream.close()
             raise
