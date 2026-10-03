@@ -663,6 +663,26 @@ class SQLiteAdapterTests(unittest.TestCase):
             self.assertEqual(loaded.turns[0].metadata, stored_turn.metadata)
             database.close()
 
+    def test_session_turns_with_equal_timestamps_keep_insertion_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = SQLiteDatabase(Path(directory) / "ordered-sessions.db")
+            repository = SQLiteSessionRepository(database)
+            session = repository.create(Session(principal_id="test-user"))
+            created_at = utc_now()
+            for speaker, text in (("user", "Question"), ("assistant", "Answer")):
+                repository.append_turn(
+                    ConversationTurn(
+                        session_id=session.session_id,
+                        speaker=speaker,
+                        text=text,
+                        created_at=created_at,
+                    )
+                )
+
+            loaded = repository.get(session.session_id)
+            self.assertEqual([turn.speaker for turn in loaded.turns], ["user", "assistant"])
+            database.close()
+
     def test_schema_v1_database_is_migrated_for_causal_events_and_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "legacy.db"

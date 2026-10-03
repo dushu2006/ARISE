@@ -496,7 +496,7 @@
 - [x] COMPLETE — Replay suites pass (pytest replay/failure tests pass; harness replay probes ran under host guard).
 - [x] COMPLETE — Voice harness runs correctly and reports `ENVIRONMENT-LIMITED`/`BLOCKED` honestly on Linux (21 checks; no device/provider access).
 - [x] COMPLETE — No real-only claims made from replay tests (evidence labels and limitations remain explicit).
-- [-] IN PROGRESS — Resolve latest GitHub Actions failures: Ubuntu backend (3.11/3.12) and frontend pass, but Windows backend (3.11/3.12) and Windows Tauri compile fail. GitHub log retrieval hits EOF on Actions log storage, so the failure causes are not yet verified.
+- [-] IN PROGRESS — Windows CI run 37134069280 exposed portability failures: POSIX path string expectations, unstable conversation ordering for equal timestamps, backup-path alias comparison, and TaskEngine approval/worker timing. Fixes are implemented and pass locally on Linux; Windows rerun remains pending. Tauri compile still fails without surfaced compiler details; the CI wrapper now normalizes cargo diagnostics and emits check annotations for the next run.
 - [-] IN PROGRESS — No fake success responses remain in production paths.
 - [-] IN PROGRESS — No accidental debug code remains.
 - [-] IN PROGRESS — No obsolete placeholders remain in production paths.

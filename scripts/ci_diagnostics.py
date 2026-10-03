@@ -110,6 +110,7 @@ def _command_for(mode: str) -> tuple[list[str], Path]:
             [
                 "cargo",
                 "check",
+                "--color=never",
                 "--manifest-path",
                 "src-tauri/Cargo.toml",
             ],
@@ -142,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         return 127
 
     output = result.stdout or ""
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
     if output:
         print(output, end="" if output.endswith("\n") else "\n", flush=True)
     if result.returncode:
@@ -151,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
         if not diagnostics:
             tail = [line.strip() for line in output.splitlines()[-10:] if line.strip()]
             diagnostics = [(None, line[:1000]) for line in tail[:_MAX_ANNOTATIONS]]
+        if not diagnostics:
+            diagnostics = [
+                (None, f"{mode} validation exited with status {result.returncode} and no output.")
+            ]
         _emit_annotations(mode, diagnostics)
     return result.returncode
 

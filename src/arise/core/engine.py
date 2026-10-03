@@ -372,6 +372,27 @@ class TaskEngine:
             if confirmation.task_id == task_id and confirmation_id in self._pending_confirmations
         )
 
+    def _require_pending_confirmation(
+        self, *, task_id: str, confirmation_id: str, approved_by: str
+    ) -> tuple[tuple[str, str, str], ConfirmationRequest]:
+        self.pending_confirmations(task_id)
+        pending = self._pending_confirmations.get(confirmation_id)
+        confirmation = self._confirmation_requests.get(confirmation_id)
+        if (
+            pending is None
+            or confirmation is None
+            or confirmation.expires_at <= utc_now()
+            or pending[0] != task_id
+            or pending[2] != approved_by
+        ):
+            raise PermissionError("confirmation is invalid, expired, or out of scope")
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(task_id)
+        if task.status is not TaskStatus.WAITING_USER:
+            raise PermissionError("task is no longer waiting for approval")
+        return pending, confirmation
+
     async def approve(
         self,
         *,
@@ -387,19 +408,31 @@ class TaskEngine:
             raise PermissionError("approval principal does not own this task")
         if not self._workers:
             await self.start()
+        self._require_pending_confirmation(
+            task_id=task_id, confirmation_id=confirmation_id, approved_by=approved_by
+        )
+
+        # A task can be durably marked WAITING_USER just before its worker has
+        # returned from the final bookkeeping for that turn. Let that processor
+        # and the worker's active-slot cleanup finish before queuing continuation.
+        current = asyncio.current_task()
+        while (active := self._active.get(task_id)) is not None:
+            if active is current:
+                raise RuntimeError("a task cannot approve itself while it is active")
+            if active.done():
+                await asyncio.sleep(0)
+            else:
+                await asyncio.gather(active, return_exceptions=True)
+                await asyncio.sleep(0)
+
+        task = self.tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(task_id)
+        pending, _ = self._require_pending_confirmation(
+            task_id=task_id, confirmation_id=confirmation_id, approved_by=approved_by
+        )
         if self._queue.full():
             raise TaskQueueFull("the task queue is full; approval remains pending")
-        self.pending_confirmations(task_id)
-        pending = self._pending_confirmations.get(confirmation_id)
-        confirmation = self._confirmation_requests.get(confirmation_id)
-        if (
-            pending is None
-            or confirmation is None
-            or confirmation.expires_at <= utc_now()
-            or pending[0] != task_id
-            or pending[2] != approved_by
-        ):
-            raise PermissionError("confirmation is invalid, expired, or out of scope")
         _, action_id, _ = pending
         action = self._actions.get((task_id, action_id))
         plan_info = self._plans.get(task_id)
@@ -416,8 +449,6 @@ class TaskEngine:
         )
         if start_index is None:
             raise InvalidPlan("approved action no longer belongs to the in-memory plan")
-        if task_id in self._active:
-            raise RuntimeError("task already has an active operation")
         tool = self.tools.get(action.tool_name)
         grant: ApprovalGrant = self.policy.issue_approval(
             action,
@@ -726,15 +757,13 @@ class TaskEngine:
                 self._fail_before_dispatch(task_id, "Task execution exceeded its deadline.")
                 return
             try:
-                result: ActionRunResult = await asyncio.wait_for(
-                    self.runtime.execute_action(
+                async with asyncio.timeout(remaining):
+                    result: ActionRunResult = await self.runtime.execute_action(
                         action,
                         approval=approval if index == start_index else None,
                         final_action=final_action,
                         resource_wait_timeout=self.config.resource_wait_timeout_seconds,
-                    ),
-                    timeout=remaining,
-                )
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

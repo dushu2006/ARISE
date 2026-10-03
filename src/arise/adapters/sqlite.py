@@ -860,8 +860,7 @@ class SQLiteSessionRepository(SessionRepository):
             if row is None:
                 return None
             turn_rows = connection.execute(
-                "SELECT * FROM conversation_turns WHERE session_id = ? "
-                "ORDER BY created_at, turn_id",
+                "SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY created_at, rowid",
                 (session_id,),
             ).fetchall()
         turns = tuple(

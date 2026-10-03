@@ -29,7 +29,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(result, 0)
             destination = Path(json.loads(output.getvalue())["backup_path"])
             self.assertTrue(destination.is_file())
-            self.assertEqual(destination.parent, settings.data_dir / "backups")
+            self.assertTrue(destination.parent.samefile(settings.data_dir / "backups"))
             snapshot = SQLiteDatabase(destination)
             snapshot.close()
 

@@ -126,7 +126,7 @@ class SettingsValidationTests(unittest.TestCase):
             local_model_path="/models/vosk-en",
         )
         self.assertTrue(enabled.microphone_enabled)
-        self.assertEqual(str(enabled.local_model_path), "/models/vosk-en")
+        self.assertEqual(enabled.local_model_path.as_posix(), "/models/vosk-en")
 
     def test_voice_timeout_secret_name_and_model_are_bounded(self) -> None:
         for timeout in (4, 3601):
