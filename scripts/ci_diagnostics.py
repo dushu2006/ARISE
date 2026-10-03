@@ -87,9 +87,10 @@ def _cargo_diagnostics(output: str) -> list[tuple[str | None, str]]:
 
 def _emit_annotations(kind: str, diagnostics: list[tuple[str | None, str]]) -> None:
     for path, message in diagnostics:
-        file_property = f" file={path}," if path else ""
+        properties = [f"file={path}"] if path else []
+        properties.append(f"title={kind} failure")
         escaped = _escape_command_data(message)
-        print(f"::error{file_property}title={kind} failure::{escaped}", flush=True)
+        print(f"::error {','.join(properties)}::{escaped}", flush=True)
 
 
 def _command_for(mode: str) -> tuple[list[str], Path]:
