@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 
 from arise.core.errors import CapabilityUnavailableError, ProviderUnavailableError
+from arise.core.events import EventEnvelope, EventSeverity, EventStore
 from arise.core.models import (
     CapabilityStatus,
     ModelRequest,
@@ -53,11 +54,13 @@ class ModelRouter:
         max_concurrent_requests: int = 4,
         circuit_failure_threshold: int = 3,
         circuit_recovery_seconds: float = 30.0,
+        events: EventStore | None = None,
     ) -> None:
         if max_concurrent_requests < 1:
             raise ValueError("max_concurrent_requests must be positive")
         self.allow_cloud = allow_cloud
         self.max_concurrent_requests = max_concurrent_requests
+        self.events = events
         self._providers: dict[str, _ProviderRuntime] = {}
         self._failure_threshold = circuit_failure_threshold
         self._recovery_seconds = circuit_recovery_seconds
@@ -119,31 +122,117 @@ class ModelRouter:
             required_modalities=request.required_modalities,
             preferred_provider=None,
         )
-        selected = self.select(selector)
+        try:
+            selected = self.select(selector)
+        except CapabilityUnavailableError:
+            self._record_model_event(
+                "MODEL_REQUEST_FAILED",
+                request,
+                severity=EventSeverity.WARNING,
+                payload={
+                    "request_id": request.request_id,
+                    "role": request.role.value,
+                    "attempt": 0,
+                    "provider_id": None,
+                    "error_code": "MODEL_NO_ELIGIBLE_PROVIDER",
+                },
+            )
+            raise
         candidates = self._candidates(selector)
         candidates.sort(key=lambda item: item.provider.provider_id != selected.provider_id)
         last_error: BaseException | None = None
+        last_failed_provider: str | None = None
+        fallback_reason: str | None = None
+        attempt = 0
         for runtime in candidates:
-            if request.stream and not getattr(runtime.provider, "supports_streaming", True):
+            provider = runtime.provider
+            if request.stream and not getattr(provider, "supports_streaming", True):
                 last_error = CapabilityUnavailableError(
                     "The selected model provider does not support streaming responses.",
                     component="model-router",
                     operation="complete",
                 )
+                last_failed_provider = provider.provider_id
+                fallback_reason = "MODEL_STREAMING_UNSUPPORTED"
+                self._record_model_event(
+                    "MODEL_REQUEST_FAILED",
+                    request,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "attempt": attempt + 1,
+                        "provider_id": provider.provider_id,
+                        "error_code": fallback_reason,
+                    },
+                )
                 continue
             if not runtime.breaker.allow_request():
                 last_error = CircuitOpenError("model provider circuit is open")
+                last_failed_provider = provider.provider_id
+                fallback_reason = "MODEL_CIRCUIT_OPEN"
+                self._record_model_event(
+                    "MODEL_REQUEST_FAILED",
+                    request,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "attempt": attempt + 1,
+                        "provider_id": provider.provider_id,
+                        "error_code": fallback_reason,
+                    },
+                )
                 continue
-            provider = runtime.provider
             if request.model_id is not None and request.model_id not in provider.model_ids:
                 last_error = CapabilityUnavailableError(
                     "Requested model ID is not exposed by the selected provider.",
                     component="model-router",
                     operation="complete",
                 )
+                last_failed_provider = provider.provider_id
+                fallback_reason = "MODEL_ID_UNAVAILABLE"
+                self._record_model_event(
+                    "MODEL_REQUEST_FAILED",
+                    request,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "attempt": attempt + 1,
+                        "provider_id": provider.provider_id,
+                        "error_code": fallback_reason,
+                    },
+                )
                 continue
             model_id = request.model_id or self._select_model(provider, selector)
             routed_request = request.model_copy(update={"model_id": model_id})
+            if last_failed_provider is not None:
+                self._record_model_event(
+                    "MODEL_FALLBACK_SELECTED",
+                    request,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "attempt": attempt + 1,
+                        "from_provider_id": last_failed_provider,
+                        "provider_id": provider.provider_id,
+                        "reason_code": fallback_reason or "MODEL_PROVIDER_UNAVAILABLE",
+                    },
+                )
+            attempt += 1
+            self._record_model_event(
+                "MODEL_REQUEST_STARTED",
+                request,
+                payload={
+                    "request_id": request.request_id,
+                    "role": request.role.value,
+                    "attempt": attempt,
+                    "provider_id": provider.provider_id,
+                    "model_id": model_id,
+                    "stream_requested": request.stream,
+                },
+            )
             started = time.perf_counter()
             try:
                 async with runtime.semaphore:
@@ -159,17 +248,57 @@ class ModelRouter:
                         component="model-router",
                         operation="complete",
                     )
-                runtime.breaker.record_success()
-                runtime.failures = 0
-                runtime.last_success_at = datetime.now(UTC)
-                runtime.last_latency_ms = (time.perf_counter() - started) * 1000
-                return response
             except asyncio.CancelledError:
+                self._record_model_event(
+                    "MODEL_REQUEST_CANCELLED",
+                    request,
+                    severity=EventSeverity.INFO,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "attempt": attempt,
+                        "provider_id": provider.provider_id,
+                        "model_id": model_id,
+                    },
+                )
                 raise
             except Exception as exc:
                 runtime.breaker.record_failure()
                 runtime.failures += 1
                 last_error = exc
+                last_failed_provider = provider.provider_id
+                fallback_reason = self._failure_code(exc)
+                self._record_model_event(
+                    "MODEL_REQUEST_FAILED",
+                    request,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "attempt": attempt,
+                        "provider_id": provider.provider_id,
+                        "model_id": model_id,
+                        "error_code": fallback_reason,
+                    },
+                )
+                continue
+            runtime.breaker.record_success()
+            runtime.failures = 0
+            runtime.last_success_at = datetime.now(UTC)
+            runtime.last_latency_ms = (time.perf_counter() - started) * 1000
+            self._record_model_event(
+                "MODEL_RESPONSE_COMPLETED",
+                request,
+                payload={
+                    "request_id": request.request_id,
+                    "role": request.role.value,
+                    "attempt": attempt,
+                    "provider_id": response.provider_id,
+                    "model_id": response.model_id,
+                    "latency_ms": round(runtime.last_latency_ms, 3),
+                },
+            )
+            return response
         if isinstance(last_error, CapabilityUnavailableError):
             raise last_error
         raise ProviderUnavailableError(
@@ -179,6 +308,40 @@ class ModelRouter:
             retryable=True,
             metadata={"provider_count": len(candidates)},
         ) from last_error
+
+    def _record_model_event(
+        self,
+        event_type: str,
+        request: ModelRequest,
+        *,
+        payload: dict[str, str | int | float | bool | None],
+        severity: EventSeverity = EventSeverity.INFO,
+    ) -> None:
+        if self.events is None:
+            return
+        self.events.append(
+            EventEnvelope(
+                event_type=event_type,
+                task_id=request.task_id,
+                session_id=request.session_id,
+                correlation_id=request.correlation_id,
+                source="model-router",
+                severity=severity,
+                payload=payload,
+            )
+        )
+
+    @staticmethod
+    def _failure_code(error: BaseException) -> str:
+        if isinstance(error, TimeoutError):
+            return "MODEL_PROVIDER_TIMEOUT"
+        if isinstance(error, CircuitOpenError):
+            return "MODEL_CIRCUIT_OPEN"
+        if isinstance(error, CapabilityUnavailableError):
+            return "MODEL_CAPABILITY_UNAVAILABLE"
+        if isinstance(error, ProviderUnavailableError):
+            return "MODEL_PROVIDER_UNAVAILABLE"
+        return "MODEL_PROVIDER_FAILED"
 
     def status(self) -> tuple[ProviderStatus, ...]:
         result: list[ProviderStatus] = []

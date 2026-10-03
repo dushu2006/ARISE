@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from arise.core.extensions import (
     MemoryConsentError,
     MemoryEntry,
+    memory_entry_fingerprint,
     require_memory_write_consent,
 )
 
@@ -14,7 +16,7 @@ from arise.core.extensions import (
 class FakeConsentRegistry:
     """Test-only atomic consent port; this is not a memory store."""
 
-    def __init__(self, grants: dict[str, tuple[str, datetime]]) -> None:
+    def __init__(self, grants: dict[str, tuple[str, datetime, str | None]]) -> None:
         self.grants = grants
         self.consumed: set[str] = set()
         self._lock = asyncio.Lock()
@@ -24,6 +26,7 @@ class FakeConsentRegistry:
         *,
         principal_id: str,
         consent_reference: str,
+        entry_fingerprint: str,
         now: datetime,
     ) -> bool:
         async with self._lock:
@@ -32,6 +35,7 @@ class FakeConsentRegistry:
                 grant is None
                 or grant[0] != principal_id
                 or grant[1] <= now
+                or (grant[2] is not None and grant[2] != entry_fingerprint)
                 or consent_reference in self.consumed
             ):
                 return False
@@ -57,8 +61,8 @@ class MemoryConsentGuardTests(unittest.IsolatedAsyncioTestCase):
 
         registry = FakeConsentRegistry(
             {
-                "expired": ("user-a", self.now - timedelta(seconds=1)),
-                "other-user": ("user-b", self.now + timedelta(days=1)),
+                "expired": ("user-a", self.now - timedelta(seconds=1), None),
+                "other-user": ("user-b", self.now + timedelta(days=1), None),
             }
         )
         with self.assertRaises(MemoryConsentError):
@@ -72,7 +76,7 @@ class MemoryConsentGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_proposal_expiry_is_checked_even_with_a_live_consent_grant(self) -> None:
         registry = FakeConsentRegistry(
-            {"consent-a": ("user-a", self.now + timedelta(days=1))}
+            {"consent-a": ("user-a", self.now + timedelta(days=1), None)}
         )
         expired_entry = self.entry().__class__(
             principal_id="user-a",
@@ -86,16 +90,34 @@ class MemoryConsentGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_consent_reference_is_consumed_once_and_replay_is_rejected(self) -> None:
         registry = FakeConsentRegistry(
-            {"consent-a": ("user-a", self.now + timedelta(days=1))}
+            {"consent-a": ("user-a", self.now + timedelta(days=1), None)}
         )
         await require_memory_write_consent(self.entry(), registry, now=self.now)
         with self.assertRaises(MemoryConsentError):
             await require_memory_write_consent(self.entry(), registry, now=self.now)
         self.assertEqual(registry.consumed, {"consent-a"})
 
+    async def test_consent_is_bound_to_exact_entry_content(self) -> None:
+        approved = self.entry()
+        registry = FakeConsentRegistry(
+            {
+                "consent-a": (
+                    "user-a",
+                    self.now + timedelta(days=1),
+                    memory_entry_fingerprint(approved),
+                )
+            }
+        )
+        changed = replace(approved, text="A different memory.")
+        with self.assertRaises(MemoryConsentError):
+            await require_memory_write_consent(changed, registry, now=self.now)
+        self.assertFalse(registry.consumed)
+        await require_memory_write_consent(approved, registry, now=self.now)
+        self.assertEqual(registry.consumed, {"consent-a"})
+
     async def test_concurrent_replay_allows_exactly_one_consumer(self) -> None:
         registry = FakeConsentRegistry(
-            {"consent-a": ("user-a", self.now + timedelta(days=1))}
+            {"consent-a": ("user-a", self.now + timedelta(days=1), None)}
         )
         results = await asyncio.gather(
             require_memory_write_consent(self.entry(), registry, now=self.now),

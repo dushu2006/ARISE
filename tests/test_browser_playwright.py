@@ -21,6 +21,7 @@ class FakeLocator:
     def __init__(self) -> None:
         self.fill_value: str | None = None
         self.click_count = 0
+        self.scroll_count = 0
         self.press_keys: list[str] = []
 
     async def count(self) -> int:
@@ -49,6 +50,7 @@ class FakeLocator:
 
     async def scroll_into_view_if_needed(self, *, timeout: int) -> None:
         del timeout
+        self.scroll_count += 1
 
 
 class FakePage:
@@ -213,6 +215,26 @@ class PlaywrightBrowserTests(unittest.IsolatedAsyncioTestCase):
             await self.provider.click(candidate, timeout_seconds=1)
         self.assertIs(caught.exception.code, ComputerFailureCode.TARGET_STALE)
         self.assertEqual(self.page.locator_instance.click_count, 0)
+
+    async def test_scroll_dispatches_only_after_fresh_target_validation(self) -> None:
+        candidate = (await self.provider.inspect(self.page_id))[0]
+        await self.provider.scroll_into_view(candidate, timeout_seconds=1)
+        self.assertEqual(self.page.locator_instance.scroll_count, 1)
+        self.page.rows[0] = {**self.row, "name": "New password control"}
+        with self.assertRaises(ComputerAdapterError) as caught:
+            await self.provider.scroll_into_view(candidate, timeout_seconds=1)
+        self.assertIs(caught.exception.code, ComputerFailureCode.TARGET_STALE)
+        self.assertEqual(self.page.locator_instance.scroll_count, 1)
+
+    async def test_popup_pages_are_registered_as_scoped_tabs(self) -> None:
+        popup = FakePage([self.row])
+        self.provider._context.pages.append(popup)
+        tabs = await self.provider.list_tabs()
+        self.assertEqual(len(tabs), 2)
+        popup_record = next(tab for tab in tabs if tab.page_id != self.page_id)
+        self.assertEqual(popup_record.title, "Sign in")
+        self.assertNotIn("private", popup_record.url)
+        self.assertNotEqual(popup_record.page_id, self.page_id)
 
     def test_browser_url_policy_blocks_unsafe_schemes_and_private_hosts(self) -> None:
         self.assertEqual(

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,7 +20,7 @@ from arise.adapters.sqlite import (
     SQLiteTaskRepository,
     UnsupportedDatabaseVersion,
 )
-from arise.core.contracts import AuthorizationContext, TrustLevel
+from arise.core.contracts import AuthorizationContext, TrustLevel, utc_now
 from arise.core.errors import DatabaseError
 from arise.core.events import DuplicateEventError, EventEnvelope
 from arise.core.models import ConversationTurn, Session
@@ -30,6 +33,49 @@ from arise.core.tasks import (
 
 
 class SQLiteAdapterTests(unittest.TestCase):
+    def test_file_database_uses_wal_and_normal_synchronous_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = SQLiteDatabase(Path(directory) / "wal.sqlite3")
+            with database.locked() as connection:
+                self.assertEqual(
+                    connection.execute("PRAGMA journal_mode").fetchone()[0].casefold(), "wal"
+                )
+                self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 1)
+            database.close()
+
+    def test_online_backup_is_atomic_private_and_refuses_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = SQLiteDatabase(root / "live.sqlite3")
+            repository = SQLiteTaskRepository(database)
+            task = TaskRecord.new("Backup this task")
+            task.transition_to(TaskStatus.QUEUED)
+            repository.save(task)
+            event_store = SQLiteEventStore(database)
+            event_store.append(EventEnvelope(event_type="BACKUP_FIXTURE", task_id=task.task_id))
+
+            destination = database.backup_to(root / "backups" / "snapshot.sqlite3")
+            self.assertTrue(destination.is_file())
+            if os.name != "nt":
+                self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                database.backup_to(destination)
+            with self.assertRaises(ValueError):
+                database.backup_to(database.path)
+
+            snapshot = SQLiteDatabase(destination)
+            self.assertEqual(
+                SQLiteTaskRepository(snapshot).get(task.task_id).status, TaskStatus.QUEUED
+            )
+            self.assertEqual(
+                [event.event_type for event in SQLiteEventStore(snapshot).read_after()],
+                ["BACKUP_FIXTURE"],
+            )
+            with snapshot.locked() as connection:
+                self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            snapshot.close()
+            database.close()
+
     def test_managed_instance_lock_precedes_connection_and_releases_on_close(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "owned.db"
@@ -124,6 +170,286 @@ class SQLiteAdapterTests(unittest.TestCase):
             with self.assertRaises(DuplicateEventError):
                 store.append(replace(first, payload={"different": True}))
             self.assertEqual(store.latest_sequence(), 3)
+            database.close()
+
+    def test_clear_terminal_history_preserves_active_work_events_and_request_tombstones(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = SQLiteDatabase(Path(directory) / "history-clear.db")
+            tasks = SQLiteTaskRepository(database)
+            sessions = SQLiteSessionRepository(database)
+            events = SQLiteEventStore(database)
+            session = sessions.create(Session(session_id="session-a", principal_id="user-a"))
+            terminal_auth = AuthorizationContext(
+                principal_id="user-a",
+                user_intent_id="request-terminal",
+                trust=TrustLevel.USER_INSTRUCTION,
+            )
+            terminal = TaskRecord.new(
+                "Terminal task",
+                authorization=terminal_auth,
+                request_id="request-terminal",
+                session_id=session.session_id,
+            )
+            terminal.transition_to(TaskStatus.FAILED, reason="fixture failure")
+            terminal, created = tasks.create_or_get(
+                terminal, request_fingerprint="terminal-fingerprint"
+            )
+            self.assertTrue(created)
+
+            active_auth = AuthorizationContext(
+                principal_id="user-a",
+                user_intent_id="request-active",
+                trust=TrustLevel.USER_INSTRUCTION,
+            )
+            active = TaskRecord.new(
+                "Still active",
+                authorization=active_auth,
+                request_id="request-active",
+                session_id=session.session_id,
+            )
+            active.transition_to(TaskStatus.QUEUED)
+            active, created = tasks.create_or_get(active, request_fingerprint="active-fingerprint")
+            self.assertTrue(created)
+
+            recoverable_tasks = []
+            for request_id, final_status in (
+                ("request-unknown", TaskStatus.UNKNOWN),
+                ("request-interrupted", TaskStatus.INTERRUPTED),
+                ("request-partial", TaskStatus.PARTIALLY_COMPLETED),
+            ):
+                authority = AuthorizationContext(
+                    principal_id="user-a",
+                    user_intent_id=request_id,
+                    trust=TrustLevel.USER_INSTRUCTION,
+                )
+                recoverable = TaskRecord.new(
+                    request_id,
+                    authorization=authority,
+                    request_id=request_id,
+                    session_id=session.session_id,
+                )
+                for status in (
+                    TaskStatus.QUEUED,
+                    TaskStatus.UNDERSTANDING,
+                    TaskStatus.PLANNING,
+                    TaskStatus.READY,
+                    TaskStatus.RUNNING,
+                    final_status,
+                ):
+                    recoverable.transition_to(status)
+                recoverable, created = tasks.create_or_get(
+                    recoverable, request_fingerprint=f"{request_id}-fingerprint"
+                )
+                self.assertTrue(created)
+                recoverable_tasks.append(recoverable)
+
+            active_event = events.append(
+                EventEnvelope(
+                    event_type="ACTIVE_EVENT",
+                    task_id=active.task_id,
+                    session_id=session.session_id,
+                )
+            )
+            terminal_event = events.append(
+                EventEnvelope(
+                    event_type="TERMINAL_EVENT",
+                    task_id=terminal.task_id,
+                    session_id=session.session_id,
+                )
+            )
+            self.assertEqual(events.replay_floor(), 0)
+            self.assertEqual(terminal_event.sequence, active_event.sequence + 1)
+            sessions.append_turn(
+                ConversationTurn(
+                    session_id=session.session_id,
+                    speaker="user",
+                    text="Terminal task request",
+                    task_id=terminal.task_id,
+                )
+            )
+            sessions.append_turn(
+                ConversationTurn(
+                    session_id=session.session_id,
+                    speaker="user",
+                    text="Active task request",
+                    task_id=active.task_id,
+                )
+            )
+
+            latest_sequence_before_clear = events.latest_sequence()
+            result = tasks.clear_terminal_history(principal_id="user-a")
+            self.assertEqual(events.latest_sequence(), latest_sequence_before_clear)
+            self.assertEqual(events.replay_floor(), terminal_event.sequence)
+            next_event = events.append(EventEnvelope(event_type="AFTER_HISTORY_CLEAR"))
+            self.assertGreater(next_event.sequence, latest_sequence_before_clear)
+            self.assertEqual(
+                result,
+                {
+                    "deleted_tasks": 1,
+                    "retained_recoverable_tasks": 4,
+                    "deleted_events": 1,
+                    "deleted_sessions": 0,
+                },
+            )
+            self.assertIsNone(tasks.get(terminal.task_id))
+            self.assertEqual(tasks.get(active.task_id).status, TaskStatus.QUEUED)
+            self.assertEqual(
+                {item.task_id for item in tasks.list_for_principal(principal_id="user-a")},
+                {active.task_id, *(item.task_id for item in recoverable_tasks)},
+            )
+            self.assertEqual(events.read_after(task_id=terminal.task_id), [])
+            self.assertEqual(
+                [event.event_type for event in events.read_after(task_id=active.task_id)],
+                ["ACTIVE_EVENT"],
+            )
+            remaining_session = sessions.get(session.session_id)
+            self.assertEqual([turn.task_id for turn in remaining_session.turns], [active.task_id])
+
+            replay = TaskRecord.new(
+                "Terminal task replay",
+                authorization=terminal_auth,
+                request_id="request-terminal",
+                session_id=session.session_id,
+            )
+            replay.transition_to(TaskStatus.QUEUED)
+            with self.assertRaisesRegex(DuplicateTaskRequestError, "cleared history"):
+                tasks.create_or_get(replay, request_fingerprint="terminal-fingerprint")
+
+            other_session = sessions.create(Session(session_id="session-b", principal_id="user-a"))
+            other_terminal_auth = AuthorizationContext(
+                principal_id="user-a",
+                user_intent_id="request-other-terminal",
+                trust=TrustLevel.USER_INSTRUCTION,
+            )
+            other_terminal = TaskRecord.new(
+                "Other settled task",
+                authorization=other_terminal_auth,
+                request_id="request-other-terminal",
+                session_id=other_session.session_id,
+            )
+            other_terminal.transition_to(TaskStatus.FAILED, reason="fixture failure")
+            other_terminal, created = tasks.create_or_get(
+                other_terminal, request_fingerprint="other-terminal-fingerprint"
+            )
+            self.assertTrue(created)
+            events.append(
+                EventEnvelope(
+                    event_type="OTHER_TERMINAL_EVENT",
+                    task_id=other_terminal.task_id,
+                    session_id=other_session.session_id,
+                )
+            )
+            sessions.append_turn(
+                ConversationTurn(
+                    session_id=other_session.session_id,
+                    speaker="user",
+                    text="Other terminal task request",
+                    task_id=other_terminal.task_id,
+                )
+            )
+
+            last_active = tasks.get(active.task_id)
+            last_active.transition_to(TaskStatus.CANCELLED, reason="test cleanup")
+            tasks.save(last_active)
+            final_clear = tasks.clear_terminal_history(principal_id="user-a")
+            self.assertEqual(final_clear["deleted_tasks"], 2)
+            self.assertEqual(final_clear["retained_recoverable_tasks"], 3)
+            self.assertEqual(final_clear["deleted_sessions"], 1)
+            self.assertIsNotNone(sessions.get(session.session_id))
+            self.assertIsNone(sessions.get(other_session.session_id))
+            database.close()
+
+    def test_history_retention_prunes_old_settled_tasks_and_keeps_ambiguous_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = SQLiteDatabase(Path(directory) / "history-retention.db")
+            tasks = SQLiteTaskRepository(database)
+            sessions = SQLiteSessionRepository(database)
+            events = SQLiteEventStore(database)
+
+            def create_task(request_id: str, session_id: str, status: TaskStatus) -> TaskRecord:
+                sessions.create(Session(session_id=session_id, principal_id="user-a"))
+                authority = AuthorizationContext(
+                    principal_id="user-a",
+                    user_intent_id=request_id,
+                    trust=TrustLevel.USER_INSTRUCTION,
+                )
+                task = TaskRecord.new(
+                    request_id,
+                    authorization=authority,
+                    request_id=request_id,
+                    session_id=session_id,
+                )
+                if status is TaskStatus.UNKNOWN:
+                    for next_status in (
+                        TaskStatus.QUEUED,
+                        TaskStatus.UNDERSTANDING,
+                        TaskStatus.PLANNING,
+                        TaskStatus.READY,
+                        TaskStatus.RUNNING,
+                        TaskStatus.UNKNOWN,
+                    ):
+                        task.transition_to(next_status)
+                else:
+                    task.transition_to(status)
+                saved, created = tasks.create_or_get(task, request_fingerprint=request_id)
+                self.assertTrue(created)
+                return saved
+
+            old_terminal = create_task("old-terminal", "old-session", TaskStatus.FAILED)
+            old_unknown = create_task("old-unknown", "unknown-session", TaskStatus.UNKNOWN)
+            recent_terminal = create_task("recent-terminal", "recent-session", TaskStatus.FAILED)
+            events.append(
+                EventEnvelope(
+                    event_type="OLD_TERMINAL_EVENT",
+                    task_id=old_terminal.task_id,
+                    session_id=old_terminal.session_id,
+                )
+            )
+            events.append(
+                EventEnvelope(
+                    event_type="UNKNOWN_EVENT",
+                    task_id=old_unknown.task_id,
+                    session_id=old_unknown.session_id,
+                )
+            )
+            cutoff = utc_now() - timedelta(days=30)
+            old_time = (cutoff - timedelta(days=2)).isoformat()
+            with database.transaction() as connection:
+                for task in (old_terminal, old_unknown):
+                    persisted = tasks.get(task.task_id)
+                    persisted.updated_at = cutoff - timedelta(days=2)
+                    payload = json.dumps(persisted.to_dict(), sort_keys=True, separators=(",", ":"))
+                    connection.execute(
+                        "UPDATE tasks SET updated_at = ?, payload_json = ? WHERE task_id = ?",
+                        (old_time, payload, task.task_id),
+                    )
+
+            result = tasks.prune_terminal_history(before=cutoff)
+            self.assertEqual(
+                result,
+                {
+                    "deleted_tasks": 1,
+                    "retained_recoverable_tasks": 1,
+                    "deleted_events": 1,
+                    "deleted_sessions": 1,
+                },
+            )
+            self.assertIsNone(tasks.get(old_terminal.task_id))
+            self.assertEqual(tasks.get(old_unknown.task_id).status, TaskStatus.UNKNOWN)
+            self.assertEqual(tasks.get(recent_terminal.task_id).status, TaskStatus.FAILED)
+            self.assertIsNone(sessions.get("old-session"))
+            self.assertIsNotNone(sessions.get("unknown-session"))
+            replay = TaskRecord.new(
+                "Replay old terminal task",
+                authorization=old_terminal.authorization,
+                request_id=old_terminal.request_id,
+                session_id=old_terminal.session_id,
+            )
+            replay.transition_to(TaskStatus.QUEUED)
+            with self.assertRaisesRegex(DuplicateTaskRequestError, "cleared history"):
+                tasks.create_or_get(replay, request_fingerprint="old-terminal")
             database.close()
 
     def test_task_request_ids_are_idempotent_and_scoped(self) -> None:
@@ -235,9 +561,7 @@ class SQLiteAdapterTests(unittest.TestCase):
                     session_id="concurrent-session",
                 )
                 barrier.wait(timeout=3)
-                return repository.create_or_get(
-                    candidate, request_fingerprint="same-fingerprint"
-                )
+                return repository.create_or_get(candidate, request_fingerprint="same-fingerprint")
 
             try:
                 with ThreadPoolExecutor(max_workers=2) as pool:
@@ -311,7 +635,7 @@ class SQLiteAdapterTests(unittest.TestCase):
                         "SELECT version FROM schema_migrations ORDER BY version"
                     )
                 ]
-            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9])
             with recovered.locked() as connection:
                 task_request_columns = {
                     row["name"] for row in connection.execute("PRAGMA table_info(task_requests)")
@@ -382,11 +706,12 @@ class SQLiteAdapterTests(unittest.TestCase):
                 request_columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(task_requests)")
                 }
-            self.assertEqual(versions, [1, 2, 3, 4, 5])
+            self.assertEqual(versions, [1, 2, 3, 4, 5, 6, 7, 8, 9])
             self.assertIn("request_fingerprint", request_columns)
             self.assertIn("correlation_id", event_columns)
             self.assertIn("causation_id", event_columns)
             store = SQLiteEventStore(database)
+            self.assertEqual(store.replay_floor(), 0)
             event = store.append(
                 EventEnvelope(
                     event_type="TASK_CREATED",

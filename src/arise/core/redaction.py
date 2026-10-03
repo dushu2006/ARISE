@@ -17,8 +17,9 @@ class SecretRedactor:
 
     _PATTERNS = (
         re.compile(
-            r"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|"
-            r"password|passwd|secret)\b\s*[:=]\s*)([^\s,;]+)"
+            r"(?i)(\b(?:api[_-]?key|(?:api|access|refresh|auth|id|session|bearer)?[_-]?token|"
+            r"authorization|client[_-]?secret|private[_-]?key|credential|password|passwd|secret)"
+            r"\b\s*[:=]\s*)([^\s,;]+)"
         ),
         re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+=*"),
         re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
@@ -47,7 +48,7 @@ class SecretRedactor:
             for key, item in value.items():
                 safe_key = str(key)
                 if re.search(
-                    r"(?i)(api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|secret|credential)",
+                    r"(?i)(api[_-]?key|(?:api|access|refresh|auth|id|session|bearer)?[_-]?token|authorization|private[_-]?key|password|passwd|secret|credential)",
                     safe_key,
                 ):
                     redacted[safe_key] = "[REDACTED]"

@@ -64,3 +64,6 @@ class PublishingEventStore(EventStore):
 
     def latest_sequence(self) -> int:
         return self.store.latest_sequence()
+
+    def replay_floor(self) -> int:
+        return self.store.replay_floor()

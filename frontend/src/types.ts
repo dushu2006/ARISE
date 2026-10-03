@@ -1,3 +1,70 @@
+export type MemoryKind = 'semantic' | 'preference' | 'episodic' | 'procedural';
+
+export interface MemoryRecord {
+  record_id: string;
+  text: string;
+  kind: MemoryKind;
+  provenance: string;
+  created_at: string;
+  expires_at: string;
+  source_task_id: string | null;
+}
+
+export interface MemoryWriteDraft {
+  text: string;
+  kind: MemoryKind;
+  expires_at: string;
+  source_task_id?: string | null;
+}
+
+export interface MemoryConsent {
+  consent_reference: string;
+  expires_at: string;
+}
+
+export interface MemorySearchResult {
+  source: string;
+  source_id: string;
+  text: string;
+  provenance: string;
+  retrieved_at: string;
+  relevance: number | null;
+}
+
+export interface WebResearchResult {
+  source: string;
+  source_id: string;
+  text: string;
+  provenance: string;
+  retrieved_at: string;
+  relevance: number | null;
+}
+
+export interface WebResearchResponse {
+  provider: string;
+  authority: 'untrusted_context_only';
+  results: WebResearchResult[];
+}
+
+export type TextInteractionOutcome = 'task' | 'answer' | 'clarification' | 'control' | 'unavailable';
+
+export interface TextInteractionSource {
+  source_id: string;
+  text: string;
+  provenance: string;
+  retrieved_at: string;
+  relevance: number | null;
+}
+
+export interface TextInteractionResponse {
+  outcome: TextInteractionOutcome;
+  intent: string;
+  task: TaskSnapshot | null;
+  answer: string | null;
+  provider_id: string | null;
+  sources: TextInteractionSource[];
+}
+
 export type CapabilityStatus =
   | 'available'
   | 'degraded'
@@ -57,6 +124,7 @@ export interface TaskSnapshot {
   task_id: string;
   request_id: string;
   session_id: string;
+  parent_task_id: string | null;
   correlation_id: string;
   goal: string;
   state: TaskState;
@@ -86,6 +154,21 @@ export interface TaskDetail {
   accepts_user_input: boolean;
 }
 
+export interface TaskHistoryExport {
+  format_version: 1;
+  exported_at: string;
+  tasks: TaskSnapshot[];
+  events: EventRecord[];
+  truncated: { tasks: boolean; events: boolean };
+}
+
+export interface TaskHistoryClearResult {
+  deleted_tasks: number;
+  retained_recoverable_tasks: number;
+  deleted_events: number;
+  deleted_sessions: number;
+}
+
 export interface HealthSnapshot {
   schema_version: number;
   status: 'healthy' | 'degraded' | 'unavailable';
@@ -112,12 +195,63 @@ export interface Capability {
   limitations: string[];
 }
 
+export interface VoiceMetricSnapshot {
+  schema_version: number;
+  count: number;
+  last_latency_ms: number | null;
+  max_latency_ms: number | null;
+}
+
+export interface VoiceStatusSnapshot {
+  schema_version: number;
+  state:
+    | 'dormant'
+    | 'activating'
+    | 'listening'
+    | 'thinking'
+    | 'speaking'
+    | 'interrupted'
+    | 'executing'
+    | 'waiting_for_user'
+    | 'deactivating'
+    | 'disconnected'
+    | 'error';
+  microphone_status:
+    | 'not_configured'
+    | 'unknown'
+    | 'available'
+    | 'permission_denied'
+    | 'unavailable'
+    | 'error';
+  provider_status:
+    | 'unconfigured'
+    | 'disconnected'
+    | 'connecting'
+    | 'connected'
+    | 'reconnecting'
+    | 'authentication_failure'
+    | 'quota_limited'
+    | 'network_failure'
+    | 'provider_error';
+  provider_id: string | null;
+  wake_word: string;
+  wake_word_enabled: boolean;
+  active_session_id: string | null;
+  active_task_id: string | null;
+  inactivity_timeout_seconds: number;
+  last_error_code: string | null;
+  updated_at: string;
+  telemetry: Record<string, VoiceMetricSnapshot>;
+}
+
 export interface DisplayInfo {
   schema_version: number;
   display_id: string;
   width: number | null;
   height: number | null;
   scale: number | null;
+  dpi_x: number | null;
+  dpi_y: number | null;
   primary: boolean | null;
   availability: CapabilityStatus | null;
 }
@@ -156,6 +290,8 @@ export interface EnvironmentSnapshot {
   installed_applications: ApplicationInfo[];
   browsers: string[];
   terminals: string[];
+  audio_input_devices: string[];
+  audio_output_devices: string[];
   network_status: 'online' | 'offline' | 'unknown';
   unavailable_fields: string[];
 }

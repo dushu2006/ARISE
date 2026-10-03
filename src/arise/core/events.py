@@ -12,6 +12,7 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from arise.core.contracts import FrozenJSON, freeze_json, json_byte_size, thaw_json, utc_now
+from arise.core.redaction import DEFAULT_REDACTOR
 
 _PROCESS_RUNTIME_ID = str(uuid.uuid4())
 
@@ -61,9 +62,12 @@ class EventEnvelope:
         frozen = freeze_json(self.payload, path="event.payload")
         if not isinstance(frozen, Mapping):
             raise ValueError("event payload must be an object")
-        if json_byte_size(frozen) > 65_536:
+        safe_payload = freeze_json(DEFAULT_REDACTOR.redact_object(frozen), path="event.payload")
+        if not isinstance(safe_payload, Mapping):
+            raise ValueError("event payload must be an object")
+        if json_byte_size(safe_payload) > 65_536:
             raise ValueError("event payload exceeds the size limit")
-        object.__setattr__(self, "payload", frozen)
+        object.__setattr__(self, "payload", safe_payload)
 
     def with_sequence(self, sequence: int) -> EventEnvelope:
         if sequence < 1:
@@ -127,6 +131,10 @@ class EventStore(Protocol):
 
     def latest_sequence(self) -> int: ...
 
+    def replay_floor(self) -> int:
+        """Largest pruned sequence; cursors below it must refresh state before reconnecting."""
+        ...
+
 
 class DuplicateEventError(RuntimeError):
     """An event ID was replayed with content different from its original append."""
@@ -183,6 +191,9 @@ class InMemoryEventStore:
         with self._lock:
             return len(self._events)
 
+    def replay_floor(self) -> int:
+        return 0
+
 
 class NullEventStore:
     """Explicit no-op sink for callers that deliberately disable persistence."""
@@ -200,4 +211,7 @@ class NullEventStore:
         return []
 
     def latest_sequence(self) -> int:
+        return 0
+
+    def replay_floor(self) -> int:
         return 0

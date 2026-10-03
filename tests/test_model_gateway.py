@@ -8,6 +8,7 @@ import httpx
 from arise.adapters.openai_compatible import MAX_MODEL_RESPONSE_BYTES, OpenAICompatibleProvider
 from arise.adapters.secrets import MemorySecretProvider
 from arise.core.errors import CapabilityUnavailableError, ProviderUnavailableError
+from arise.core.events import InMemoryEventStore
 from arise.core.model_gateway import ModelRouter
 from arise.core.models import (
     ModelMessage,
@@ -65,6 +66,78 @@ class ModelGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.provider_id, "local-test")
         self.assertEqual(provider.requests, 1)
         self.assertEqual(router.status()[0].status.value, "available")
+
+    async def test_model_lifecycle_events_are_correlated_and_do_not_store_prompts(self) -> None:
+        events = InMemoryEventStore()
+        provider = StaticProvider()
+        router = ModelRouter(events=events)
+        router.register(provider)
+        request = self.make_request().model_copy(
+            update={"task_id": "task-1", "session_id": "session-1"}
+        )
+
+        await router.complete(request)
+        recorded = events.read_after()
+
+        self.assertEqual(
+            [event.event_type for event in recorded],
+            ["MODEL_REQUEST_STARTED", "MODEL_RESPONSE_COMPLETED"],
+        )
+        self.assertTrue(all(event.task_id == "task-1" for event in recorded))
+        self.assertTrue(all(event.session_id == "session-1" for event in recorded))
+        self.assertTrue(all(event.correlation_id == request.correlation_id for event in recorded))
+        self.assertNotIn("Plan a task", repr([event.payload for event in recorded]))
+        self.assertTrue(all(event.source == "model-router" for event in recorded))
+
+    async def test_fallback_and_cancellation_are_journaled_without_exception_text(self) -> None:
+        class FailingProvider(StaticProvider):
+            provider_id = "a-failing"
+
+        class SuccessfulProvider(StaticProvider):
+            provider_id = "z-success"
+
+        events = InMemoryEventStore()
+        router = ModelRouter(events=events)
+        router.register(FailingProvider(fail=True))
+        router.register(SuccessfulProvider())
+        await router.complete(self.make_request())
+        types = [event.event_type for event in events.read_after()]
+        self.assertEqual(
+            types,
+            [
+                "MODEL_REQUEST_STARTED",
+                "MODEL_REQUEST_FAILED",
+                "MODEL_FALLBACK_SELECTED",
+                "MODEL_REQUEST_STARTED",
+                "MODEL_RESPONSE_COMPLETED",
+            ],
+        )
+        self.assertNotIn("provider body", repr([event.payload for event in events.read_after()]))
+
+        class BlockingProvider(StaticProvider):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def complete(self, request: ModelRequest) -> ModelResponse:
+                self.started.set()
+                await self.release.wait()
+                return await super().complete(request)
+
+        cancellation_events = InMemoryEventStore()
+        blocking = BlockingProvider()
+        cancellable = ModelRouter(events=cancellation_events)
+        cancellable.register(blocking)
+        pending = asyncio.create_task(cancellable.complete(self.make_request()))
+        await asyncio.wait_for(blocking.started.wait(), timeout=1)
+        pending.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await pending
+        self.assertEqual(
+            [event.event_type for event in cancellation_events.read_after()],
+            ["MODEL_REQUEST_STARTED", "MODEL_REQUEST_CANCELLED"],
+        )
 
     async def test_cloud_route_requires_explicit_policy_and_privacy(self) -> None:
         class CloudProvider(StaticProvider):

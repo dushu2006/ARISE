@@ -134,6 +134,57 @@ class TaskEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(event.causation_id == request.request_id for event in events))
         self.assertIn("TASK_COMPLETED", [event.event_type for event in events])
 
+    async def test_child_task_lineage_is_persisted_and_scoped_to_live_parent(self) -> None:
+        authority = AuthorizationContext(
+            principal_id="test-user",
+            user_intent_id="parent-request",
+            trust=TrustLevel.USER_INSTRUCTION,
+        )
+        parent = TaskRecord.new(
+            "Parent workflow",
+            authorization=authority,
+            request_id="parent-request",
+            session_id="parent-session",
+        )
+        parent.transition_to(TaskStatus.QUEUED)
+        parent.transition_to(TaskStatus.UNDERSTANDING)
+        parent.transition_to(TaskStatus.WAITING_USER)
+        self.tasks.save(parent)
+
+        child_request = UserRequest(
+            request_id="child-request",
+            session_id=parent.session_id,
+            text="Open the demo project",
+        )
+        accepted = await self.engine.submit(
+            child_request,
+            principal_id="test-user",
+            session_id=parent.session_id,
+            parent_task_id=parent.task_id,
+        )
+        child = await self.wait_for_status(accepted.task_id, TaskStatus.COMPLETED)
+        self.assertEqual(child.parent_task_id, parent.task_id)
+        self.assertEqual(TaskRecord.from_dict(child.to_dict()).parent_task_id, parent.task_id)
+        replay = await self.engine.submit(
+            child_request,
+            principal_id="test-user",
+            session_id=parent.session_id,
+            parent_task_id=parent.task_id,
+        )
+        self.assertEqual(replay.task_id, child.task_id)
+
+        with self.assertRaises(ValueError):
+            await self.engine.submit(
+                UserRequest(
+                    request_id="child-wrong-session",
+                    session_id="another-session",
+                    text="Open the demo project",
+                ),
+                principal_id="test-user",
+                session_id="another-session",
+                parent_task_id=parent.task_id,
+            )
+
     async def test_unavailable_planner_never_reports_success(self) -> None:
         engine = TaskEngine(
             tasks=self.tasks,
@@ -367,7 +418,8 @@ class TaskEngineTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.005)
         self.assertEqual(completed.status, TaskStatus.COMPLETED)
         accepted = [
-            event for event in events.read_after(task_id=replay.task_id)
+            event
+            for event in events.read_after(task_id=replay.task_id)
             if event.event_type == "TASK_ACCEPTED"
         ]
         self.assertEqual(len(accepted), 1)
