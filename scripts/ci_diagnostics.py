@@ -80,8 +80,11 @@ def _cargo_diagnostics(output: str) -> list[tuple[str | None, str]]:
             continue
         seen.add(message)
         diagnostics.append((None, message[:1000]))
-        if len(diagnostics) >= _MAX_ANNOTATIONS:
+        if len(diagnostics) >= _MAX_ANNOTATIONS - 1:
             break
+    tail = [line.strip() for line in lines[-15:] if line.strip()]
+    if tail:
+        diagnostics.append((None, "cargo output tail:\n" + "\n".join(tail)[-3000:]))
     return diagnostics
 
 
