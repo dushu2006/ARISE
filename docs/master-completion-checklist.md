@@ -407,7 +407,7 @@
 - [!] BLOCKED — ENVIRONMENT — Exercise the integrated frontend inside real Tauri/WebView2 on supported Windows.
 
 ## Production and packaging checklist
-- [-] IN PROGRESS — Tauri 2 structure valid.
+- [x] COMPLETE — Tauri 2 configuration and Rust shell compile with the Windows CI `cargo check`; installer/runtime validation remains separate below.
 - [-] IN PROGRESS — React production build valid.
 - [ ] NOT STARTED — Python backend packaging path valid.
 - [-] IN PROGRESS — Sidecar architecture valid.
@@ -422,7 +422,7 @@
 - [-] IN PROGRESS — First-run capability discovery implemented.
 - [-] IN PROGRESS — Optional providers remain optional.
 - [-] IN PROGRESS — Capability states are truthful.
-- [!] BLOCKED — ENVIRONMENT — Compile/package/run the Tauri sidecar on Windows with WebView2 and real per-user ACLs.
+- [!] BLOCKED — ENVIRONMENT — Package and run the Tauri sidecar against real WebView2; validate per-user ACLs on a supported Windows desktop.
 
 ## Integrated acceptance-path checklist
 - [-] IN PROGRESS — Voice command → real intent → real task admission → TaskEngine → planner → policy → executor → verifier → completion (bridge path exists; no real voice/runtime evidence and no production action tools).
@@ -496,7 +496,7 @@
 - [x] COMPLETE — Replay suites pass (pytest replay/failure tests pass; harness replay probes ran under host guard).
 - [x] COMPLETE — Voice harness runs correctly and reports `ENVIRONMENT-LIMITED`/`BLOCKED` honestly on Linux (21 checks; no device/provider access).
 - [x] COMPLETE — No real-only claims made from replay tests (evidence labels and limitations remain explicit).
-- [-] IN PROGRESS — Windows backend CI fixes now pass on Python 3.11/3.12; Ubuntu backend 3.11/3.12 and frontend also pass. Tauri CI run 37135096983 identified invalid NSIS `installMode` value `perUser` (Tauri accepts `currentUser`, `perMachine`, or `both`); the config is corrected to `currentUser`, pending CI rerun. The Windows fixes addressed POSIX path-string assumptions, equal-timestamp conversation ordering, temp-path aliases, and approval/worker timing.
+- [x] COMPLETE — GitHub Actions run 37135316889 passes Ubuntu/Windows backend (Python 3.11/3.12), frontend, and Windows Tauri `cargo check`. Windows path/order/approval fixes and the NSIS install-mode correction are covered; installer and desktop runtime validation remain separate.
 - [-] IN PROGRESS — No fake success responses remain in production paths.
 - [-] IN PROGRESS — No accidental debug code remains.
 - [-] IN PROGRESS — No obsolete placeholders remain in production paths.
@@ -519,5 +519,5 @@
 - [-] IN PROGRESS — Implement every software-remediable production gap found by that search without removing legitimate tests; remaining gaps are enumerated in this checklist and `docs/forensic-audit.md`.
 
 ## Required final report
-- [x] COMPLETE — Re-opened and recounted the full checklist for this report after recording the failing Windows CI: 461 total; 71 COMPLETE, 284 IN PROGRESS, 93 NOT STARTED, 8 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two closed final-report rows).
+- [x] COMPLETE — Re-opened and recounted the full checklist for this report after the Windows CI rerun: 461 total; 73 COMPLETE, 282 IN PROGRESS, 93 NOT STARTED, 8 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two closed final-report rows).
 - [x] COMPLETE — Final report records changes/defects, exact test totals, REAL vs FAKE/REPLAY evidence, environment/external setup needs, Git status, and the commit/push/PR outcome. The user's later PR request authorizes committing and pushing this branch despite the earlier no-commit/no-push instruction.
