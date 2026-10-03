@@ -25,9 +25,9 @@ jobs:
       - name: Install backend and test dependencies
         run: python -m pip install -e ".[dev]"
       - name: Run backend lint
-        run: python -m ruff check src/arise tests
+        run: python -m ruff check src/arise tests scripts
       - name: Run backend tests
-        run: python -m pytest -q
+        run: python scripts/ci_diagnostics.py pytest
       - name: Run isolated simulator demo
         run: python -m arise demo
 
@@ -70,4 +70,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Compile Tauri shell on Windows
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: python ../scripts/ci_diagnostics.py cargo
