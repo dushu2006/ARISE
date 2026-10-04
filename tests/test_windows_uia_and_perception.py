@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 from arise.adapters.perception import (
@@ -53,7 +54,7 @@ from arise.core.contracts import (
 )
 from arise.core.model_gateway import ModelRouter
 from arise.core.models import ModelRequest, ModelResponse, ModelRole
-from arise.core.policy import PolicyEngine
+from arise.core.policy import PolicyDecisionKind, PolicyEngine
 from arise.core.ports import ToolRegistry, VerificationStatus
 from arise.core.resources import ResourceManager
 from arise.core.runtime import AgentRuntime
@@ -232,6 +233,8 @@ class FakeUiaBackend:
         del window_id
         self.invoked_nodes.append(node.node_id)
         self.invoked_points.append(click_point)
+        if node.control_type.casefold() == "edit":
+            self.set_focused_node(node.node_id)
 
     async def set_node_value(self, window_id: str, node: RawUiaNode, value: str) -> None:
         del window_id
@@ -266,9 +269,13 @@ class FakeUiaBackend:
             for n in self.nodes
         ]
 
+    def set_focused_node(self, node_id: str | None) -> None:
+        self.nodes = [replace(node, focused=node.node_id == node_id) for node in self.nodes]
+
     async def focus_node(self, window_id: str, node: RawUiaNode) -> None:
         del window_id
         self.focused_nodes.append(node.node_id)
+        self.set_focused_node(node.node_id)
 
     async def send_keys(self, window_id: str, node: RawUiaNode | None, key: str) -> None:
         self.keys_sent.append((window_id, key))
@@ -505,6 +512,102 @@ class WindowsUiaProviderTests(unittest.IsolatedAsyncioTestCase):
         assert second.verification is not None
         self.assertIs(second.verification.status, VerificationStatus.PASSED)
         self.assertIs(second.task_status, TaskStatus.COMPLETED)
+
+    async def test_click_postcondition_verifies_observed_keyboard_focus(self) -> None:
+        self.backend.nodes[1] = replace(
+            self.backend.nodes[1],
+            name="Address bar",
+            automation_id="chromeOmnibox",
+            focused=False,
+            supported_patterns=("ValuePattern", "InvokePattern"),
+        )
+        self.backend.set_focused_node(None)
+        registry = ToolRegistry()
+        register_windows_uia_tools(registry, self.provider)
+        click_tool = registry.get("uia.click")
+        candidate = next(
+            item
+            for item in await self.provider.inspect("hwnd-1001")
+            if item.descriptor.identity.semantic_name == "Address bar"
+        )
+        authority = AuthorizationContext(
+            principal_id="user-1",
+            user_intent_id="intent-click-address-bar",
+            trust=TrustLevel.USER_INSTRUCTION,
+            capabilities=frozenset({"desktop.ui_automation"}),
+        )
+        action = ActionContract(
+            task_id="task-click-address-bar",
+            action_id="action-click-address-bar",
+            tool_name="uia.click",
+            target=candidate.descriptor.identity,
+            risk=RiskLevel.R3,
+            authority=authority,
+            postconditions=(
+                Condition(
+                    "window.focused_element",
+                    expected="Address bar",
+                    description="Address bar has keyboard focus",
+                ),
+            ),
+        )
+
+        # The existing R3 confirmation gate remains in effect. A valid semantic
+        # target and verifier-observable condition make the action approvable.
+        policy = PolicyEngine()
+        self.assertEqual(click_tool.spec.minimum_risk, RiskLevel.R3)
+        self.assertIs(
+            policy.evaluate(action, click_tool.spec).kind,
+            PolicyDecisionKind.CONFIRM,
+        )
+        before = await self.provider.observe(action)
+        self.assertIsNone(before.facts["window.focused_element"])
+
+        tasks = InMemoryTaskRepository()
+        task = TaskRecord.planned(
+            "Click the address bar",
+            task_id=action.task_id,
+            authorization=authority,
+        )
+        tasks.save(task)
+        from arise.core.events import InMemoryEventStore
+
+        runtime = AgentRuntime(
+            tasks=tasks,
+            events=InMemoryEventStore(),
+            tools=registry,
+            policy=policy,
+            environment=self.provider,
+            resources=ResourceManager(),
+            verifier=self.provider,
+        )
+        awaiting_approval = await runtime.execute_action(action, final_action=True)
+        self.assertIs(awaiting_approval.task_status, TaskStatus.WAITING_USER)
+        grant = policy.issue_approval(action, click_tool.spec, approved_by="user-1")
+        self.assertIs(
+            policy.evaluate(action, click_tool.spec, approval=grant).kind,
+            PolicyDecisionKind.ALLOW,
+        )
+        completed = await runtime.execute_action(action, approval=grant, final_action=True)
+        self.assertTrue(completed.executed)
+        self.assertIs(completed.task_status, TaskStatus.COMPLETED)
+        assert completed.verification is not None
+        self.assertIs(completed.verification.status, VerificationStatus.PASSED)
+
+        after = await self.provider.observe(action)
+        self.assertEqual(after.facts["window.focused_element"], "Address bar")
+        refreshed_candidate = next(
+            item
+            for item in await self.provider.inspect("hwnd-1001")
+            if item.descriptor.identity.semantic_name == "Address bar"
+        )
+        self.assertEqual(
+            refreshed_candidate.descriptor.identity.fingerprint,
+            candidate.descriptor.identity.fingerprint,
+        )
+        self.backend.set_focused_node("node-save")
+        failed = await self.provider.verify(action)
+        self.assertIs(failed.status, VerificationStatus.FAILED)
 
 
 class PerceptionAndHierarchyTests(unittest.IsolatedAsyncioTestCase):
@@ -841,6 +944,11 @@ class PerceptionAndHierarchyTests(unittest.IsolatedAsyncioTestCase):
                 ctypes.cast(pid_ptr, ctypes.POINTER(ctypes.c_ulong)).contents.value = 0
                 return 1
 
+            def GetGUIThreadInfo(self, thread_id: int, info_ptr: Any) -> bool:
+                assert thread_id == 1
+                info_ptr._obj.hwndFocus = 1002
+                return True
+
             def GetWindowRect(self, hwnd: int, rect_ptr: Any) -> bool:
                 coords = {
                     1000: (0, 0, 800, 600),
@@ -910,6 +1018,9 @@ class PerceptionAndHierarchyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nodes[2].role, "textbox")
         self.assertTrue(nodes[2].sensitive)
         self.assertEqual(nodes[2].value, "")
+        self.assertFalse(nodes[0].focused)
+        self.assertFalse(nodes[1].focused)
+        self.assertTrue(nodes[2].focused)
 
         await uia_win32.invoke_node("hwnd-1000", nodes[1])
         await uia_win32.set_node_value("hwnd-1000", nodes[2], "new-val")

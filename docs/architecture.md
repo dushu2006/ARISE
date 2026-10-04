@@ -68,7 +68,9 @@ With explicit settings, the production composition can register real Win32 UIA a
 
 ## 5. Policy and approvals
 
-Policy uses the greater of proposed risk and trusted adapter minimum risk. `R3` always requires confirmation; `R4` is denied by default. Consequential actions require a semantic target and explicit postconditions. User approval binds to exact task/action IDs, contract fingerprint, authenticated owner, issue/expiry time, and one-time consumption immediately before dispatch.
+Policy uses the greater of proposed risk and trusted adapter minimum risk. `R3` always requires confirmation; `R4` is denied by default. Consequential actions require a semantic target and explicit postconditions. User approval binds to exact task/action IDs, contract fingerprint, authenticated owner, issue/expiry time, and one-time consumption immediately before dispatch. `GatewayTaskPlanner` now rejects a generated R2+ action without postconditions (including the trusted tool risk floor), and its prompt names the current Windows UIA fact schema; `PolicyEngine` remains the final gate and runtime verification remains independent.
+
+Windows UIA verification can observe `window.focused_element`, which is derived from a named element marked focused in a fresh tree, along with the existing window and element facts. The native Win32 backend now queries `GetGUIThreadInfo` for the focused HWND instead of equating foreground with keyboard focus. This is limited to controls represented as HWNDs; it does not establish accessibility for Chrome's custom-drawn omnibox or any other control absent from the inspected tree. The fake tests exercise this fact path only; interactive Windows/Chrome validation is still required.
 
 The Web UI receives only confirmation metadata (action/target summary, risk, expiry, fingerprint), never the opaque grant. The server verifies the principal from the local bearer token and issues/consumes the grant in-process. Pending approvals are not restored after restart; they expire and require a fresh user instruction/replan.
 

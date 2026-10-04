@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 
+from arise.core.contracts import RiskLevel
 from arise.core.errors import CapabilityUnavailableError, ProviderUnavailableError
 from arise.core.extensions import ContextQuery, MemoryPort, ResearchQuery, WebResearchPort
 from arise.core.intent import IntentClassifier
@@ -36,7 +37,7 @@ from arise.core.ports import ToolRegistry
 from arise.core.tasks import TaskRecord
 
 # Identifies the prompt/response contract revision for audit records.
-PLANNER_CONTRACT_VERSION = "planner-contract-2"
+PLANNER_CONTRACT_VERSION = "planner-contract-3"
 
 MAX_PLANNER_ATTEMPTS = 2
 
@@ -413,7 +414,32 @@ class GatewayTaskPlanner(TaskPlanner):
                 category=PlanFailureCategory.SCHEMA_INVALID,
                 detail=describe_validation_failure(exc),
             ) from exc
+        self._validate_consequential_postconditions(plan)
         return plan
+
+    def _validate_consequential_postconditions(self, plan: TaskPlan) -> None:
+        """Reject R2+ proposals that omit the policy-required verification contract.
+
+        Trusted tool metadata supplies the risk floor. This is an early planner
+        validation only; PolicyEngine remains the final gate and the runtime
+        still verifies every declared condition against fresh observations.
+        """
+
+        minimum_risk_by_tool = {spec.name: spec.minimum_risk for spec in self.tools.list_specs()}
+        for step_index, step in enumerate(plan.steps):
+            proposals = [("action", step.action)]
+            fallback = step.fallback_policy.fallback_action
+            if fallback is not None:
+                proposals.append(("fallback_policy.fallback_action", fallback))
+            for field_name, proposal in proposals:
+                tool_minimum = minimum_risk_by_tool.get(proposal.tool_name, RiskLevel.R0)
+                effective_risk = max(int(proposal.risk), int(tool_minimum))
+                if effective_risk >= RiskLevel.R2 and not proposal.postconditions:
+                    raise InvalidPlan(
+                        "consequential planner actions require explicit postconditions",
+                        category=PlanFailureCategory.SCHEMA_INVALID,
+                        detail=f"steps.{step_index}.{field_name}.postconditions: missing",
+                    )
 
     def _record_diagnostic(
         self,

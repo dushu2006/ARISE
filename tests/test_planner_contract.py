@@ -24,6 +24,7 @@ from pydantic import ValidationError
 from arise.adapters.memory import InMemoryEnvironment, SetFactTool
 from arise.adapters.openai_compatible import OpenAICompatibleProvider
 from arise.adapters.secrets import MemorySecretProvider
+from arise.adapters.windows_uia import WindowsUiaActionTool
 from arise.config.settings import AppSettings, DatabaseSettings, SecuritySettings
 from arise.core.contracts import (
     AuthorizationContext,
@@ -40,6 +41,7 @@ from arise.core.events import InMemoryEventStore
 from arise.core.model_gateway import ModelRouter
 from arise.core.models import (
     ActionProposal,
+    ConditionModel,
     ModelRequest,
     ModelResponse,
     ModelRole,
@@ -150,6 +152,23 @@ class FailingProvider:
         raise ProviderUnavailableError("provider unavailable", component="test")
 
 
+class MetadataOnlyTool:
+    """Tool registration stub for plan-binding tests that never dispatch an action."""
+
+    def __init__(self, spec: ToolSpec) -> None:
+        self._spec = spec
+
+    @property
+    def spec(self) -> ToolSpec:
+        return self._spec
+
+    def validate_parameters(self, parameters: Any) -> None:
+        del parameters
+
+    async def execute(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("metadata-only test tool must not be dispatched")
+
+
 class PlannerContractTestCase(unittest.IsolatedAsyncioTestCase):
     """Shared planner/router/tool harness."""
 
@@ -249,6 +268,67 @@ class PlannerOutputContractTests(PlannerContractTestCase):
         self.assertEqual([step.step_id for step in plan.steps], ["step-1", "step-2"])
         self.assertEqual(plan.steps[1].depends_on, ("step-1",))
         self.assertEqual(len(provider.requests), 1)
+
+    async def test_consequential_uia_action_retries_when_postconditions_are_missing(self) -> None:
+        self.tools.register(WindowsUiaActionTool(None, "click"))
+        target = {
+            "platform": "windows",
+            "application": "chrome.exe",
+            "window_id": "hwnd-1001",
+            "role": "textbox",
+            "semantic_name": "Address bar",
+            "stable_id": "chrome-omnibox",
+        }
+        missing_postcondition = {
+            "steps": [
+                {
+                    "step_id": "click-address-bar",
+                    "title": "Click the address bar",
+                    "action": {
+                        "tool_name": "uia.click",
+                        "risk": 1,
+                        "target": target,
+                    },
+                }
+            ]
+        }
+        valid_postcondition = {
+            "steps": [
+                {
+                    "step_id": "click-address-bar",
+                    "title": "Click the address bar",
+                    "action": {
+                        "tool_name": "uia.click",
+                        "risk": 1,
+                        "target": target,
+                        "postconditions": [
+                            {
+                                "key": "window.focused_element",
+                                "operator": "equals",
+                                "expected": "Address bar",
+                                "description": "Address bar has keyboard focus",
+                            }
+                        ],
+                    },
+                }
+            ]
+        }
+        planner, provider, _ = await self.make_planner(
+            [json.dumps(missing_postcondition), json.dumps(valid_postcondition)]
+        )
+
+        plan = await planner.create_plan(self.request, self.task)
+
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(
+            plan.steps[0].action.postconditions[0].key,
+            "window.focused_element",
+        )
+        self.assertEqual(
+            planner.last_diagnostic().attempt_categories,
+            ("schema_invalid", "accepted"),
+        )
+        self.assertIn("postconditions", provider.requests[1].messages[-1].content)
 
     async def test_valid_clarification_response_is_accepted_without_retry(self) -> None:
         payload = {
@@ -459,6 +539,9 @@ class PlannerOutputContractTests(PlannerContractTestCase):
             "at least one valid PlanStep",
             "matching ActionProposal",
             "spelled exactly as listed",
+            "proposed risk OR registered tool minimum risk is R2 or higher",
+            "window.focused_element",
+            "at least one explicit postcondition",
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, system)
@@ -710,6 +793,10 @@ class PlannerTransportNormalizationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_system_prompt(())
 
+    def test_condition_model_rejects_keys_outside_the_domain_safe_token_contract(self) -> None:
+        with self.assertRaises(ValidationError):
+            ConditionModel(key="window.focused element")
+
     def test_response_format_is_a_typed_contract_field(self) -> None:
         with self.assertRaises(ValidationError):
             ModelRequest.model_validate(
@@ -842,6 +929,116 @@ class PlannerEngineIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return task
             await asyncio.sleep(0.005)
         self.fail(f"task {task_id} did not reach {[status.value for status in statuses]}")
+
+    async def test_multistep_launch_and_uia_plan_retains_postconditions_when_bound(self) -> None:
+        self.tools.register(WindowsUiaActionTool(None, "click"))
+        self.tools.register(
+            MetadataOnlyTool(
+                ToolSpec(
+                    name="system.app_launch",
+                    version="1.0.0",
+                    description="Launch an installed desktop application.",
+                    minimum_risk=RiskLevel.R1,
+                    required_capabilities=frozenset({"desktop.launch"}),
+                    idempotency=Idempotency.IDEMPOTENT,
+                    parameter_names=("application",),
+                )
+            )
+        )
+        goal = "Open Chrome and click the address bar"
+        authority = AuthorizationContext(
+            principal_id="planner-user",
+            user_intent_id="intent-open-chrome",
+            trust=TrustLevel.USER_INSTRUCTION,
+            capabilities=frozenset({"desktop.launch", "desktop.ui_automation"}),
+        )
+        task = TaskRecord.new(
+            goal,
+            task_id="task-open-chrome",
+            request_id="request-open-chrome",
+            session_id="session-open-chrome",
+            authorization=authority,
+        )
+        request = UserRequest(
+            request_id=task.request_id,
+            session_id=task.session_id,
+            text=goal,
+        )
+        payload = {
+            "steps": [
+                {
+                    "step_id": "launch-chrome",
+                    "title": "Launch Chrome",
+                    "action": {
+                        "tool_name": "system.app_launch",
+                        "risk": 1,
+                        "parameters": {"application": "Chrome"},
+                        "postconditions": [
+                            {
+                                "key": "application.running",
+                                "operator": "equals",
+                                "expected": True,
+                                "description": "Chrome process is running",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "step_id": "click-address-bar",
+                    "title": "Click the address bar",
+                    "depends_on": ["launch-chrome"],
+                    "action": {
+                        "tool_name": "uia.click",
+                        "risk": 3,
+                        "target": {
+                            "platform": "windows",
+                            "application": "chrome.exe",
+                            "window_id": "hwnd-1001",
+                            "role": "textbox",
+                            "semantic_name": "Address bar",
+                            "stable_id": "chrome-omnibox",
+                        },
+                        "postconditions": [
+                            {
+                                "key": "window.focused_element",
+                                "operator": "equals",
+                                "expected": "Address bar",
+                                "description": "Address bar has keyboard focus",
+                            }
+                        ],
+                    },
+                },
+            ]
+        }
+        provider = ScriptedProvider([json.dumps(payload)])
+        router = ModelRouter()
+        router.register(provider)
+        self.addAsyncCleanup(router.close)
+        planner = GatewayTaskPlanner(router, self.tools)
+        plan = await planner.create_plan(request, task)
+        engine = TaskEngine(
+            tasks=self.tasks,
+            events=self.events,
+            runtime=self.runtime,
+            tools=self.tools,
+            policy=self.policy,
+            planner=planner,
+        )
+
+        bound = engine._validate_and_bind_plan(plan, task)
+
+        self.assertEqual(plan.steps[1].action.postconditions[0].key, "window.focused_element")
+        self.assertEqual(plan.steps[1].action.postconditions[0].expected, "Address bar")
+        self.assertEqual(
+            [action.tool_name for _, action in bound],
+            ["system.app_launch", "uia.click"],
+        )
+        self.assertEqual(len(bound[0][1].postconditions), 1)
+        self.assertEqual(bound[0][1].postconditions[0].key, "application.running")
+        self.assertEqual(len(bound[1][1].postconditions), 1)
+        self.assertEqual(bound[1][1].postconditions[0].key, "window.focused_element")
+        self.assertEqual(bound[1][1].postconditions[0].expected, "Address bar")
+        self.assertTrue(all(action.postconditions for _, action in bound))
 
     async def test_mocked_plan_reaches_execution_and_verification(self) -> None:
         provider = ScriptedProvider([json.dumps(EXECUTABLE_PLAN)])
