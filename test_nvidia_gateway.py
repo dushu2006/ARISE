@@ -2,13 +2,14 @@ import asyncio
 import uuid
 
 from arise.config.settings import get_settings
-from arise.server import create_app
 from arise.core.models import (
-    ModelRequest,
     ModelMessage,
+    ModelRequest,
     ModelRole,
     ModelSelectionRequest,
 )
+from arise.server import create_app
+
 
 async def main():
     settings = get_settings()

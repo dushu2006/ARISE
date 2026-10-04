@@ -70,6 +70,12 @@ from arise.adapters.sqlite import (
     SQLiteTaskRepository,
 )
 from arise.adapters.unavailable import UnavailableEnvironment
+from arise.adapters.windows_app_launch import (
+    Win32AppLaunchBackend,
+    WindowsAppLaunchProvider,
+    WindowsApplicationResolver,
+    register_app_launch_tools,
+)
 from arise.adapters.windows_uia import (
     Win32UiaBackend,
     WindowsUiaProvider,
@@ -127,7 +133,7 @@ from arise.core.personalization import (
 )
 from arise.core.planner import GatewayTaskPlanner
 from arise.core.policy import PolicyEngine
-from arise.core.ports import ToolRegistry
+from arise.core.ports import EnvironmentPort, ToolRegistry, VerificationResult
 from arise.core.protocol import (
     PROTOCOL_VERSION,
     ClientFrame,
@@ -397,6 +403,7 @@ class ServerServices:
     api_token: str | None
     api_token_file: Path | None
     uia_provider: WindowsUiaProvider | None = None
+    app_launch_provider: WindowsAppLaunchProvider | None = None
     browser_provider: PlaywrightBrowserProvider | None = None
     perception: PerceptionHierarchyPipeline | None = None
     screen_capture: ScreenCaptureAdapter | None = None
@@ -411,13 +418,20 @@ class CompositeEnvironment:
         *,
         uia: WindowsUiaProvider | None = None,
         browser: PlaywrightBrowserProvider | None = None,
+        app_launch: WindowsAppLaunchProvider | None = None,
         fallback: UnavailableEnvironment | None = None,
     ) -> None:
         self.uia = uia
         self.browser = browser
+        self.app_launch = app_launch
         self.fallback = fallback or UnavailableEnvironment()
 
     async def observe(self, action: ActionContract) -> ObservationLease:
+        if (
+            action.tool_name == "system.app_launch"
+            or action.tool_name.startswith("system.")
+        ) and self.app_launch is not None:
+            return await self.app_launch.observe(action)
         if action.tool_name.startswith("uia.") and self.uia is not None:
             return await self.uia.observe(action)
         if action.tool_name.startswith("browser.") and self.browser is not None:
@@ -425,6 +439,11 @@ class CompositeEnvironment:
         return await self.fallback.observe(action)
 
     async def is_current(self, lease: ObservationLease) -> bool:
+        if self.app_launch is not None and (
+            lease.lease_id in getattr(self.app_launch, "_observations", {})
+            or lease.facts.get("domain") == "system.application"
+        ):
+            return await self.app_launch.is_current(lease)
         if self.uia is not None and (
             lease.lease_id in getattr(self.uia, "_observations", {})
             or lease.facts.get("uia_domain") == "windows"
@@ -437,6 +456,36 @@ class CompositeEnvironment:
         ):
             return await self.browser.is_current(lease)
         return await self.fallback.is_current(lease)
+
+
+class CompositeVerifier:
+    """Route action verification to domain-specific providers or fallback fact verification."""
+
+    def __init__(
+        self,
+        environment: EnvironmentPort,
+        *,
+        uia: WindowsUiaProvider | None = None,
+        browser: PlaywrightBrowserProvider | None = None,
+        app_launch: WindowsAppLaunchProvider | None = None,
+    ) -> None:
+        self.environment = environment
+        self.uia = uia
+        self.browser = browser
+        self.app_launch = app_launch
+        self.fact_verifier = FactVerifier(environment)
+
+    async def verify(self, action: ActionContract) -> VerificationResult:
+        if (
+            action.tool_name == "system.app_launch"
+            or action.tool_name.startswith("system.")
+        ) and self.app_launch is not None:
+            return await self.app_launch.verify(action)
+        if action.tool_name.startswith("uia.") and self.uia is not None:
+            return await self.uia.verify(action)
+        if action.tool_name.startswith("browser.") and self.browser is not None:
+            return await self.browser.verify(action)
+        return await self.fact_verifier.verify(action)
 
 
 def _load_or_create_token(settings: AppSettings) -> tuple[str | None, Path | None]:
@@ -801,9 +850,11 @@ def _build_services(settings: AppSettings) -> ServerServices:
     short_term_memory_store = ShortTermConversationMemory()
     unsafe_regions = tuple(Rect(*bounds) for bounds in settings.perception.unsafe_regions)
     uia_provider: WindowsUiaProvider | None = None
+    app_launch_provider: WindowsAppLaunchProvider | None = None
     if settings.desktop.enabled:
+        uia_backend = Win32UiaBackend()
         uia_provider = WindowsUiaProvider(
-            backend=Win32UiaBackend(),
+            backend=uia_backend,
             secret_provider=secret_provider,
             max_tree_depth=settings.desktop.max_tree_depth,
             max_tree_nodes=settings.desktop.max_nodes,
@@ -811,6 +862,12 @@ def _build_services(settings: AppSettings) -> ServerServices:
             unsafe_regions=unsafe_regions,
         )
         register_windows_uia_tools(tools, uia_provider)
+        app_launch_backend = Win32AppLaunchBackend(uia_backend=uia_backend)
+        app_launch_provider = WindowsAppLaunchProvider(
+            backend=app_launch_backend,
+            resolver=WindowsApplicationResolver(),
+        )
+        register_app_launch_tools(tools, app_launch_provider)
     browser_provider: PlaywrightBrowserProvider | None = None
     if settings.browser.enabled and settings.browser.allowed_domains:
         browser_provider = PlaywrightBrowserProvider(
@@ -908,13 +965,34 @@ def _build_services(settings: AppSettings) -> ServerServices:
             allow_memory_context_to_cloud=settings.memory.allow_cloud_context,
         )
 
+    def _principal_capabilities(principal_id: str) -> frozenset[str]:
+        if not principal_id or not principal_id.strip():
+            return frozenset()
+        grants: set[str] = set()
+        if settings.desktop.enabled or uia_provider is not None:
+            grants.add("desktop.ui_automation")
+        if (
+            app_launch_provider is not None
+            or (settings.desktop.enabled and sys.platform == "win32")
+        ):
+            grants.add("desktop.launch")
+        if browser_provider is not None:
+            grants.add("browser.control")
+        return frozenset(grants)
+
+    has_active_provider = (
+        uia_provider is not None
+        or browser_provider is not None
+        or app_launch_provider is not None
+    )
     environment = (
         CompositeEnvironment(
             uia=uia_provider,
             browser=browser_provider,
+            app_launch=app_launch_provider,
             fallback=UnavailableEnvironment(),
         )
-        if (uia_provider is not None or browser_provider is not None)
+        if has_active_provider
         else UnavailableEnvironment()
     )
     runtime = AgentRuntime(
@@ -924,7 +1002,12 @@ def _build_services(settings: AppSettings) -> ServerServices:
         policy=policy,
         environment=environment,
         resources=ResourceManager(),
-        verifier=FactVerifier(environment),
+        verifier=CompositeVerifier(
+            environment,
+            uia=uia_provider,
+            browser=browser_provider,
+            app_launch=app_launch_provider,
+        ),
     )
     engine = TaskEngine(
         tasks=task_repository,
@@ -933,6 +1016,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         tools=tools,
         policy=policy,
         planner=planner,
+        capability_grants=_principal_capabilities,
         config=TaskEngineConfig(
             max_concurrent_tasks=settings.runtime.max_concurrent_tasks,
             max_queued_tasks=settings.runtime.max_queued_tasks,
@@ -976,7 +1060,9 @@ def _build_services(settings: AppSettings) -> ServerServices:
             browser_provider.discover_browsers if browser_provider is not None else None
         ),
         desktop_host_supported=(
-            (lambda: sys.platform == "win32") if uia_provider is not None else None
+            (lambda: sys.platform == "win32")
+            if (uia_provider is not None or app_launch_provider is not None)
+            else None
         ),
     )
     health = HealthService(
@@ -1014,6 +1100,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         api_token=token,
         api_token_file=token_file,
         uia_provider=uia_provider,
+        app_launch_provider=app_launch_provider,
         browser_provider=browser_provider,
         perception=perception,
         screen_capture=screen_capture,

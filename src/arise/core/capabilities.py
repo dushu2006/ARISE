@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Mapping, Sequence
 
 from arise.core.model_gateway import ModelRouter
@@ -113,6 +114,15 @@ class CapabilityService:
                     "desktop.ui_automation",
                     "No live Windows UI Automation adapter is included or registered.",
                     requirements=("Windows UI Automation/accessibility adapter",),
+                )
+            ),
+            (
+                self._app_launch_capability()
+                if any(spec.name == "system.app_launch" for spec in self.tools.list_specs())
+                else self._unavailable(
+                    "desktop.launch",
+                    "No live application-launch adapter is included or registered.",
+                    requirements=("Windows application launch adapter",),
                 )
             ),
             (
@@ -445,6 +455,43 @@ class CapabilityService:
             health=HealthStatus.UNAVAILABLE,
             requirements=requirements,
             adapter="adapters.windows_uia.WindowsUiaProvider",
+            limitations=(reason,),
+        )
+
+    def _app_launch_capability(self) -> Capability:
+        requirements = ("Windows application launch adapter",)
+        probe = self._desktop_host_supported
+        supported: bool | None = None
+        if probe is not None:
+            try:
+                supported = bool(probe() if callable(probe) else probe)
+            except Exception:
+                supported = False
+        if supported or (supported is None and sys.platform == "win32"):
+            return Capability(
+                name="desktop.launch",
+                version="1.0",
+                status=CapabilityStatus.AVAILABLE,
+                availability="available",
+                health=HealthStatus.HEALTHY,
+                requirements=requirements,
+                adapter="adapters.windows_app_launch.WindowsAppLaunchProvider",
+                limitations=(),
+            )
+        reason = (
+            "The application-launch tool is registered, but this process is not running on a "
+            "supported Windows desktop host."
+            if supported is False or sys.platform != "win32"
+            else "The application-launch tool is registered, but host support is unverified."
+        )
+        return Capability(
+            name="desktop.launch",
+            version="1.0",
+            status=CapabilityStatus.REQUIRES_CONFIGURATION,
+            availability="requires_configuration",
+            health=HealthStatus.UNAVAILABLE,
+            requirements=requirements,
+            adapter="adapters.windows_app_launch.WindowsAppLaunchProvider",
             limitations=(reason,),
         )
 
