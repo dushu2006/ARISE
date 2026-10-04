@@ -519,18 +519,22 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
             )
             app = create_app(settings)
             services = app.state.services
+            try:
+                tool_names = [spec.name for spec in services.tools.list_specs()]
+                self.assertIn("system.app_launch", tool_names)
+                self.assertIn("uia.invoke", tool_names)
 
-            tool_names = [spec.name for spec in services.tools.list_specs()]
-            self.assertIn("system.app_launch", tool_names)
-            self.assertIn("uia.invoke", tool_names)
+                caps = {c.name: c for c in services.health.capability_service.list_capabilities()}
+                self.assertIn("tool.system.app_launch", caps)
+                self.assertIn("desktop.launch", caps)
 
-            caps = {c.name: c for c in services.health.capability_service.list_capabilities()}
-            self.assertIn("tool.system.app_launch", caps)
-            self.assertIn("desktop.launch", caps)
-
-            prompt = build_system_prompt(services.tools.list_specs())
-            self.assertIn("system.app_launch", prompt)
-            self.assertIn("desktop.launch", prompt)
+                prompt = build_system_prompt(services.tools.list_specs())
+                self.assertIn("system.app_launch", prompt)
+                self.assertIn("desktop.launch", prompt)
+            finally:
+                await services.engine.close()
+                await services.router.close()
+                services.database.close()
 
     async def test_planner_proposes_launch_and_engine_completes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -542,49 +546,53 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
             )
             app = create_app(settings)
             services = app.state.services
+            try:
+                fake_backend = FakeAppLaunchBackend()
+                services.app_launch_provider._backend = fake_backend
+                services.app_launch_provider._resolver.register_alias(
+                    "chrome",
+                    ResolvedApplication(
+                        name="Google Chrome",
+                        executable_path="C:\\Program Files\\Google\\Chrome\\chrome.exe",
+                        process_names=("chrome.exe",),
+                    ),
+                )
 
-            fake_backend = FakeAppLaunchBackend()
-            services.app_launch_provider._backend = fake_backend
-            services.app_launch_provider._resolver.register_alias(
-                "chrome",
-                ResolvedApplication(
-                    name="Google Chrome",
-                    executable_path="C:\\Program Files\\Google\\Chrome\\chrome.exe",
-                    process_names=("chrome.exe",),
-                ),
-            )
+                plan_content = (
+                    '{"needs_clarification":false,"steps":['
+                    '{"step_id":"step-1","title":"Open Chrome","action":'
+                    '{"tool_name":"system.app_launch","risk":1,"parameters":{"application":"Chrome"}}}'
+                    ']}'
+                )
+                planner_provider = MockPlannerProvider(plan_content)
+                services.router.register(planner_provider)
+                services.engine.planner = GatewayTaskPlanner(
+                    services.router,
+                    services.tools,
+                    model_id="planner-model",
+                    privacy="local_only",
+                )
 
-            plan_content = (
-                '{"needs_clarification":false,"steps":['
-                '{"step_id":"step-1","title":"Open Chrome","action":'
-                '{"tool_name":"system.app_launch","risk":1,"parameters":{"application":"Chrome"}}}'
-                ']}'
-            )
-            planner_provider = MockPlannerProvider(plan_content)
-            services.router.register(planner_provider)
-            services.engine.planner = GatewayTaskPlanner(
-                services.router,
-                services.tools,
-                model_id="planner-model",
-                privacy="local_only",
-            )
+                request = UserRequest(text="Open Chrome")
+                task_record = await services.engine.submit(request, principal_id="local-user")
 
-            request = UserRequest(text="Open Chrome")
-            task_record = await services.engine.submit(request, principal_id="local-user")
+                for _ in range(100):
+                    current = services.tasks.get(task_record.task_id)
+                    if current and current.status in {
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.BLOCKED,
+                    }:
+                        task_record = current
+                        break
+                    await asyncio.sleep(0.02)
 
-            for _ in range(100):
-                current = services.tasks.get(task_record.task_id)
-                if current and current.status in {
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.BLOCKED,
-                }:
-                    task_record = current
-                    break
-                await asyncio.sleep(0.02)
-
-            self.assertEqual(task_record.status, TaskStatus.COMPLETED)
-            self.assertEqual(len(fake_backend.launched_paths), 1)
+                self.assertEqual(task_record.status, TaskStatus.COMPLETED)
+                self.assertEqual(len(fake_backend.launched_paths), 1)
+            finally:
+                await services.engine.close()
+                await services.router.close()
+                services.database.close()
 
 
 if __name__ == "__main__":
