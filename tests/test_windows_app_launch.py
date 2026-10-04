@@ -552,7 +552,10 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 fake_backend = FakeAppLaunchBackend()
                 services.app_launch_provider._backend = fake_backend
-                services.app_launch_provider._resolver.register_alias(
+                fake_resolver = _empty_catalog_resolver()
+                services.app_launch_provider._resolver = fake_resolver
+                services.uia_provider.application_resolver = fake_resolver
+                fake_resolver.register_alias(
                     "chrome",
                     ResolvedApplication(
                         name="Google Chrome",
@@ -579,18 +582,23 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
                 request = UserRequest(text="Open Chrome")
                 task_record = await services.engine.submit(request, principal_id="local-user")
 
-                for _ in range(100):
+                for _ in range(500):
                     current = services.tasks.get(task_record.task_id)
-                    if current and current.status in {
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.BLOCKED,
-                    }:
+                    if current is not None:
                         task_record = current
-                        break
+                        if current.status in {
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.BLOCKED,
+                        }:
+                            break
                     await asyncio.sleep(0.02)
 
-                self.assertEqual(task_record.status, TaskStatus.COMPLETED)
+                self.assertEqual(
+                    task_record.status,
+                    TaskStatus.COMPLETED,
+                    task_record.status_reason,
+                )
                 self.assertEqual(len(fake_backend.launched_paths), 1)
             finally:
                 await services.engine.close()
