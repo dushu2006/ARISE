@@ -103,7 +103,7 @@ All 8 scenarios are executed in `tests/test_phase4_and_phase5_and_scenarios.py`:
 
 ---
 
-## 5. Release-Gate Defects (Windows release validation, commits `9c132f3`..`e4b81d6`)
+## 5. Release-Gate Defects (found at `9c132f3`; fixed across `bc437f8`, `928bc88`, and `3f4b708`)
 
 Seven defects were found in this gate (rows 9–16 below; row 12 is a documentation defect). Row 14 is the memory-governance ordering gap found while verifying row 9's fix; row 15 is a regression in my own fix for row 11, caught only by hosted CI; row 16 is a capability-overclaim defect found while re-reading the API surface for row 11's blast radius.
 
