@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from arise.adapters.windows_app_discovery import WindowsApplicationCatalog
 from arise.adapters.windows_app_launch import (
     AppLaunchTool,
     ResolvedApplication,
@@ -48,6 +49,10 @@ from arise.core.resources import ResourceManager
 from arise.core.runtime import AgentRuntime
 from arise.core.tasks import InMemoryTaskRepository, TaskRecord, TaskStatus
 from arise.server import CompositeEnvironment, CompositeVerifier, create_app
+
+
+def _empty_catalog_resolver() -> WindowsApplicationResolver:
+    return WindowsApplicationResolver(catalog=WindowsApplicationCatalog(is_windows=False))
 
 
 class FakeAppLaunchBackend:
@@ -106,7 +111,7 @@ class FakeAppLaunchBackend:
 
 class ApplicationResolverTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
 
     def test_known_aliases_resolve_deterministically(self) -> None:
         aliases_to_test = [
@@ -215,7 +220,7 @@ class ApplicationResolverTests(unittest.TestCase):
 class AppLaunchToolSpecTests(unittest.TestCase):
     def setUp(self) -> None:
         self.backend = FakeAppLaunchBackend()
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
         self.provider = WindowsAppLaunchProvider(backend=self.backend, resolver=self.resolver)
         self.tool = AppLaunchTool(self.provider)
 
@@ -261,7 +266,7 @@ class AppLaunchToolSpecTests(unittest.TestCase):
 class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.backend = FakeAppLaunchBackend()
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
         self.resolver.register_alias(
             "chrome",
             ResolvedApplication(
@@ -405,7 +410,7 @@ class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
 class EndToEndRuntimeAndPolicyIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.backend = FakeAppLaunchBackend()
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
         self.resolver.register_alias(
             "chrome",
             ResolvedApplication(

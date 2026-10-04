@@ -515,13 +515,12 @@ class WindowsApplicationResolver:
                 for value in descriptor.process_names
             ):
                 score, matched_by = 100, "process_name_exact"
-            elif alias is not None and query_key == normalize_application_name(alias.name):
-                score, matched_by = 90, "known_alias_canonical_name"
-            elif alias is not None and any(
-                query_key == normalize_application_name(_safe_basename(value))
-                for value in alias.process_names
+            elif alias is not None and descriptor.normalized_name == normalize_application_name(
+                alias.name
             ):
-                score, matched_by = 90, "known_alias_process_name"
+                # The alias is a query-to-canonical-name hint, not evidence that
+                # every discovered catalog entry represents that application.
+                score, matched_by = 95, "known_alias_canonical_name"
             if score:
                 ranked.append(_RankedApplication(descriptor, score, matched_by))
         return ranked

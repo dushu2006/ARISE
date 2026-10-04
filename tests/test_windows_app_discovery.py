@@ -140,6 +140,60 @@ def test_catalog_match_beats_a_registered_alias_and_is_cache_bounded():
     assert catalog.calls == 1
 
 
+def test_known_alias_does_not_promote_unrelated_catalog_entries():
+    unrelated = (
+        ApplicationDescriptor(
+            name="CMake",
+            executable_path=r"C:\Program Files\CMake\cmake.exe",
+            source="installed_registry",
+        ),
+        ApplicationDescriptor(
+            name="Settings",
+            activation_method=ActivationMethod.PACKAGED_AUMID,
+            package_family_name="Microsoft.Windows.Settings_8wekyb3d8bbwe",
+            aumid="Microsoft.Windows.Settings_8wekyb3d8bbwe!App",
+            source="windows_start_apps",
+        ),
+    )
+    resolver = WindowsApplicationResolver(catalog=StaticCatalog(unrelated))
+    chrome_alias = ApplicationDescriptor(
+        name="Google Chrome",
+        executable_path=r"C:\Chrome\chrome.exe",
+        process_names=("chrome.exe",),
+        source="fixture_alias",
+    )
+    resolver.register_alias("chrome", chrome_alias)
+
+    assert resolver.resolve("chrome") is chrome_alias
+
+
+def test_known_alias_resolves_matching_catalog_entry_ahead_of_registered_alias():
+    chrome_catalog = ApplicationDescriptor(
+        name="Google Chrome",
+        executable_path=r"C:\Installed\chrome.exe",
+        source="installed_registry",
+    )
+    unrelated = ApplicationDescriptor(
+        name="Feedback Hub",
+        activation_method=ActivationMethod.PACKAGED_AUMID,
+        package_family_name="Microsoft.WindowsFeedbackHub_8wekyb3d8bbwe",
+        aumid="Microsoft.WindowsFeedbackHub_8wekyb3d8bbwe!App",
+        source="windows_start_apps",
+    )
+    resolver = WindowsApplicationResolver(catalog=StaticCatalog((unrelated, chrome_catalog)))
+    resolver.register_alias(
+        "chrome",
+        ApplicationDescriptor(
+            name="Google Chrome",
+            executable_path=r"C:\Legacy\chrome.exe",
+            process_names=("chrome.exe",),
+            source="fixture_alias",
+        ),
+    )
+
+    assert resolver.resolve("chrome") is chrome_catalog
+
+
 def test_ambiguous_exact_candidates_fail_closed_with_path_free_diagnostics():
     catalog = StaticCatalog(
         (

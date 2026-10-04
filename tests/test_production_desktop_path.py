@@ -13,6 +13,7 @@ from test_windows_uia_and_perception import FakeUiaBackend
 
 from arise.adapters.memory import InMemoryEnvironment, SetFactTool
 from arise.adapters.secrets import MemorySecretProvider
+from arise.adapters.windows_app_discovery import WindowsApplicationCatalog
 from arise.adapters.windows_app_launch import (
     ResolvedApplication,
     Win32AppLaunchBackend,
@@ -54,6 +55,10 @@ from arise.core.tasks import ActionStep, InMemoryTaskRepository, StepStatus, Tas
 from arise.server import CompositeEnvironment, CompositeVerifier, create_app
 
 
+def _empty_catalog_resolver() -> WindowsApplicationResolver:
+    return WindowsApplicationResolver(catalog=WindowsApplicationCatalog(is_windows=False))
+
+
 def authority():
     return AuthorizationContext(
         principal_id="user",
@@ -65,7 +70,7 @@ def authority():
 def launch_fixture():
     backend = FakeAppLaunchBackend()
     backend.requires_visible_window = True
-    resolver = WindowsApplicationResolver()
+    resolver = _empty_catalog_resolver()
     resolver.register_alias(
         "chrome",
         ResolvedApplication(
@@ -245,7 +250,7 @@ class MultiProcessLaunchBackend:
 
 def multi_process_fixture(*, keep_launcher_alive: bool = False, allow_reuse: bool = True):
     backend = MultiProcessLaunchBackend(keep_launcher_alive=keep_launcher_alive)
-    resolver = WindowsApplicationResolver()
+    resolver = _empty_catalog_resolver()
     resolver.register_alias(
         "chrome",
         ResolvedApplication(
