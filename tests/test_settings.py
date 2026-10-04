@@ -71,6 +71,32 @@ class SettingsValidationTests(unittest.TestCase):
                 model_id="model-a",
             )
 
+    def test_model_provider_options_are_bounded_json_without_credentials_or_overrides(self) -> None:
+        settings = ModelSettings(
+            provider_options={
+                "chat_template_kwargs": {"enable_thinking": False},
+                "top_k": 32,
+            },
+        )
+        self.assertEqual(
+            settings.provider_options,
+            {"chat_template_kwargs": {"enable_thinking": False}, "top_k": 32},
+        )
+        self.assertEqual(ModelSettings().provider_options, {})
+
+        with self.assertRaises(ValidationError) as caught:
+            ModelSettings(provider_options={"api_key": "credential-marker"})
+        self.assertNotIn("credential-marker", str(caught.exception))
+
+        for options in (
+            {"nested": {"Authorization": "Bearer credential-marker"}},
+            {"model": "unrouted-model"},
+            {"stream": False},
+            {"not_json": object()},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValidationError):
+                ModelSettings(provider_options=options)
+
     def test_embedding_provider_requires_model_endpoint_and_explicit_cloud_memory_opt_ins(
         self,
     ) -> None:

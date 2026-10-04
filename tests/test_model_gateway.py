@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 
 import httpx
@@ -231,7 +232,105 @@ class ModelGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0].url.path, "/v1/chat/completions")
         self.assertEqual(calls[0].headers["authorization"], "Bearer not-in-db")
         self.assertNotIn("not-in-db", calls[0].content.decode())
+        self.assertEqual(provider.provider_options, {})
+        self.assertEqual(
+            set(json.loads(calls[0].content)),
+            {"model", "messages", "max_tokens", "temperature", "stream"},
+        )
         await client.aclose()
+
+    async def test_provider_options_are_serialized_without_credentials(self) -> None:
+        calls: list[httpx.Request] = []
+        api_key = "nvidia-test-secret-marker"
+        provider_options = {"chat_template_kwargs": {"enable_thinking": False}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "ARISE NVIDIA GATEWAY OK"}}]},
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            provider_id="nvidia",
+            base_url="https://integrate.api.nvidia.com/v1",
+            model_id="nvidia/nemotron-test",
+            api_key_secret_name="NVIDIA_API_KEY",
+            secret_provider=MemorySecretProvider({"NVIDIA_API_KEY": api_key}),
+            is_cloud=True,
+            provider_options=provider_options,
+            client=client,
+        )
+        router = ModelRouter(allow_cloud=True)
+        router.register(provider)
+        selection = ModelSelectionRequest(
+            role=ModelRole.PLANNER,
+            task_type="nvidia-gateway-regression",
+            privacy="cloud_allowed",
+        )
+        try:
+            response = await router.complete(self.make_request(), selection=selection)
+            request_payload = json.loads(calls[0].content)
+
+            self.assertEqual(response.content, "ARISE NVIDIA GATEWAY OK")
+            self.assertEqual(request_payload["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(provider.provider_options, provider_options)
+            self.assertEqual(calls[0].headers["authorization"], f"Bearer {api_key}")
+            self.assertNotIn(api_key, calls[0].content.decode())
+            self.assertNotIn("api_key", calls[0].content.decode().casefold())
+            status = router.status()[0]
+            self.assertEqual(status.provider_id, "nvidia")
+            self.assertEqual(status.status.value, "available")
+        finally:
+            await client.aclose()
+
+    async def test_provider_options_are_sent_with_streaming_requests(self) -> None:
+        calls: list[httpx.Request] = []
+        api_key = "stream-test-secret-marker"
+        provider_options = {
+            "chat_template_kwargs": {"enable_thinking": False},
+            "top_k": 16,
+        }
+        sse = (
+            'data: {"choices":[{"delta":{"content":"Final "},"finish_reason":null}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=sse.encode("utf-8"),
+            )
+
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        provider = OpenAICompatibleProvider(
+            provider_id="nvidia-stream",
+            base_url="https://integrate.api.nvidia.com/v1",
+            model_id="nvidia/nemotron-test",
+            api_key_secret_name="NVIDIA_API_KEY",
+            secret_provider=MemorySecretProvider({"NVIDIA_API_KEY": api_key}),
+            is_cloud=True,
+            provider_options=provider_options,
+            supports_streaming=True,
+            client=client,
+        )
+        try:
+            chunks = [chunk async for chunk in provider.stream(self.make_request())]
+            request_payload = json.loads(calls[0].content)
+
+            self.assertEqual("".join(chunk.text_delta for chunk in chunks), "Final answer")
+            self.assertTrue(any(chunk.is_final for chunk in chunks))
+            self.assertTrue(request_payload["stream"])
+            self.assertEqual(request_payload["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(request_payload["top_k"], 16)
+            self.assertEqual(calls[0].headers["authorization"], f"Bearer {api_key}")
+            self.assertNotIn(api_key, calls[0].content.decode())
+        finally:
+            await client.aclose()
 
     async def test_provider_response_size_is_bounded_and_sanitized(self) -> None:
         client = httpx.AsyncClient(

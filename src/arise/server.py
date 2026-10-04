@@ -493,6 +493,22 @@ def _is_loopback_endpoint(base_url: str) -> bool:
         return False
 
 
+def _provider_request_options(
+    provider_id: str | None,
+    configured_options: dict[str, Any],
+) -> dict[str, Any]:
+    """Compose provider-neutral options with NVIDIA's non-thinking request default."""
+
+    options = dict(configured_options)
+    if provider_id is None or provider_id.strip().casefold() != "nvidia":
+        return options
+    template_options = options.get("chat_template_kwargs", {})
+    if not isinstance(template_options, dict):
+        raise ValueError("NVIDIA chat_template_kwargs must be an object")
+    options["chat_template_kwargs"] = {**template_options, "enable_thinking": False}
+    return options
+
+
 def _voice_gemini_prerequisites(settings: AppSettings) -> tuple[bool, bool, bool]:
     """Return cloud opt-in, keyring presence, and SDK availability without opening a session."""
 
@@ -838,6 +854,10 @@ def _build_services(settings: AppSettings) -> ServerServices:
                 api_key_secret_name=settings.model.api_key_secret_name,
                 secret_provider=secret_provider,
                 is_cloud=not local,
+                provider_options=_provider_request_options(
+                    settings.model.provider_id,
+                    settings.model.provider_options,
+                ),
                 max_concurrent_requests=settings.model.max_concurrent_requests,
                 timeout_seconds=settings.model.request_timeout_seconds,
                 connect_timeout_seconds=settings.model.connect_timeout_seconds,
