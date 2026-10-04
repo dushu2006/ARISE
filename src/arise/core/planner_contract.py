@@ -211,16 +211,39 @@ def _schema_lines() -> tuple[str, ...]:
         "need; never add keys that are not listed.",
         "- ActionProposal keys: tool_name (a registered tool name), risk (integer), "
         "parameters (object, default {}), target (object), preconditions (array), "
-        "postconditions (array), required_resources (array of strings), "
+        "postconditions (array; mandatory for R2+ actions), required_resources (array of strings), "
         f"idempotency ({idempotency_values}), idempotency_key, "
         "timeout_seconds (number, greater than 0 and at most 3600), rollback_strategy, "
-        "verification_strategy (string). Omit keys you do not need.",
+        "verification_strategy (string). Omit optional keys you do not need, except where a "
+        "policy rule below requires them.",
         "- plan.action_id is optional: leave it out so the runtime assigns it.",
         f"- risk must be an integer: {risk_values} (0 observation, 1 harmless local action, "
         "2 reversible change, 3 external side effect, 4 destructive or privileged). "
         "Never write words such as 'low' or 'high'.",
         "- Use at least the tool's minimum_risk from the registered tool list.",
-        "- Condition keys: key (non-empty string), "
+        "- Every action whose proposed risk OR registered tool minimum risk is R2 or higher "
+        "requires a semantically identified target and MUST include at least one explicit "
+        "postcondition. Never omit or leave that array empty; "
+        "the planner rejects consequential actions without it.",
+        "- Postconditions must describe the intended result of that specific action using facts "
+        "the registered adapter actually observes. Do not use target presence, a tool return, or "
+        "an assumed success as a substitute for the requested result. Never invent fact keys or "
+        "expected values; if the requested result is not observable, ask for clarification.",
+        "- Current Windows UIA observation facts are: window.id, window.foreground, "
+        "window.element_count, window.focused_element (the name of the first observed focused "
+        "element, or null), display.topology_hash, uia.state_hash. The native Win32 backend can "
+        "identify focus only for controls represented by an enumerated HWND; custom-drawn controls "
+        "without their own HWND are not identified by this fact. "
+        "uia.element.<control_type-lowercase>.<name> (true for a named observed element), and "
+        "uia.element.<control_type-lowercase>.<name>.value only for a non-sensitive observed "
+        "value. A dynamic element key can be used only if its exact spelling also satisfies the "
+        "Condition key safe-identifier rule; do not normalize or invent another key. For a click "
+        "intended to focus a UIA control that is represented by a named observed HWND, use "
+        "window.focused_element equals that target's observed accessible name; mere element "
+        "presence does not verify a click. If the exact accessible name is not grounded, do not "
+        "guess it.",
+        "- Condition keys: key (bounded non-empty safe identifier, max 128 characters; letters, "
+        "numbers, dot, underscore, colon, or hyphen), "
         f"operator ({operator_values}), expected, description.",
         "- target keys: platform, application, process_id, window_id, browser_profile, page_id, "
         "semantic_name, stable_id, display_id, confidence. For UIA tools platform is "
@@ -269,6 +292,8 @@ def build_system_prompt(specs: Sequence[ToolSpec]) -> str:
         "Use only identifiers that come from the user's request; if a required grounding "
         "identifier is unknown, ask one short clarification question instead of guessing.",
         "16. Keep the plan as short as the request requires; one step is usually enough.",
+        "17. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
+        "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
         "",
         *_schema_lines(),
         "",

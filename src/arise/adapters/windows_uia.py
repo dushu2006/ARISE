@@ -463,6 +463,51 @@ class Win32UiaBackend:
             )
         return rec
 
+    @staticmethod
+    def _focused_hwnd_for_window(user32: Any, window_hwnd: int) -> int | None:
+        """Return the GUI thread's keyboard-focused HWND when Windows reports one.
+
+        Foreground-window state is not keyboard focus. GetGUIThreadInfo is used
+        instead of GetFocus because this inspection runs on a worker thread. The
+        result can only identify a native HWND; custom-drawn controls that are
+        not separate HWNDs remain unidentifiable and will not be guessed.
+        """
+
+        import ctypes
+        from ctypes import wintypes
+
+        get_thread_id = getattr(user32, "GetWindowThreadProcessId", None)
+        get_gui_thread_info = getattr(user32, "GetGUIThreadInfo", None)
+        if get_thread_id is None or get_gui_thread_info is None:
+            return None
+
+        class GuiThreadInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        process_id = wintypes.DWORD(0)
+        try:
+            thread_id = int(get_thread_id(window_hwnd, ctypes.byref(process_id)) or 0)
+            if thread_id <= 0:
+                return None
+            info = GuiThreadInfo()
+            info.cbSize = ctypes.sizeof(GuiThreadInfo)
+            if not get_gui_thread_info(thread_id, ctypes.byref(info)):
+                return None
+            focused_hwnd = int(info.hwndFocus or 0)
+        except Exception:
+            return None
+        return focused_hwnd or None
+
     async def inspect_window_nodes(
         self,
         window_id: str,
@@ -497,6 +542,7 @@ class Win32UiaBackend:
                 source=PerceptionSource.UI_AUTOMATION,
             )
         fg_hwnd = int(user32.GetForegroundWindow() or 0)
+        focused_hwnd = self._focused_hwnd_for_window(user32, root_hwnd)
         root_rec = self._window_record_from_hwnd(root_hwnd, fg_hwnd=fg_hwnd)
         if root_rec is None:
             raise ComputerAdapterError(
@@ -521,7 +567,7 @@ class Win32UiaBackend:
                 framework_id="Win32",
                 enabled=True,
                 visible=root_rec.visible,
-                focused=(root_hwnd == fg_hwnd),
+                focused=(focused_hwnd == root_hwnd),
                 hierarchy=(f"hwnd-{root_hwnd}",),
                 bounds=root_rec.bounds,
             )
@@ -594,7 +640,7 @@ class Win32UiaBackend:
                     value="" if is_pwd else raw_text,
                     enabled=enabled,
                     visible=visible,
-                    focused=False,
+                    focused=(focused_hwnd == child_hwnd),
                     sensitive=is_pwd,
                     supported_patterns=patterns,
                     runtime_id=(child_hwnd,),
@@ -1072,6 +1118,9 @@ class WindowsUiaProvider:
         record.target_fingerprint = target_fingerprint
         self._remember(lease_id, record)
         now = utc_now()
+        # This fact is based on the backend's observed keyboard-focus state, not
+        # the foreground-window flag. Backends that cannot identify a focused
+        # named element report None; the verifier never infers focus from a click.
         focused_names = [el.name for el in record.elements if el.focused and el.name]
         facts: dict[str, Any] = {
             "window.id": window_id,
@@ -1676,7 +1725,6 @@ class WindowsUiaProvider:
             "control_type": safe_control_type,
             "class_name": node.class_name,
             "sensitive": is_sensitive,
-            "focused": bool(node.focused),
             "patterns": list(node.supported_patterns),
         }
         identity = TargetIdentity(
@@ -1814,7 +1862,11 @@ class WindowsUiaActionTool:
         self._spec = ToolSpec(
             name=f"uia.{operation}",
             version="1.0.0",
-            description=f"{operation.title()} a grounded control via Windows UI Automation.",
+            description=(
+                f"{operation.title()} a grounded control via Windows UI Automation. The native "
+                "backend can verify keyboard focus only when Windows reports the target as a "
+                "named HWND in the inspected tree; custom-drawn controls may not be identifiable."
+            ),
             minimum_risk=risk,
             required_capabilities=frozenset({"desktop.ui_automation"}),
             required_resources=(),

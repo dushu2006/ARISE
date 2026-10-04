@@ -171,6 +171,12 @@ class ConditionModel(ContractModel):
     expected: Any = None
     description: str = Field(default="", max_length=512)
 
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, value: str) -> str:
+        validate_safe_token(value, "condition key")
+        return value
+
     def to_domain(self) -> Condition:
         return Condition(
             key=self.key,
@@ -505,7 +511,7 @@ class PlannerDiagnostic(ContractModel):
     transport_normalization: Literal["none", "code_fence_unwrapped"] = "none"
     provider_id: str = Field(default="", max_length=128)
     model_id: str = Field(default="", max_length=256)
-    contract_version: str = Field(default="planner-contract-2", max_length=64)
+    contract_version: str = Field(default="planner-contract-3", max_length=64)
     context_sources: tuple[str, ...] = Field(default=(), max_length=8)
     occurred_at: datetime = Field(default_factory=_utc_now)
 
