@@ -291,6 +291,108 @@ class PlaywrightBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(click_tool.resources_for(action), (f"browser.page.{self.page_id}",))
         self.assertIsInstance(PlaywrightActionTool(self.provider, "scroll"), PlaywrightActionTool)
 
+    async def test_stale_browser_target_regrounding_and_crash_navigation_recovery(self) -> None:
+        submit_row = {
+            **self.row,
+            "role": "button",
+            "name": "Submit",
+            "tag": "button",
+            "id": "submit-btn",
+            "test_id": "submit-btn",
+            "input_type": "",
+            "sensitive": False,
+        }
+        self.page.rows.append(submit_row)
+        candidates = await self.provider.inspect(self.page_id)
+        submit_cand = next(c for c in candidates if c.descriptor.identity.semantic_name == "Submit")
+        # Unrelated DOM row changes -> state_hash changes
+        self.page.rows[0] = {**self.row, "placeholder": "Updated placeholder"}
+        regrounded = await self.provider.reground_stale_target(submit_cand)
+        self.assertEqual(
+            regrounded.descriptor.identity.fingerprint,
+            submit_cand.descriptor.identity.fingerprint,
+        )
+        self.assertEqual(self.provider.reground_count, 1)
+
+        # Crash recovery restores a fresh page
+        replacement_page = FakePage([submit_row])
+        replacement_ctx = FakeContext(replacement_page)
+        new_page_id = await self.provider.recover_after_crash(replacement_context=replacement_ctx)
+        self.assertEqual(self.provider.crash_recovery_count, 1)
+        self.assertTrue(new_page_id)
+
+        # Navigation recovery clears stale leases and navigates to fallback
+        async def fake_goto(url: str, *, wait_until: str, timeout: int) -> None:
+            del wait_until, timeout
+            replacement_page.url = url
+
+        replacement_page.goto = fake_goto  # type: ignore[attr-defined]
+        tab = await self.provider.recover_navigation(
+            new_page_id, fallback_url="https://example.com/home"
+        )
+        self.assertEqual(self.provider.navigation_recovery_count, 1)
+        self.assertEqual(tab.url, "https://example.com/home")
+
+    async def test_dns_rebinding_and_websocket_egress_controls(self) -> None:
+        from arise.adapters.browser_playwright import (
+            validate_browser_egress_url,
+            verify_browser_dns_binding,
+        )
+
+        # Plaintext ws:// is blocked on public network; wss:// to public host is allowed
+        with self.assertRaises(ValueError):
+            validate_browser_egress_url("ws://example.com/socket")
+        self.assertEqual(
+            validate_browser_egress_url(
+                "wss://api.example.com/socket", allowed_domains=("example.com",)
+            ),
+            "wss://api.example.com/socket",
+        )
+        with self.assertRaises(ValueError):
+            validate_browser_egress_url("wss://evil.test/socket", allowed_domains=("example.com",))
+
+        # DNS rebinding from public IP to 127.0.0.1 is blocked
+        pinned: dict[str, frozenset[str]] = {}
+        ips = verify_browser_dns_binding(
+            "https://rebind.example.com/",
+            dns_resolver=lambda _host: ["93.184.216.34"],
+            pinned_hosts=pinned,
+        )
+        self.assertEqual(ips, ("93.184.216.34",))
+        with self.assertRaises(ValueError):
+            verify_browser_dns_binding(
+                "https://rebind.example.com/",
+                dns_resolver=lambda _host: ["127.0.0.1"],
+                pinned_hosts=pinned,
+            )
+        with self.assertRaises(ValueError):
+            verify_browser_dns_binding(
+                "https://rebind.example.com/",
+                dns_resolver=lambda _host: ["198.51.100.42"],
+                pinned_hosts=pinned,
+            )
+
+        # Route guard enforces DNS resolver and WebSocket egress
+        guarded_provider = PlaywrightBrowserProvider(
+            allowed_domains=("example.com",),
+            dns_resolver=lambda host: ["127.0.0.1"] if "rebind" in host else ["93.184.216.34"],
+        )
+        ws_private = FakeRoute()
+        await guarded_provider._guard_route(ws_private, FakeRequest("ws://127.0.0.1:8765/ws/v1"))
+        self.assertEqual(ws_private.action, "abort:blockedbyclient")
+        rebind_route = FakeRoute()
+        await guarded_provider._guard_route(
+            rebind_route, FakeRequest("https://rebind.example.com/api")
+        )
+        self.assertEqual(rebind_route.action, "abort:blockedbyclient")
+        valid_wss = FakeRoute()
+        await guarded_provider._guard_route(valid_wss, FakeRequest("wss://sub.example.com/stream"))
+        self.assertEqual(valid_wss.action, "continue")
+
+        discovery = guarded_provider.discover_browsers()
+        self.assertIn("playwright_installed", discovery)
+        self.assertIn("browsers", discovery)
+
 
 class _DynamicResourceTool:
     def __init__(self, resources) -> None:

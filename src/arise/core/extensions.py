@@ -135,6 +135,10 @@ class RetrievedContext:
     provenance: str
     retrieved_at: datetime
     relevance: float | None = None
+    title: str | None = None
+    published_at: str | None = None
+    citation: str | None = None
+    conflicts_with: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, ContextSource):
@@ -149,6 +153,13 @@ class RetrievedContext:
             raise ValueError("retrieved context timestamp must be timezone-aware")
         if self.relevance is not None and not 0.0 <= self.relevance <= 1.0:
             raise ValueError("context relevance must be between zero and one")
+        if self.title is not None and len(self.title) > 512:
+            raise ValueError("context title exceeds 512 characters")
+        if self.published_at is not None and len(self.published_at) > 128:
+            raise ValueError("context published_at exceeds 128 characters")
+        if self.citation is not None and len(self.citation) > 1024:
+            raise ValueError("context citation exceeds 1024 characters")
+        object.__setattr__(self, "conflicts_with", tuple(str(item) for item in self.conflicts_with))
 
 
 class MemoryKind(StrEnum):
@@ -158,6 +169,45 @@ class MemoryKind(StrEnum):
     PREFERENCE = "preference"
     EPISODIC = "episodic"
     PROCEDURAL = "procedural"
+
+
+_ALLOWED_MEMORY_SENSITIVITIES = frozenset({"public", "internal", "personal", "restricted"})
+_ALLOWED_EXPIRATION_POLICIES = frozenset({"session", "ttl", "pinned"})
+_PAYMENT_OR_RAW_SECRET_PATTERN = re.compile(
+    r"(?i)(?:\b(?:cvv|cvc|card[_-]?number|credit[_-]?card)\s*[:=]\s*\S+)"
+    r"|(?:\b(?:\d[ -]*?){15,19}\b)"
+)
+_CREDENTIAL_ONLY_STRIPPED_RE = re.compile(
+    r"(?i)^[\s,.;:!?_-]*(?:(?:password|passwd|api[_-]?key|secret[_-]?key|access[_-]?token|"
+    r"auth[_-]?token|private[_-]?key|client[_-]?secret|bearer|token)\s*[:=]?\s*\[REDACTED\][\s,.;:!?_-]*)+$"
+)
+
+
+class MemoryDisabledError(PermissionError):
+    """Raised when memory storage or retrieval is invoked while memory is disabled by the user."""
+
+
+class MemoryGovernanceError(ValueError):
+    """Raised when a proposed memory entry fails usefulness, credential, or sensitivity checks."""
+
+
+def validate_memory_write_governance(redacted_text: str) -> None:
+    """Ensure a redacted memory entry is useful and has no payment cards or credential-only text."""
+
+    cleaned = (redacted_text or "").strip()
+    if len(cleaned) < 3 or not any(ch.isalnum() for ch in cleaned):
+        raise MemoryGovernanceError("memory entry is too short or non-informative to store")
+    if _PAYMENT_OR_RAW_SECRET_PATTERN.search(cleaned):
+        raise MemoryGovernanceError(
+            "payment card details and raw credentials cannot be stored in memory"
+        )
+    if _CREDENTIAL_ONLY_STRIPPED_RE.match(cleaned):
+        raise MemoryGovernanceError("credential-only entries cannot be stored in general memory")
+    without_redacted = re.sub(r"\[REDACTED\]", "", cleaned).strip()
+    if len(without_redacted) < 3 or not any(ch.isalnum() for ch in without_redacted):
+        raise MemoryGovernanceError(
+            "memory entry contained no useful content after secret redaction"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +220,9 @@ class MemoryEntry:
     expires_at: datetime
     source_task_id: str | None = None
     kind: MemoryKind = MemoryKind.SEMANTIC
+    confidence: float = 1.0
+    sensitivity: str = "internal"
+    expiration_policy: str = "ttl"
 
     def __post_init__(self) -> None:
         validate_safe_token(self.principal_id, "memory principal_id")
@@ -187,6 +240,12 @@ class MemoryEntry:
             raise ValueError("memory kind must be a MemoryKind")
         if self.source_task_id is not None:
             validate_safe_token(self.source_task_id, "memory source_task_id")
+        if not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("memory confidence must be between zero and one")
+        if self.sensitivity not in _ALLOWED_MEMORY_SENSITIVITIES:
+            raise ValueError("memory sensitivity must be public, internal, personal, or restricted")
+        if self.expiration_policy not in _ALLOWED_EXPIRATION_POLICIES:
+            raise ValueError("memory expiration_policy must be session, ttl, or pinned")
 
 
 def memory_entry_fingerprint(entry: MemoryEntry) -> str:
@@ -221,6 +280,9 @@ class MemoryRecord:
     source_task_id: str | None = None
     embedding: tuple[float, ...] | None = None
     embedding_model_id: str | None = None
+    confidence: float = 1.0
+    sensitivity: str = "internal"
+    expiration_policy: str = "ttl"
 
     def __post_init__(self) -> None:
         validate_safe_token(self.record_id, "memory record_id")
@@ -240,6 +302,32 @@ class MemoryRecord:
         if self.embedding is not None and self.embedding_model_id is not None:
             checked = EmbeddingResult(self.embedding_model_id, self.embedding)
             object.__setattr__(self, "embedding", checked.vector)
+        if not 0.0 <= float(self.confidence) <= 1.0:
+            raise ValueError("memory record confidence must be between zero and one")
+        if self.sensitivity not in _ALLOWED_MEMORY_SENSITIVITIES:
+            raise ValueError("memory record sensitivity is invalid")
+        if self.expiration_policy not in _ALLOWED_EXPIRATION_POLICIES:
+            raise ValueError("memory record expiration_policy is invalid")
+
+    @property
+    def id(self) -> str:
+        return self.record_id
+
+    @property
+    def type(self) -> str:
+        return self.kind.value
+
+    @property
+    def content(self) -> str:
+        return self.text
+
+    @property
+    def source(self) -> str:
+        return self.provenance
+
+    @property
+    def timestamp(self) -> datetime:
+        return self.created_at
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,12 +416,15 @@ class ResearchQuery:
     query: str
     max_results: int = 8
     allowed_domains: tuple[str, ...] = ()
+    min_relevance: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.query.strip() or len(self.query) > MAX_CONTEXT_TEXT_CHARS:
             raise ValueError("research query must be non-empty and bounded")
         if not 1 <= self.max_results <= 25:
             raise ValueError("research max_results must be between one and twenty-five")
+        if not 0.0 <= self.min_relevance <= 1.0:
+            raise ValueError("research min_relevance must be between zero and one")
         domains = tuple(
             dict.fromkeys(domain.lower().rstrip(".") for domain in self.allowed_domains)
         )

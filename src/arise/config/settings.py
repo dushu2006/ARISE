@@ -158,6 +158,10 @@ class VoiceSettings(BaseModel):
     enabled: bool = False
     microphone_enabled: bool = False
     local_model_path: Path | None = None
+    kokoro_model_path: Path | None = None
+    kokoro_voices_path: Path | None = None
+    tts_voice: str = "af_heart"
+    enable_local_tts_acknowledgement: bool = True
     microphone_device_id: str | None = None
     playback_device_id: str | None = None
     wake_word: str = "ARISE"
@@ -180,11 +184,11 @@ class VoiceSettings(BaseModel):
             raise ValueError("secret name must be an environment/keyring identifier")
         return name
 
-    @field_validator("model_id")
+    @field_validator("model_id", "tts_voice")
     @classmethod
     def validate_model_id(cls, model_id: str) -> str:
         if not model_id.strip() or len(model_id) > 256:
-            raise ValueError("voice model_id must be non-empty and at most 256 characters")
+            raise ValueError("voice model_id and tts_voice must be non-empty and at most 256 chars")
         return model_id.strip()
 
     @field_validator("wake_word", "locale")
@@ -208,13 +212,40 @@ class VoiceSettings(BaseModel):
             raise ValueError("microphone activation requires voice.enabled")
         if self.microphone_enabled and self.local_model_path is None:
             raise ValueError("microphone activation requires a user-supplied local Vosk model path")
+        if (self.kokoro_model_path is None) != (self.kokoro_voices_path is None):
+            raise ValueError("kokoro_model_path and kokoro_voices_path must be configured together")
         return self
+
+
+class DesktopSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    max_tree_depth: int = Field(default=8, ge=1, le=20)
+    max_nodes: int = Field(default=250, ge=10, le=2000)
+
+
+class BrowserSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    allowed_domains: list[str] = Field(default_factory=list)
+    allow_private_network: bool = False
+
+
+class PerceptionSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    allow_coordinate_fallback: bool = False
+    minimum_vision_confidence: float = Field(default=0.75, ge=0.0, le=1.0)
 
 
 class EmbeddingSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
+    use_local_fallback: bool = False
     base_url: AnyHttpUrl | None = None
     model_id: str | None = None
     api_key_secret_name: str = "LOCAL_EMBEDDINGS_KEY"
@@ -332,6 +363,9 @@ class AppSettings(BaseSettings):
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     model: ModelSettings = Field(default_factory=ModelSettings)
     voice: VoiceSettings = Field(default_factory=VoiceSettings)
+    desktop: DesktopSettings = Field(default_factory=DesktopSettings)
+    browser: BrowserSettings = Field(default_factory=BrowserSettings)
+    perception: PerceptionSettings = Field(default_factory=PerceptionSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     embeddings: EmbeddingSettings = Field(default_factory=EmbeddingSettings)
     research: ResearchSettings = Field(default_factory=ResearchSettings)

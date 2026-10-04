@@ -18,8 +18,13 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from arise.core.contracts import FrozenJSON, freeze_json, json_byte_size, validate_safe_token
-from arise.core.extensions import AudioChunk, SpeechRecognitionPort, TranscriptSegment
-from arise.core.intent import IntentClassifier
+from arise.core.extensions import (
+    AudioChunk,
+    SpeechRecognitionPort,
+    SpeechSynthesisPort,
+    TranscriptSegment,
+)
+from arise.core.intent import IntentClassifier, IntentKind
 from arise.core.models import (
     MicrophoneStatus,
     VoiceMetricSnapshot,
@@ -191,6 +196,9 @@ class VoiceConfig:
     minimum_asr_confidence: float = 0.65
     locale: str = "en"
     microphone_device_id: str | None = None
+    max_device_recovery_attempts: int = 2
+    device_recovery_backoff_seconds: float = 0.05
+    enable_local_tts_acknowledgement: bool = False
 
     def __post_init__(self) -> None:
         if not self.wake_word.strip() or len(self.wake_word) > 32:
@@ -215,6 +223,10 @@ class VoiceConfig:
             raise ValueError("voice locale must contain 1 to 32 characters")
         if self.microphone_device_id is not None and len(self.microphone_device_id) > 256:
             raise ValueError("microphone device identifier exceeds 256 characters")
+        if not 0 <= self.max_device_recovery_attempts <= 10:
+            raise ValueError("voice device recovery attempts must be between 0 and 10")
+        if not 0 <= self.device_recovery_backoff_seconds <= 10:
+            raise ValueError("voice device recovery backoff must be between 0 and 10 seconds")
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,6 +472,8 @@ class VoiceEventKind(StrEnum):
     TASK_ACCEPTED = "task_accepted"
     TASK_STATUS = "task_status"
     SESSION_RECONNECTED = "session_reconnected"
+    DEVICE_RECOVERED = "device_recovered"
+    LOCAL_ACKNOWLEDGED = "local_acknowledged"
     OUTPUT_GATED = "output_gated"
     ERROR = "error"
 
@@ -621,6 +635,7 @@ class AudioHub:
         config: VoiceConfig | None = None,
         conversation_bridge: VoiceConversationBridgePort | None = None,
         speech_recognizer: SpeechRecognitionPort | None = None,
+        speech_synthesizer: SpeechSynthesisPort | None = None,
         principal_id: str = "local-user",
         event_sink: VoiceEventSink | None = None,
         telemetry: VoiceTelemetry | None = None,
@@ -633,9 +648,11 @@ class AudioHub:
         self.config = config or VoiceConfig()
         self.conversation_bridge = conversation_bridge
         self.speech_recognizer = speech_recognizer
+        self.speech_synthesizer = speech_synthesizer
         self.principal_id = principal_id
         self.event_sink = event_sink
         self.telemetry = telemetry or VoiceTelemetry()
+        self._tts_generation_id = 0
         self._state = VoiceState.DORMANT
         self._microphone_status = (
             MicrophoneStatus.UNKNOWN if microphone is not None else MicrophoneStatus.NOT_CONFIGURED
@@ -1106,23 +1123,276 @@ class AudioHub:
 
     async def _capture_loop(self) -> None:
         assert self.microphone is not None and self._device_id is not None
+        while self._running and not self._closed:
+            try:
+                async for chunk in self.microphone.capture(self._device_id):
+                    if self._closed or not self._running:
+                        return
+                    await self.process_chunk(chunk)
+                if self._running and not self._closed:
+                    raise MicrophoneUnavailable("microphone stream ended")
+                return
+            except asyncio.CancelledError:
+                raise
+            except MicrophonePermissionDenied:
+                self._microphone_status = MicrophoneStatus.PERMISSION_DENIED
+                self._last_error_code = "MICROPHONE_PERMISSION_DENIED"
+                await self._capture_failed()
+                return
+            except MicrophoneUnavailable:
+                if (
+                    self._running
+                    and not self._closed
+                    and self.config.max_device_recovery_attempts > 0
+                    and await self.recover_device_loss()
+                ):
+                    continue
+                self._microphone_status = MicrophoneStatus.UNAVAILABLE
+                self._last_error_code = "MICROPHONE_DEVICE_LOST"
+                await self._capture_failed()
+                return
+            except Exception:
+                if (
+                    self._running
+                    and not self._closed
+                    and self.config.max_device_recovery_attempts > 0
+                    and await self.recover_device_loss()
+                ):
+                    continue
+                self._microphone_status = MicrophoneStatus.ERROR
+                self._last_error_code = "MICROPHONE_CAPTURE_FAILED"
+                await self._capture_failed()
+                return
+
+    async def recover_device_loss(self) -> bool:
+        """Attempt bounded recovery after a microphone or audio endpoint disconnect."""
+
+        if self._closed or self.microphone is None:
+            return False
+        started = time.perf_counter()
+        self._microphone_status = MicrophoneStatus.UNAVAILABLE
+        attempts = max(1, self.config.max_device_recovery_attempts)
+        for attempt in range(attempts):
+            if self.config.device_recovery_backoff_seconds and attempt > 0:
+                await asyncio.sleep(
+                    min(self.config.device_recovery_backoff_seconds * (2**attempt), 5.0)
+                )
+            try:
+                devices = tuple(await self.microphone.list_devices())
+            except MicrophonePermissionDenied:
+                self._microphone_status = MicrophoneStatus.PERMISSION_DENIED
+                self._last_error_code = "MICROPHONE_PERMISSION_DENIED"
+                return False
+            except Exception:
+                continue
+            chosen = next(
+                (
+                    device
+                    for device in devices
+                    if device.device_id == self.config.microphone_device_id
+                ),
+                None,
+            )
+            if chosen is None:
+                chosen = next((device for device in devices if device.is_default), None)
+            if chosen is None and devices:
+                chosen = devices[0]
+            if chosen is None:
+                continue
+            if self.playback is not None:
+                try:
+                    await self.playback.stop()
+                except Exception:
+                    pass
+            self._device_id = chosen.device_id
+            self._microphone_status = MicrophoneStatus.AVAILABLE
+            self._last_error_code = None
+            if self._state is VoiceState.ERROR:
+                self._set_state(VoiceState.DORMANT)
+            self.telemetry.record("device_loss_recovery_ms", (time.perf_counter() - started) * 1000)
+            self._emit(VoiceEventKind.DEVICE_RECOVERED)
+            return True
+        self._microphone_status = MicrophoneStatus.UNAVAILABLE
+        self._last_error_code = "MICROPHONE_DEVICE_LOST"
+        if self._state not in {VoiceState.ERROR, VoiceState.DEACTIVATING}:
+            self._set_state(VoiceState.ERROR)
+        return False
+
+    async def acknowledge_locally(self, user_text: str, *, speak: bool = True) -> str:
+        """Produce an immediate local template acknowledgement without a cloud round-trip."""
+
+        started = time.perf_counter()
+        cleaned = (user_text or "").strip()
+        ack_fn = getattr(self.conversation_bridge, "immediate_acknowledgement", None)
+        if callable(ack_fn):
+            acknowledgement = str(ack_fn(cleaned))
+        else:
+            intent = self._intent_classifier.classify(cleaned) if cleaned else None
+            if intent is not None and intent.kind is IntentKind.CANCELLATION:
+                acknowledgement = "ARISE received your cancellation request."
+            elif intent is not None and intent.kind is IntentKind.CLARIFICATION:
+                acknowledgement = "Could you clarify what you would like ARISE to do?"
+            elif (
+                intent is not None and intent.may_require_runtime_task and intent.confidence >= 0.75
+            ):
+                acknowledgement = "ARISE accepted the task and is working on it."
+            else:
+                acknowledgement = "ARISE heard your request."
+        normalized = _normalize_spoken_text(acknowledgement)
+        if normalized:
+            self._allowed_spoken_texts.add(normalized)
+        self.telemetry.record(
+            "local_acknowledgement_latency_ms", (time.perf_counter() - started) * 1000
+        )
+        self._emit(VoiceEventKind.LOCAL_ACKNOWLEDGED)
+        if speak and self.speech_synthesizer is not None and self.playback is not None:
+            await self.speak_text(acknowledgement)
+        return acknowledgement
+
+    async def speak_text(
+        self,
+        text: str,
+        *,
+        generation_id: int | None = None,
+    ) -> int:
+        """Stream synthesized TTS audio chunks into playback with generation-fence checking."""
+
+        cleaned = (text or "").strip()
+        if not cleaned or self._closed or self.speech_synthesizer is None or self.playback is None:
+            return 0
+        if self._suppress_provider_output or (
+            self._minimum_output_generation is not None
+            and generation_id is not None
+            and generation_id < self._minimum_output_generation
+        ):
+            self._emit(VoiceEventKind.OUTPUT_GATED)
+            return 0
+        if (
+            self._task_claim_guard or _looks_like_unverified_task_claim(cleaned)
+        ) and not self._spoken_output_is_authorized(cleaned):
+            self._emit(VoiceEventKind.OUTPUT_GATED)
+            return 0
+        local_gen = self._tts_generation_id
+        chunks_played = 0
+        previous_state = self._state
+        if self._state not in {
+            VoiceState.SPEAKING,
+            VoiceState.DEACTIVATING,
+            VoiceState.ERROR,
+            VoiceState.DORMANT,
+        }:
+            self._set_state(VoiceState.SPEAKING)
         try:
-            async for chunk in self.microphone.capture(self._device_id):
-                if self._closed or not self._running:
-                    return
-                await self.process_chunk(chunk)
-            if self._running and not self._closed:
-                raise MicrophoneUnavailable("microphone stream ended")
+            async for chunk in self.speech_synthesizer.synthesize(
+                cleaned,
+                locale=self.config.locale,
+                correlation_id=self._session_id or "local-tts",
+            ):
+                if (
+                    self._closed
+                    or self._suppress_provider_output
+                    or self._tts_generation_id != local_gen
+                    or (
+                        self._minimum_output_generation is not None
+                        and generation_id is not None
+                        and generation_id < self._minimum_output_generation
+                    )
+                ):
+                    self._emit(VoiceEventKind.OUTPUT_GATED)
+                    break
+                if self._turn_started_at and not self._first_audio_recorded:
+                    self.telemetry.record(
+                        "time_to_first_audio_ms",
+                        (time.perf_counter() - self._turn_started_at) * 1000,
+                    )
+                    self._first_audio_recorded = True
+                await self.playback.play(chunk)
+                chunks_played += 1
         except asyncio.CancelledError:
             raise
-        except MicrophonePermissionDenied:
-            self._microphone_status = MicrophoneStatus.PERMISSION_DENIED
-            self._last_error_code = "MICROPHONE_PERMISSION_DENIED"
-            await self._capture_failed()
         except Exception:
-            self._microphone_status = MicrophoneStatus.ERROR
-            self._last_error_code = "MICROPHONE_CAPTURE_FAILED"
-            await self._capture_failed()
+            self._last_error_code = "AUDIO_PLAYBACK_FAILED"
+            self._emit(VoiceEventKind.ERROR, error_code=self._last_error_code)
+            if self._state is VoiceState.SPEAKING:
+                self._set_state(
+                    VoiceState.EXECUTING
+                    if self._active_task_id is not None
+                    else (
+                        previous_state
+                        if previous_state in _ALLOWED_TRANSITIONS[VoiceState.SPEAKING]
+                        else VoiceState.LISTENING
+                    )
+                )
+        return chunks_played
+
+    async def process_spoken_utterance(
+        self,
+        user_text: str,
+        *,
+        speak_response: bool = True,
+    ) -> dict[str, Any]:
+        """Process a transcribed spoken utterance through VoiceConversationBridge and TTS."""
+
+        if self._closed or self.conversation_bridge is None:
+            return {
+                "status": "unavailable",
+                "verified": False,
+                "summary": "ARISE voice bridge is not available.",
+            }
+        if self._session_id is None:
+            self._session_id = str(uuid.uuid4())
+        process_fn = getattr(self.conversation_bridge, "process_utterance", None)
+        if callable(process_fn):
+            raw_result = await process_fn(
+                user_text,
+                principal_id=self.principal_id,
+                session_id=self._session_id,
+                locale=self.config.locale,
+            )
+            response = dict(raw_result)
+        else:
+            call = LiveToolCall(
+                call_id=str(uuid.uuid4()),
+                name="execute_task",
+                arguments={"text": user_text},
+            )
+            raw_result = await self.conversation_bridge.handle_tool_call(
+                call,
+                principal_id=self.principal_id,
+                session_id=self._session_id,
+                locale=self.config.locale,
+                user_text=user_text,
+            )
+            response = dict(raw_result)
+        for key in ("acknowledgement", "summary", "question", "spoken_response"):
+            spoken = response.get(key)
+            if isinstance(spoken, str) and spoken.strip():
+                normalized = _normalize_spoken_text(spoken)
+                if normalized:
+                    self._allowed_spoken_texts.add(normalized)
+        task_id = response.get("task_id")
+        if isinstance(task_id, str):
+            self._task_claim_guard = True
+            self._guard_reset_after_turn = True
+            response_state = response.get("state", response.get("status"))
+            if response.get("status") == "accepted":
+                if not isinstance(response_state, str) or response_state not in _VOICE_TASK_STATES:
+                    response_state = "queued"
+                self._emit(VoiceEventKind.TASK_ACCEPTED, task_id=task_id)
+            if isinstance(response_state, str) and response_state in _VOICE_TASK_STATES:
+                self._record_task_state(task_id, response_state)
+                if response_state not in _TERMINAL_VOICE_TASK_STATES:
+                    self._start_task_monitor(task_id)
+        if speak_response and self.speech_synthesizer is not None and self.playback is not None:
+            spoken_text = (
+                response.get("acknowledgement")
+                or response.get("spoken_response")
+                or response.get("question")
+                or response.get("summary")
+            )
+            if isinstance(spoken_text, str) and spoken_text.strip():
+                await self.speak_text(spoken_text)
+        return response
 
     async def _capture_failed(self) -> None:
         self._running = False
@@ -1387,6 +1657,13 @@ class AudioHub:
                     (time.perf_counter() - self._turn_started_at) * 1000,
                 )
                 self._first_response_recorded = True
+            if (
+                event.is_final
+                and event.text
+                and self.speech_synthesizer is not None
+                and not self._first_audio_recorded
+            ):
+                await self.speak_text(event.text, generation_id=event.generation_id)
         elif event.type is LiveEventType.OUTPUT_AUDIO and event.audio is not None:
             if self._turn_started_at and not self._first_audio_recorded:
                 self.telemetry.record(
@@ -1515,6 +1792,14 @@ class AudioHub:
                 if response.get("status") in {"waiting_for_user", "not_authorized"}:
                     self._task_claim_guard = True
                     self._guard_reset_after_turn = True
+                if (
+                    self.config.enable_local_tts_acknowledgement
+                    and response.get("status") == "accepted"
+                    and isinstance(response.get("acknowledgement"), str)
+                    and self.speech_synthesizer is not None
+                    and not self._first_audio_recorded
+                ):
+                    await self.speak_text(str(response["acknowledgement"]))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1683,6 +1968,7 @@ class AudioHub:
         self._emit(VoiceEventKind.BARGE_IN)
 
     async def _stop_output_for_barge_in(self) -> None:
+        self._tts_generation_id += 1
         if self.playback is not None:
             stop_started = time.perf_counter_ns()
             try:

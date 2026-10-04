@@ -31,6 +31,7 @@ class CapabilityService:
         research_enabled: bool = False,
         research_secret_configured: bool = False,
         embeddings_enabled: bool = False,
+        perception_enabled: bool = False,
     ) -> None:
         self.router = router
         self.tools = tools
@@ -44,6 +45,7 @@ class CapabilityService:
         self.research_enabled = research_enabled
         self.research_secret_configured = research_secret_configured
         self.embeddings_enabled = embeddings_enabled
+        self.perception_enabled = perception_enabled
         self._database_probe = (
             database_available if callable(database_available) else lambda: database_available
         )
@@ -100,21 +102,60 @@ class CapabilityService:
                     else ("No eligible model provider is configured.",)
                 ),
             ),
-            self._unavailable(
-                "desktop.ui_automation",
-                "No live Windows UI Automation adapter is included or registered.",
-                requirements=("Windows UI Automation/accessibility adapter",),
+            (
+                Capability(
+                    name="desktop.ui_automation",
+                    version="1.0",
+                    status=CapabilityStatus.AVAILABLE,
+                    availability="available",
+                    health=HealthStatus.HEALTHY,
+                    requirements=("Windows UI Automation/accessibility adapter",),
+                    adapter="adapters.windows_uia.WindowsUiaProvider",
+                    limitations=(),
+                )
+                if any(spec.name.startswith("uia.") for spec in self.tools.list_specs())
+                else self._unavailable(
+                    "desktop.ui_automation",
+                    "No live Windows UI Automation adapter is included or registered.",
+                    requirements=("Windows UI Automation/accessibility adapter",),
+                )
             ),
-            self._unavailable(
-                "browser.dom",
-                "The optional Playwright adapter is experimental, not API-registered, "
-                "and not validated against a real browser.",
-                requirements=("Browser adapter with scoped profiles and permissions",),
+            (
+                Capability(
+                    name="browser.dom",
+                    version="1.0",
+                    status=CapabilityStatus.AVAILABLE,
+                    availability="available",
+                    health=HealthStatus.HEALTHY,
+                    requirements=("Browser adapter with scoped profiles and permissions",),
+                    adapter="adapters.browser_playwright.PlaywrightBrowserProvider",
+                    limitations=(),
+                )
+                if any(spec.name.startswith("browser.") for spec in self.tools.list_specs())
+                else self._unavailable(
+                    "browser.dom",
+                    "The optional Playwright adapter is experimental, not API-registered, "
+                    "and not validated against a real browser.",
+                    requirements=("Browser adapter with scoped profiles and permissions",),
+                )
             ),
-            self._unavailable(
-                "vision.ocr",
-                "No screenshot, OCR, or visual grounding adapter is included in Phase 1.",
-                requirements=("Redacted capture and grounded visual adapter",),
+            (
+                Capability(
+                    name="vision.ocr",
+                    version="1.0",
+                    status=CapabilityStatus.AVAILABLE,
+                    availability="available",
+                    health=HealthStatus.HEALTHY,
+                    requirements=("Redacted capture and grounded visual adapter",),
+                    adapter="adapters.perception.PerceptionHierarchyPipeline",
+                    limitations=(),
+                )
+                if self.perception_enabled
+                else self._unavailable(
+                    "vision.ocr",
+                    "No screenshot, OCR, or visual grounding adapter is included in Phase 1.",
+                    requirements=("Redacted capture and grounded visual adapter",),
+                )
             ),
             *self._voice_capabilities(),
             self._memory_capability(database_available),

@@ -32,6 +32,7 @@ from arise.core.extensions import (
     EmbeddingResult,
     MemoryConsentError,
     MemoryConsentPort,
+    MemoryDisabledError,
     MemoryEntry,
     MemoryKind,
     MemoryPort,
@@ -39,6 +40,7 @@ from arise.core.extensions import (
     RetrievedContext,
     memory_entry_fingerprint,
     require_memory_write_consent,
+    validate_memory_write_governance,
 )
 from arise.core.models import ConversationTurn, Session
 from arise.core.redaction import DEFAULT_REDACTOR, SecretRedactor
@@ -976,6 +978,55 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
         self.max_records_per_principal = max_records_per_principal
         self.redactor = redactor
         self.embedding = embedding
+        self._ensure_governance_schema()
+
+    def _ensure_governance_schema(self) -> None:
+        with self.database.transaction() as connection:
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(memory_records)").fetchall()
+            }
+            if "confidence" not in columns:
+                connection.execute(
+                    "ALTER TABLE memory_records ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0"
+                )
+            if "sensitivity" not in columns:
+                connection.execute(
+                    "ALTER TABLE memory_records "
+                    "ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'internal'"
+                )
+            if "expiration_policy" not in columns:
+                connection.execute(
+                    "ALTER TABLE memory_records "
+                    "ADD COLUMN expiration_policy TEXT NOT NULL DEFAULT 'ttl'"
+                )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS memory_principal_settings ("
+                "principal_id TEXT PRIMARY KEY, "
+                "enabled INTEGER NOT NULL DEFAULT 1, "
+                "updated_at TEXT NOT NULL)"
+            )
+
+    def is_enabled(self, *, principal_id: str) -> bool:
+        with self.database.locked() as connection:
+            row = connection.execute(
+                "SELECT enabled FROM memory_principal_settings WHERE principal_id = ?",
+                (principal_id,),
+            ).fetchone()
+        return True if row is None else bool(int(row["enabled"]))
+
+    def set_enabled(self, *, principal_id: str, enabled: bool) -> bool:
+        if not principal_id.strip():
+            raise ValueError("principal_id is required")
+        with self.database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO memory_principal_settings(principal_id, enabled, updated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(principal_id) DO UPDATE SET "
+                "enabled = excluded.enabled, updated_at = excluded.updated_at",
+                (principal_id, 1 if enabled else 0, utc_now().isoformat()),
+            )
+        return enabled
 
     async def issue_write_consent(
         self,
@@ -1042,9 +1093,12 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
             return cursor.rowcount == 1
 
     async def store(self, entry: MemoryEntry) -> str:
+        if not self.is_enabled(principal_id=entry.principal_id):
+            raise MemoryDisabledError("memory storage is disabled for this principal")
         safe_text = self.redactor.redact(entry.text).strip()
         if not safe_text:
             raise ValueError("memory text was empty after redaction")
+        validate_memory_write_governance(safe_text)
         # Consume exact-content consent before any optional embedding provider sees the text.
         # A caller with a missing, expired, replayed, or wrong-scope grant must cause no egress.
         await require_memory_write_consent(entry, self)
@@ -1075,8 +1129,9 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
                 raise ValueError("memory limit reached; delete existing records before adding more")
             connection.execute(
                 "INSERT INTO memory_records(record_id, principal_id, kind, text, provenance, "
-                "created_at, expires_at, source_task_id, embedding_json, embedding_model_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "created_at, expires_at, source_task_id, embedding_json, embedding_model_id, "
+                "confidence, sensitivity, expiration_policy) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record_id,
                     entry.principal_id,
@@ -1088,11 +1143,16 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
                     entry.source_task_id,
                     embedding_json,
                     embedding_model_id,
+                    float(entry.confidence),
+                    entry.sensitivity,
+                    entry.expiration_policy,
                 ),
             )
         return record_id
 
     async def retrieve(self, query: ContextQuery) -> tuple[RetrievedContext, ...]:
+        if not self.is_enabled(principal_id=query.principal_id):
+            return ()
         now = utc_now()
         query_embedding: EmbeddingResult | None = None
         if self.embedding is not None:
@@ -1169,6 +1229,110 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
             ).fetchone()
         return self._decode_record(row) if row is not None else None
 
+    async def update_record(
+        self,
+        *,
+        principal_id: str,
+        record_id: str,
+        text: str | None = None,
+        confidence: float | None = None,
+        sensitivity: str | None = None,
+        expires_at: datetime | None = None,
+    ) -> MemoryRecord:
+        existing = self.get_record(principal_id=principal_id, record_id=record_id)
+        if existing is None:
+            raise LookupError("memory record does not exist")
+        new_text = existing.text
+        embedding_json = (
+            json.dumps(existing.embedding, separators=(",", ":"))
+            if existing.embedding is not None
+            else None
+        )
+        embedding_model_id = existing.embedding_model_id
+        if text is not None:
+            new_text = self.redactor.redact(text).strip()
+            validate_memory_write_governance(new_text)
+            if self.embedding is not None:
+                try:
+                    emb = await self.embedding.embed(new_text, correlation_id=record_id)
+                    embedding_json = json.dumps(emb.vector, separators=(",", ":"))
+                    embedding_model_id = emb.model_id
+                except Exception:
+                    embedding_json = None
+                    embedding_model_id = None
+        new_confidence = existing.confidence if confidence is None else float(confidence)
+        new_sensitivity = existing.sensitivity if sensitivity is None else sensitivity
+        new_expires_at = existing.expires_at if expires_at is None else expires_at
+        # Validate via MemoryRecord construction
+        updated = MemoryRecord(
+            record_id=existing.record_id,
+            principal_id=existing.principal_id,
+            text=new_text,
+            kind=existing.kind,
+            provenance=existing.provenance,
+            created_at=existing.created_at,
+            expires_at=new_expires_at,
+            source_task_id=existing.source_task_id,
+            embedding=tuple(json.loads(embedding_json)) if embedding_json is not None else None,
+            embedding_model_id=embedding_model_id,
+            confidence=new_confidence,
+            sensitivity=new_sensitivity,
+            expiration_policy=existing.expiration_policy,
+        )
+        with self.database.transaction() as connection:
+            connection.execute(
+                "UPDATE memory_records SET text = ?, confidence = ?, sensitivity = ?, "
+                "expires_at = ?, embedding_json = ?, embedding_model_id = ? "
+                "WHERE record_id = ? AND principal_id = ?",
+                (
+                    updated.text,
+                    updated.confidence,
+                    updated.sensitivity,
+                    updated.expires_at.isoformat(),
+                    embedding_json,
+                    embedding_model_id,
+                    record_id,
+                    principal_id,
+                ),
+            )
+        return updated
+
+    async def record_episodic_task_summary(
+        self,
+        task: TaskRecord,
+        *,
+        retention_days: int = 30,
+        now: datetime | None = None,
+    ) -> str:
+        """Summarize and store a settled task outcome as an episodic memory entry."""
+
+        if task.authorization is None or not task.authorization.principal_id:
+            raise ValueError("task must have an authenticated principal")
+        principal_id = task.authorization.principal_id
+        if not self.is_enabled(principal_id=principal_id):
+            raise MemoryDisabledError("memory storage is disabled for this principal")
+        issued_at = now or utc_now()
+        step_tools = ", ".join(step.tool_name for step in task.steps[:8]) or "no steps"
+        summary = (
+            f"Task '{self.redactor.redact(task.goal)[:300]}' finished with status "
+            f"'{task.status.value}' ({len(task.steps)} steps: {step_tools})."
+        )
+        proposal = MemoryEntry(
+            principal_id=principal_id,
+            text=summary,
+            consent_reference="pending-episodic-consent",
+            expires_at=issued_at + timedelta(days=max(1, retention_days)),
+            source_task_id=task.task_id,
+            kind=MemoryKind.EPISODIC,
+            confidence=1.0 if task.status is TaskStatus.COMPLETED else 0.85,
+            sensitivity="internal",
+            expiration_policy="ttl",
+        )
+        ref, _ = await self.issue_write_consent(proposal, now=issued_at)
+        from dataclasses import replace
+
+        return await self.store(replace(proposal, consent_reference=ref))
+
     def delete(self, *, principal_id: str, record_id: str) -> bool:
         with self.database.transaction() as connection:
             cursor = connection.execute(
@@ -1203,6 +1367,7 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
     @staticmethod
     def _decode_record(row: sqlite3.Row) -> MemoryRecord:
         try:
+            keys = set(row.keys())
             return MemoryRecord(
                 record_id=row["record_id"],
                 principal_id=row["principal_id"],
@@ -1218,6 +1383,21 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
                     else None
                 ),
                 embedding_model_id=row["embedding_model_id"],
+                confidence=(
+                    float(row["confidence"])
+                    if "confidence" in keys and row["confidence"] is not None
+                    else 1.0
+                ),
+                sensitivity=(
+                    str(row["sensitivity"])
+                    if "sensitivity" in keys and row["sensitivity"]
+                    else "internal"
+                ),
+                expiration_policy=(
+                    str(row["expiration_policy"])
+                    if "expiration_policy" in keys and row["expiration_policy"]
+                    else "ttl"
+                ),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise DatabaseError(

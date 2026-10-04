@@ -5,14 +5,20 @@ from __future__ import annotations
 import ipaddress
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from urllib.parse import urlparse
 
 import httpx
 
 from arise.adapters.secrets import SecretProvider, SecretUnavailable
 from arise.core.errors import ProviderUnavailableError
-from arise.core.models import ModelMessage, ModelRequest, ModelResponse, ModelRole
+from arise.core.models import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ModelRole,
+    ModelStreamChunk,
+)
 
 MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -41,6 +47,7 @@ class OpenAICompatibleProvider:
         max_concurrent_requests: int = 4,
         timeout_seconds: float = 120.0,
         connect_timeout_seconds: float = 10.0,
+        supports_streaming: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         parsed = urlparse(base_url)
@@ -60,13 +67,20 @@ class OpenAICompatibleProvider:
         self.model_ids = (model_id,)
         self.is_cloud = is_cloud
         self.max_concurrent_requests = max_concurrent_requests
+        self.supports_streaming = supports_streaming
         self.base_url = base_url.rstrip("/")
         self.api_key_secret_name = api_key_secret_name
         self.secret_provider = secret_provider
         self.timeout_seconds = timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
+        self._limits = httpx.Limits(
+            max_keepalive_connections=max(2, max_concurrent_requests * 2),
+            max_connections=max(4, max_concurrent_requests * 4),
+            keepalive_expiry=30.0,
+        )
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_seconds, connect=connect_timeout_seconds),
+            limits=self._limits,
             trust_env=False,
         )
         self._owns_client = client is None
@@ -177,6 +191,103 @@ class OpenAICompatibleProvider:
                 "Model provider response was unavailable or malformed.",
                 component="model-provider",
                 operation="complete",
+                retryable=isinstance(exc, httpx.HTTPError),
+            ) from exc
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamChunk]:
+        if not self.supports_streaming:
+            raise ProviderUnavailableError(
+                "This model adapter does not support streaming responses.",
+                component="model-provider",
+                operation="stream",
+                retryable=False,
+            )
+        if not self.supports(request.role, request.required_modalities):
+            raise ProviderUnavailableError(
+                "Model provider does not support the requested role or modalities.",
+                component="model-provider",
+                operation="stream",
+            )
+        model_id = request.model_id or self.model_ids[0]
+        messages = [{"role": m.role, "content": self._plain_text(m)} for m in request.messages]
+        payload = {
+            "model": model_id,
+            "messages": messages,
+            "max_tokens": request.max_output_tokens,
+            "temperature": request.temperature,
+            "stream": True,
+        }
+        headers = {"Content-Type": "application/json"}
+        try:
+            api_key = self.secret_provider.get_secret(self.api_key_secret_name)
+        except SecretUnavailable:
+            if not self._local_endpoint:
+                raise ProviderUnavailableError(
+                    "Model credential is not configured in the OS credential store.",
+                    component="model-provider",
+                    operation="resolve-secret",
+                    retryable=False,
+                ) from None
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        response_timeout = httpx.Timeout(
+            min(request.timeout_seconds, self.timeout_seconds),
+            connect=min(request.timeout_seconds, self.connect_timeout_seconds),
+        )
+        seq = 0
+        total_bytes = 0
+        try:
+            async with self._client.stream(
+                "POST",
+                self._chat_completions_url(),
+                headers=headers,
+                json=payload,
+                timeout=response_timeout,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    total_bytes += len(line.encode("utf-8"))
+                    if total_bytes > MAX_MODEL_RESPONSE_BYTES:
+                        raise ValueError("model provider stream exceeded the size limit")
+                    stripped = line.strip()
+                    if not stripped or not stripped.startswith("data:"):
+                        continue
+                    data_str = stripped[5:].strip()
+                    if data_str == "[DONE]":
+                        yield ModelStreamChunk(
+                            request_id=request.request_id,
+                            provider_id=self.provider_id,
+                            model_id=model_id,
+                            sequence=seq,
+                            text_delta="",
+                            is_final=True,
+                            finish_reason="stop",
+                        )
+                        return
+                    chunk_obj = json.loads(data_str)
+                    choices = chunk_obj.get("choices") if isinstance(chunk_obj, Mapping) else None
+                    if not isinstance(choices, list) or not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    text_delta = delta.get("content") or ""
+                    finish_reason = choices[0].get("finish_reason")
+                    is_final = finish_reason is not None
+                    yield ModelStreamChunk(
+                        request_id=request.request_id,
+                        provider_id=self.provider_id,
+                        model_id=model_id,
+                        sequence=seq,
+                        text_delta=str(text_delta),
+                        is_final=is_final,
+                        finish_reason=str(finish_reason) if finish_reason is not None else None,
+                    )
+                    seq += 1
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            raise ProviderUnavailableError(
+                "Model provider stream was unavailable or malformed.",
+                component="model-provider",
+                operation="stream",
                 retryable=isinstance(exc, httpx.HTTPError),
             ) from exc
 

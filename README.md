@@ -140,9 +140,35 @@ Even with a model configured, the current server has no real desktop action tool
 - `POST /api/v1/tasks/{id}/respond`, `/cancel`, `/approve` — explicit task controls.
 - `GET /api/v1/tasks/export?limit=...`, `DELETE /api/v1/tasks/history` — bounded task/event export and confirmed deletion of terminal history (active/recoverable work is retained).
 - `GET /api/v1/voice/status`, `POST /api/v1/voice/listening/start|stop` — authenticated gated local voice lifecycle controls.
-- `/api/v1/memory/*`, `POST /api/v1/research/search` — consent-gated local memory and explicitly opted-in untrusted research.
+- `/api/v1/memory/*` (`GET`, `POST`, `PATCH /api/v1/memory/{record_id}`, `DELETE`, `GET/PUT /api/v1/memory/settings`), `/api/v1/personalization` (`GET`, `PUT`, `DELETE`), `/api/v1/workflows` (`GET`, `POST`, `PATCH`, `DELETE`), and `POST /api/v1/research/search` — consent-gated local memory, personalization preferences, procedural workflows, and explicitly opted-in untrusted research.
 - `GET /api/v1/events?after=<sequence>` — durable audit/event replay; returns HTTP 410 with `EVENT_CURSOR_EXPIRED` below the replay floor.
 - `WS /ws/v1` — protocol v1 hello/authentication, task commands, heartbeat, and bounded event stream.
+
+## Windows setup, sidecar packaging, and troubleshooting
+
+### Sidecar packaging (`arise-backend`)
+
+Build or validate the standalone Python sidecar binary for Tauri 2 bundling:
+
+```bash
+# Dry-run path validation (works without PyInstaller):
+python scripts/build_sidecar.py --dry-run
+
+# Full standalone binary build into frontend/src-tauri/binaries/:
+python scripts/build_sidecar.py
+```
+
+`BackendSupervisor` (`src/arise/supervisor.py`) and the Tauri shell (`frontend/src-tauri/src/main.rs`) resolve `ARISE_BACKEND_EXECUTABLE`, bundled sidecar binaries (`arise-backend-x86_64-pc-windows-msvc.exe` / `arise-backend`), or `python -m arise.server`, enforce the `ARISE_BACKEND_READY` startup handshake, supervise the process via a parent-owned stdin pipe, and perform bounded crash-restart recovery.
+
+### Troubleshooting matrix
+
+| Symptom / Error Code | Cause | Resolution |
+|---|---|---|
+| `SingleInstanceLockError` on startup | Another ARISE backend instance already holds `<db>.lock` or port `8765` is occupied. | Stop the existing `arise-backend` / Tauri process before starting a new instance or running `arise backup`. |
+| `EVENT_CURSOR_EXPIRED` (HTTP 410 / WS) | Requested event sequence is below the durable replay floor after history deletion/retention. | Refresh authoritative task state via `GET /api/v1/tasks` and reconnect from the returned `replay_floor`. |
+| `MemoryDisabledError` (HTTP 403) | Persistent memory was disabled for the principal via `PUT /api/v1/memory/settings`. | Re-enable memory in the Memory UI or `PUT /api/v1/memory/settings` with `{"enabled": true}`. |
+| `MemoryGovernanceError` (HTTP 422) | Proposed memory entry contains payment card numbers, credential-only text, or empty content after redaction. | Store credentials in the OS keyring (`SecretRef`) and save only non-secret preferences/notes in memory. |
+| `TARGET_STALE` / `USER_INTERFERENCE` | Target window/DOM mutated, lost focus, changed DPI, or human mouse/keyboard input occurred after observation. | Allow `WindowsUiaProvider.reground_stale_target` / `PlaywrightBrowserProvider.reground_stale_target` to re-observe, or re-run the step when desktop focus settles. |
 
 ## Validation
 

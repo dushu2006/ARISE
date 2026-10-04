@@ -16,6 +16,7 @@ from arise.core.models import (
     TaskPlan,
     UserRequest,
 )
+from arise.core.personalization import PersonalizationStore, ProceduralMemoryStore
 from arise.core.planning import InvalidPlan, PlannerUnavailable, TaskPlanner
 from arise.core.ports import ToolRegistry
 from arise.core.tasks import TaskRecord
@@ -35,6 +36,8 @@ class GatewayTaskPlanner(TaskPlanner):
         timeout_seconds: float = 90.0,
         memory: MemoryPort | None = None,
         research: WebResearchPort | None = None,
+        personalization: PersonalizationStore | None = None,
+        procedural_memory: ProceduralMemoryStore | None = None,
         allow_memory_context_to_cloud: bool = False,
     ) -> None:
         if privacy not in {"local_only", "balanced", "cloud_allowed"}:
@@ -47,6 +50,8 @@ class GatewayTaskPlanner(TaskPlanner):
         self.timeout_seconds = timeout_seconds
         self.memory = memory
         self.research = research
+        self.personalization = personalization
+        self.procedural_memory = procedural_memory
         self.allow_memory_context_to_cloud = allow_memory_context_to_cloud
 
     async def create_plan(self, request: UserRequest, task: TaskRecord) -> TaskPlan:
@@ -147,6 +152,58 @@ class GatewayTaskPlanner(TaskPlanner):
                     content="UNTRUSTED_SAVED_MEMORY_CONTEXT_JSON: " + serialized_memory,
                 )
             )
+        if (
+            self.personalization is not None
+            and task.authorization is not None
+            and (self.privacy == "local_only" or self.allow_memory_context_to_cloud)
+        ):
+            try:
+                profile = self.personalization.get_profile(
+                    principal_id=task.authorization.principal_id
+                )
+                if (
+                    profile.preferred_browser
+                    or profile.preferred_apps
+                    or profile.preferred_response_style != "balanced"
+                ):
+                    messages.append(
+                        ModelMessage(
+                            role="user",
+                            content="UNTRUSTED_USER_PERSONALIZATION_JSON: "
+                            + json.dumps(
+                                profile.to_dict(),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
+            except Exception:
+                pass
+        if (
+            self.procedural_memory is not None
+            and task.authorization is not None
+            and (self.privacy == "local_only" or self.allow_memory_context_to_cloud)
+        ):
+            try:
+                matched_wf = self.procedural_memory.match_workflow(
+                    principal_id=task.authorization.principal_id,
+                    request_text=request.text,
+                    require_approved=True,
+                )
+                if matched_wf is not None:
+                    messages.append(
+                        ModelMessage(
+                            role="user",
+                            content="UNTRUSTED_MATCHED_PROCEDURAL_WORKFLOW_JSON: "
+                            + json.dumps(
+                                matched_wf.to_dict(),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
+            except Exception:
+                pass
         if research_context:
             serialized_research = json.dumps(
                 [

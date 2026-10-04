@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -17,6 +18,7 @@ from arise.core.models import (
     ModelRole,
     ModelSelection,
     ModelSelectionRequest,
+    ModelStreamChunk,
     ProviderStatus,
 )
 from arise.core.retry import CircuitBreaker, CircuitOpenError
@@ -52,18 +54,23 @@ class ModelRouter:
         *,
         allow_cloud: bool = False,
         max_concurrent_requests: int = 4,
+        max_queued_requests: int = 32,
         circuit_failure_threshold: int = 3,
         circuit_recovery_seconds: float = 30.0,
         events: EventStore | None = None,
     ) -> None:
         if max_concurrent_requests < 1:
             raise ValueError("max_concurrent_requests must be positive")
+        if max_queued_requests < 1:
+            raise ValueError("max_queued_requests must be positive")
         self.allow_cloud = allow_cloud
         self.max_concurrent_requests = max_concurrent_requests
+        self.max_queued_requests = max_queued_requests
         self.events = events
         self._providers: dict[str, _ProviderRuntime] = {}
         self._failure_threshold = circuit_failure_threshold
         self._recovery_seconds = circuit_recovery_seconds
+        self._queued_requests = 0
 
     def register(self, provider: ModelProvider) -> None:
         if not provider.provider_id.strip():
@@ -234,8 +241,30 @@ class ModelRouter:
                 },
             )
             started = time.perf_counter()
+            if self._queued_requests >= self.max_queued_requests:
+                self._record_model_event(
+                    "MODEL_QUEUE_BACKPRESSURE",
+                    request,
+                    severity=EventSeverity.WARNING,
+                    payload={
+                        "request_id": request.request_id,
+                        "role": request.role.value,
+                        "queued_requests": self._queued_requests,
+                        "max_queued_requests": self.max_queued_requests,
+                    },
+                )
+                raise ProviderUnavailableError(
+                    "Model router queue backpressure limit reached.",
+                    component="model-router",
+                    operation="complete",
+                    retryable=True,
+                )
+            self._queued_requests += 1
+            dequeued = False
             try:
                 async with runtime.semaphore:
+                    self._queued_requests = max(0, self._queued_requests - 1)
+                    dequeued = True
                     response = await asyncio.wait_for(
                         provider.complete(routed_request), timeout=request.timeout_seconds
                     )
@@ -249,6 +278,8 @@ class ModelRouter:
                         operation="complete",
                     )
             except asyncio.CancelledError:
+                if not dequeued:
+                    self._queued_requests = max(0, self._queued_requests - 1)
                 self._record_model_event(
                     "MODEL_REQUEST_CANCELLED",
                     request,
@@ -263,6 +294,8 @@ class ModelRouter:
                 )
                 raise
             except Exception as exc:
+                if not dequeued:
+                    self._queued_requests = max(0, self._queued_requests - 1)
                 runtime.breaker.record_failure()
                 runtime.failures += 1
                 last_error = exc
@@ -307,6 +340,115 @@ class ModelRouter:
             operation="complete",
             retryable=True,
             metadata={"provider_count": len(candidates)},
+        ) from last_error
+
+    async def complete_with_escalation(
+        self,
+        request: ModelRequest,
+        *,
+        selection: ModelSelectionRequest | None = None,
+        escalate_on_high_complexity: bool = True,
+    ) -> ModelResponse:
+        """Route to fast/primary provider first and escalate to DEEP_REASONER when needed."""
+
+        selector = selection or ModelSelectionRequest(
+            role=request.role,
+            task_type=request.role.value,
+            privacy="cloud_allowed" if self.allow_cloud else "local_only",
+            required_modalities=request.required_modalities,
+            preferred_provider=None,
+        )
+        if escalate_on_high_complexity and selector.complexity == "high":
+            deep_selector = selector.model_copy(update={"role": ModelRole.DEEP_REASONER})
+            deep_req = request.model_copy(update={"role": ModelRole.DEEP_REASONER})
+            if self._candidates(deep_selector):
+                try:
+                    return await self.complete(deep_req, selection=deep_selector)
+                except (CapabilityUnavailableError, ProviderUnavailableError):
+                    pass
+        try:
+            return await self.complete(request, selection=selector)
+        except (CapabilityUnavailableError, ProviderUnavailableError):
+            deep_selector = selector.model_copy(update={"role": ModelRole.DEEP_REASONER})
+            deep_req = request.model_copy(update={"role": ModelRole.DEEP_REASONER})
+            if self._candidates(deep_selector):
+                self._record_model_event(
+                    "MODEL_ESCALATED_DEEP_REASONER",
+                    request,
+                    payload={"request_id": request.request_id, "from_role": request.role.value},
+                )
+                return await self.complete(deep_req, selection=deep_selector)
+            raise
+
+    async def stream(
+        self,
+        request: ModelRequest,
+        *,
+        selection: ModelSelectionRequest | None = None,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Stream chunks from a streaming-capable provider with fallback and circuit protection."""
+
+        stream_request = request.model_copy(update={"stream": True})
+        selector = selection or ModelSelectionRequest(
+            role=stream_request.role,
+            task_type=stream_request.role.value,
+            privacy="cloud_allowed" if self.allow_cloud else "local_only",
+            required_modalities=stream_request.required_modalities,
+            preferred_provider=None,
+        )
+        selected = self.select(selector)
+        candidates = self._candidates(selector)
+        candidates.sort(key=lambda item: item.provider.provider_id != selected.provider_id)
+        last_error: BaseException | None = None
+        for runtime in candidates:
+            provider = runtime.provider
+            if not getattr(provider, "supports_streaming", False):
+                continue
+            if not runtime.breaker.allow_request():
+                continue
+            model_id = stream_request.model_id or self._select_model(provider, selector)
+            routed = stream_request.model_copy(update={"model_id": model_id})
+            stream_fn = getattr(provider, "stream", None)
+            started = time.perf_counter()
+            try:
+                async with runtime.semaphore:
+                    if callable(stream_fn):
+                        seq = 0
+                        async with asyncio.timeout(routed.timeout_seconds):
+                            async for chunk in stream_fn(routed):
+                                yield chunk
+                                seq += 1
+                    else:
+                        non_stream = routed.model_copy(update={"stream": False})
+                        resp = await asyncio.wait_for(
+                            provider.complete(non_stream), timeout=routed.timeout_seconds
+                        )
+                        yield ModelStreamChunk(
+                            request_id=routed.request_id,
+                            provider_id=provider.provider_id,
+                            model_id=model_id,
+                            sequence=0,
+                            text_delta=resp.content,
+                            is_final=True,
+                            finish_reason=resp.finish_reason or "stop",
+                        )
+                runtime.breaker.record_success()
+                runtime.failures = 0
+                runtime.last_success_at = datetime.now(UTC)
+                runtime.last_latency_ms = (time.perf_counter() - started) * 1000
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                runtime.breaker.record_failure()
+                runtime.failures += 1
+                last_error = exc
+                continue
+        raise ProviderUnavailableError(
+            "No streaming model provider succeeded.",
+            component="model-router",
+            operation="stream",
+            retryable=True,
         ) from last_error
 
     def _record_model_event(

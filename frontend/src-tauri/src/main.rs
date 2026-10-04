@@ -52,6 +52,26 @@ fn backend_is_running(address: SocketAddr) -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
 }
 
+fn find_bundled_sidecar() -> Option<PathBuf> {
+    let exe_dir = env::current_exe().ok()?.parent()?.to_path_buf();
+    let candidates = [
+        "arise-backend-x86_64-pc-windows-msvc.exe",
+        "arise-backend.exe",
+        "arise-backend",
+    ];
+    for name in candidates {
+        let direct = exe_dir.join(name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        let sub = exe_dir.join("binaries").join(name);
+        if sub.is_file() {
+            return Some(sub);
+        }
+    }
+    None
+}
+
 fn spawn_backend() -> Result<Child, String> {
     let address = backend_address();
     if backend_is_running(address) {
@@ -64,6 +84,8 @@ fn spawn_backend() -> Result<Child, String> {
 
     let mut command = if let Some(executable) = env::var_os("ARISE_BACKEND_EXECUTABLE") {
         Command::new(executable)
+    } else if let Some(sidecar) = find_bundled_sidecar() {
+        Command::new(sidecar)
     } else {
         let python = env::var_os("ARISE_PYTHON").unwrap_or_else(|| "python".into());
         let mut command = Command::new(python);
