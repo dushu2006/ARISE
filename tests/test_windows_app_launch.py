@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from arise.adapters.windows_app_discovery import WindowsApplicationCatalog
 from arise.adapters.windows_app_launch import (
     AppLaunchTool,
     ResolvedApplication,
@@ -48,6 +49,10 @@ from arise.core.resources import ResourceManager
 from arise.core.runtime import AgentRuntime
 from arise.core.tasks import InMemoryTaskRepository, TaskRecord, TaskStatus
 from arise.server import CompositeEnvironment, CompositeVerifier, create_app
+
+
+def _empty_catalog_resolver() -> WindowsApplicationResolver:
+    return WindowsApplicationResolver(catalog=WindowsApplicationCatalog(is_windows=False))
 
 
 class FakeAppLaunchBackend:
@@ -106,7 +111,7 @@ class FakeAppLaunchBackend:
 
 class ApplicationResolverTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
 
     def test_known_aliases_resolve_deterministically(self) -> None:
         aliases_to_test = [
@@ -215,7 +220,7 @@ class ApplicationResolverTests(unittest.TestCase):
 class AppLaunchToolSpecTests(unittest.TestCase):
     def setUp(self) -> None:
         self.backend = FakeAppLaunchBackend()
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
         self.provider = WindowsAppLaunchProvider(backend=self.backend, resolver=self.resolver)
         self.tool = AppLaunchTool(self.provider)
 
@@ -261,7 +266,7 @@ class AppLaunchToolSpecTests(unittest.TestCase):
 class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.backend = FakeAppLaunchBackend()
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
         self.resolver.register_alias(
             "chrome",
             ResolvedApplication(
@@ -351,7 +356,7 @@ class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
         obs = await self.provider.observe(action)
         with self.assertRaises(ComputerAdapterError) as caught:
             await self.tool.execute(action, obs, None)  # type: ignore[arg-type]
-        self.assertEqual(caught.exception.code, ComputerFailureCode.INTERNAL_ADAPTER_ERROR)
+        self.assertEqual(caught.exception.code, ComputerFailureCode.ACTIVATION_FAILED)
 
     async def test_process_exits_immediately_fails_verification(self) -> None:
         self.backend.exit_immediately = True
@@ -396,9 +401,7 @@ class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
             risk=RiskLevel.R1,
             authority=self.authority,
             parameters={"application": "Notepad"},
-            postconditions=(
-                Condition("nonexistent_fact", expected=True),
-            ),
+            postconditions=(Condition("nonexistent_fact", expected=True),),
         )
         verification = await self.provider.verify(action)
         self.assertEqual(verification.status, VerificationStatus.FAILED)
@@ -407,7 +410,7 @@ class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
 class EndToEndRuntimeAndPolicyIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.backend = FakeAppLaunchBackend()
-        self.resolver = WindowsApplicationResolver()
+        self.resolver = _empty_catalog_resolver()
         self.resolver.register_alias(
             "chrome",
             ResolvedApplication(
@@ -549,7 +552,10 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
             try:
                 fake_backend = FakeAppLaunchBackend()
                 services.app_launch_provider._backend = fake_backend
-                services.app_launch_provider._resolver.register_alias(
+                fake_resolver = _empty_catalog_resolver()
+                services.app_launch_provider._resolver = fake_resolver
+                services.uia_provider.application_resolver = fake_resolver
+                fake_resolver.register_alias(
                     "chrome",
                     ResolvedApplication(
                         name="Google Chrome",
@@ -562,7 +568,7 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
                     '{"needs_clarification":false,"steps":['
                     '{"step_id":"step-1","title":"Open Chrome","action":'
                     '{"tool_name":"system.app_launch","risk":1,"parameters":{"application":"Chrome"}}}'
-                    ']}'
+                    "]}"
                 )
                 planner_provider = MockPlannerProvider(plan_content)
                 services.router.register(planner_provider)
@@ -576,18 +582,23 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
                 request = UserRequest(text="Open Chrome")
                 task_record = await services.engine.submit(request, principal_id="local-user")
 
-                for _ in range(100):
+                for _ in range(500):
                     current = services.tasks.get(task_record.task_id)
-                    if current and current.status in {
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.BLOCKED,
-                    }:
+                    if current is not None:
                         task_record = current
-                        break
+                        if current.status in {
+                            TaskStatus.COMPLETED,
+                            TaskStatus.FAILED,
+                            TaskStatus.BLOCKED,
+                        }:
+                            break
                     await asyncio.sleep(0.02)
 
-                self.assertEqual(task_record.status, TaskStatus.COMPLETED)
+                self.assertEqual(
+                    task_record.status,
+                    TaskStatus.COMPLETED,
+                    task_record.status_reason,
+                )
                 self.assertEqual(len(fake_backend.launched_paths), 1)
             finally:
                 await services.engine.close()

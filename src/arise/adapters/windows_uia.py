@@ -189,7 +189,7 @@ class Win32UiaBackend:
     def _require_windows(self) -> None:
         if sys.platform != "win32" and self._user32 is None:
             raise ComputerAdapterError(
-                ComputerFailureCode.ADAPTER_UNAVAILABLE,
+                ComputerFailureCode.UIA_NOT_AVAILABLE,
                 "Windows UI Automation requires a supported Windows desktop host.",
                 source=PerceptionSource.UI_AUTOMATION,
             )
@@ -388,6 +388,8 @@ class Win32UiaBackend:
         process_id = int(pid.value) if int(pid.value) > 0 else None
         app_name = "windows-app"
         owner_executable: str | None = None
+        package_family_name: str | None = None
+        window_aumid: str | None = None
         if process_id is not None:
             try:
                 owner_process = psutil.Process(process_id)
@@ -402,6 +404,13 @@ class Win32UiaBackend:
                 raw_executable = owner_process.exe()
                 if raw_executable:
                     owner_executable = str(raw_executable)[:4096]
+                from arise.adapters.windows_app_discovery import (
+                    app_user_model_id_for_window,
+                    package_family_name_for_pid,
+                )
+
+                package_family_name = package_family_name_for_pid(process_id)
+                window_aumid = app_user_model_id_for_window(hwnd)
             except Exception:
                 app_name = "windows-app"
         return WindowRecord(
@@ -415,6 +424,8 @@ class Win32UiaBackend:
             foreground=(hwnd == fg_hwnd),
             bounds=bounds,
             executable_path=owner_executable,
+            package_family_name=package_family_name,
+            aumid=window_aumid,
         )
 
     async def list_windows(self, *, include_hidden: bool = False) -> Sequence[WindowRecord]:
@@ -856,6 +867,7 @@ class WindowsUiaProvider:
         backend: WindowsUiaBackend | None = None,
         secret_provider: SecretProvider | None = None,
         resolver: TargetResolver | None = None,
+        application_resolver: Any | None = None,
         observation_lease_seconds: float = 5.0,
         default_timeout_seconds: float = 10.0,
         max_tree_nodes: int = _MAX_TREE_NODES,
@@ -875,6 +887,7 @@ class WindowsUiaProvider:
         self._backend: WindowsUiaBackend = backend or Win32UiaBackend()
         self._secrets = secret_provider
         self._resolver = resolver or TargetResolver()
+        self.application_resolver = application_resolver
         self.observation_lease_seconds = observation_lease_seconds
         self.default_timeout_seconds = default_timeout_seconds
         if any(not isinstance(region, Rect) for region in unsafe_regions):
@@ -1001,6 +1014,8 @@ class WindowsUiaProvider:
                     bounds=win.bounds,
                     class_name=win.class_name,
                     executable_path=None,
+                    package_family_name=win.package_family_name,
+                    aumid=win.aumid,
                 )
             )
         return tuple(sanitized)
@@ -1021,6 +1036,8 @@ class WindowsUiaProvider:
             bounds=win.bounds,
             class_name=win.class_name,
             executable_path=None,
+            package_family_name=win.package_family_name,
+            aumid=win.aumid,
         )
 
     async def focus_window(self, window_id: str) -> WindowRecord:
@@ -1938,7 +1955,23 @@ class WindowsUiaActionTool:
                 "Windows action requires a semantic Windows target.",
                 source=PerceptionSource.UI_AUTOMATION,
             )
-        from arise.adapters.windows_app_launch import KNOWN_ALIASES, _safe_basename
+        from arise.adapters.windows_app_discovery import normalize_application_name
+        from arise.adapters.windows_app_launch import (
+            KNOWN_ALIASES,
+            _executable_key,
+            _safe_basename,
+        )
+
+        resolved_application = None
+        alias = KNOWN_ALIASES.get(target.application.casefold()) if target.application else None
+        if target.application and self.provider.application_resolver is not None:
+            try:
+                resolved_application = await asyncio.to_thread(
+                    self.provider.application_resolver.resolve, target.application
+                )
+            except ComputerAdapterError as exc:
+                if exc.code is ComputerFailureCode.APPLICATION_AMBIGUOUS:
+                    raise
 
         windows = await self.provider.list_windows()
         matches = []
@@ -1948,17 +1981,43 @@ class WindowsUiaActionTool:
             if target.process_id is not None and window.process_id != target.process_id:
                 continue
             if target.application:
-                requested = target.application.casefold()
-                alias = KNOWN_ALIASES.get(requested)
-                names = {requested}
-                if alias is not None:
-                    names.update(name.casefold() for name in alias.process_names)
-                    names.add(alias.name.casefold())
-                observed = {
-                    (window.application or "").casefold(),
-                    _safe_basename(window.executable_path or "").casefold(),
-                }
-                if not names.intersection(observed):
+                requested = normalize_application_name(target.application)
+                if resolved_application is not None:
+                    if resolved_application.package_family_name:
+                        app_matches = normalize_application_name(
+                            window.package_family_name or ""
+                        ) == normalize_application_name(
+                            resolved_application.package_family_name
+                        ) or bool(
+                            resolved_application.aumid
+                            and window.aumid
+                            and window.aumid.casefold() == resolved_application.aumid.casefold()
+                        )
+                    elif resolved_application.is_web_app:
+                        app_matches = normalize_application_name(
+                            window.title
+                        ) == resolved_application.normalized_name and _executable_key(
+                            window.executable_path
+                        ) == _executable_key(resolved_application.executable_path)
+                    else:
+                        app_matches = bool(
+                            resolved_application.executable_path
+                            and _executable_key(window.executable_path)
+                            == _executable_key(resolved_application.executable_path)
+                        )
+                else:
+                    names = {requested}
+                    if alias is not None:
+                        names.update(
+                            normalize_application_name(name) for name in alias.process_names
+                        )
+                        names.add(normalize_application_name(alias.name))
+                    observed = {
+                        normalize_application_name(window.application or ""),
+                        normalize_application_name(_safe_basename(window.executable_path or "")),
+                    }
+                    app_matches = bool(names.intersection(observed))
+                if not app_matches:
                     continue
             if window.visible:
                 matches.append(window)

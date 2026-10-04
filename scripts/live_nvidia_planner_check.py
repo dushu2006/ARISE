@@ -234,9 +234,12 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.diagnostics:
             launch = services.app_launch_provider
             if launch is not None:
-                print("launch dispatch diagnostic (not verification evidence):")
+                print("launch resolution/activation diagnostic (not verification evidence):")
                 print(json.dumps(launch.launch_diagnostic, indent=2))
-                # Only native observation facts, never application names/paths or UI text.
+                print("bounded installed-app discovery catalog (labels only; not launch evidence):")
+                catalog = launch.resolver.discover_installed(refresh=True)
+                print(json.dumps([item.diagnostic_summary() for item in catalog[:64]], indent=2))
+                # Observation facts omit application names, paths, and UI text.
                 observations = list(launch._observations.values())[-8:]
                 print("bounded launch observation evidence:")
                 print(

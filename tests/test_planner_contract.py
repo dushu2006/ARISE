@@ -103,6 +103,98 @@ LIVE_FAILURE_SHAPE: dict[str, Any] = {
 }
 
 
+def chrome_address_bar_plan(*, obsolete_condition_field: bool) -> dict[str, Any]:
+    """Return the live two-step scenario with valid or obsolete condition syntax."""
+
+    click_postcondition = {
+        "key": "window.focused_element",
+        "operator": "equals",
+        "expected": "Address bar",
+        "description": "Address bar has keyboard focus",
+    }
+    if obsolete_condition_field:
+        click_postcondition["condition"] = click_postcondition.pop("key")
+    return {
+        "steps": [
+            {
+                "step_id": "launch-chrome",
+                "title": "Launch Chrome",
+                "action": {
+                    "tool_name": "system.app_launch",
+                    "risk": 1,
+                    "parameters": {"application": "Chrome"},
+                    "postconditions": [
+                        {
+                            "key": "application.running",
+                            "operator": "equals",
+                            "expected": True,
+                            "description": "Chrome is running",
+                        }
+                    ],
+                },
+            },
+            {
+                "step_id": "click-address-bar",
+                "title": "Click the address bar",
+                "depends_on": ["launch-chrome"],
+                "action": {
+                    "tool_name": "uia.click",
+                    "risk": 3,
+                    "target": {
+                        "platform": "windows",
+                        "application": "chrome.exe",
+                        "window_id": "hwnd-1001",
+                        "role": "textbox",
+                        "semantic_name": "Address bar",
+                        "stable_id": "chrome-omnibox",
+                    },
+                    "postconditions": [click_postcondition],
+                },
+            },
+        ]
+    }
+
+
+def register_chrome_planning_tools(tools: ToolRegistry) -> None:
+    """Register inert metadata for the two-step planner regression scenario."""
+
+    tools.register(
+        MetadataOnlyTool(
+            ToolSpec(
+                name="system.app_launch",
+                version="1.0.0",
+                description="Launch an installed desktop application.",
+                minimum_risk=RiskLevel.R1,
+                required_capabilities=frozenset({"desktop.launch"}),
+                idempotency=Idempotency.IDEMPOTENT,
+                parameter_names=("application",),
+            )
+        )
+    )
+    tools.register(WindowsUiaActionTool(None, "click"))
+
+
+def chrome_request_and_task() -> tuple[UserRequest, TaskRecord]:
+    goal = "Open Chrome and click the address bar"
+    request_id = "request-open-chrome"
+    session_id = "session-open-chrome"
+    authority = AuthorizationContext(
+        principal_id="user-a",
+        user_intent_id=request_id,
+        trust=TrustLevel.USER_INSTRUCTION,
+        capabilities=frozenset({"desktop.launch", "desktop.ui_automation"}),
+    )
+    task = TaskRecord.new(
+        goal,
+        task_id="task-open-chrome",
+        request_id=request_id,
+        session_id=session_id,
+        authorization=authority,
+    )
+    request = UserRequest(request_id=request_id, session_id=session_id, text=goal)
+    return request, task
+
+
 class ScriptedProvider:
     """Deterministic provider double; records every request it receives."""
 
@@ -330,6 +422,58 @@ class PlannerOutputContractTests(PlannerContractTestCase):
         )
         self.assertIn("postconditions", provider.requests[1].messages[-1].content)
 
+    async def test_obsolete_condition_field_is_corrected_to_current_condition_shape(self) -> None:
+        register_chrome_planning_tools(self.tools)
+        request, task = chrome_request_and_task()
+        malformed = json.dumps(chrome_address_bar_plan(obsolete_condition_field=True))
+        corrected = json.dumps(chrome_address_bar_plan(obsolete_condition_field=False))
+        planner, provider, _ = await self.make_planner([malformed, corrected])
+
+        plan = await planner.create_plan(request, task)
+
+        self.assertEqual(len(provider.requests), 2)
+        self.assertEqual(plan.steps[1].action.postconditions[0].key, "window.focused_element")
+        self.assertEqual(plan.steps[1].action.postconditions[0].operator, ConditionOperator.EQUALS)
+        self.assertEqual(plan.steps[1].action.postconditions[0].expected, "Address bar")
+        self.assertEqual(
+            planner.last_diagnostic().attempt_categories,
+            ("schema_invalid", "accepted"),
+        )
+        self.assertEqual(planner.last_diagnostic().contract_version, "planner-contract-5")
+
+        correction = provider.requests[1].messages[-1].content
+        self.assertIn("steps.1.action.postconditions.0.key: missing", correction)
+        self.assertIn("steps.1.action.postconditions.0.condition: extra_forbidden", correction)
+        self.assertIn('"key":"window.focused_element"', correction)
+        self.assertIn('"condition" field', correction)
+        self.assertEqual(
+            provider.requests[0].messages[0].content,
+            provider.requests[1].messages[0].content,
+        )
+
+    async def test_obsolete_condition_field_stays_rejected_after_bounded_retry(self) -> None:
+        register_chrome_planning_tools(self.tools)
+        request, task = chrome_request_and_task()
+        malformed = json.dumps(chrome_address_bar_plan(obsolete_condition_field=True))
+        planner, provider, _ = await self.make_planner([malformed, malformed])
+
+        with self.assertRaises(InvalidPlan) as context:
+            await planner.create_plan(request, task)
+
+        self.assertEqual(context.exception.category, PlanFailureCategory.SCHEMA_INVALID)
+        self.assertEqual(context.exception.attempts, MAX_PLANNER_ATTEMPTS)
+        self.assertIn("steps.1.action.postconditions.0.key: missing", context.exception.detail)
+        self.assertIn(
+            "steps.1.action.postconditions.0.condition: extra_forbidden",
+            context.exception.detail,
+        )
+        self.assertEqual(len(provider.requests), MAX_PLANNER_ATTEMPTS)
+        diagnostic = planner.last_diagnostic()
+        self.assertFalse(diagnostic.accepted)
+        self.assertEqual(diagnostic.attempt_categories, ("schema_invalid", "schema_invalid"))
+        self.assertNotIn("Address bar", diagnostic.detail)
+        self.assertNotIn("window.focused_element", diagnostic.detail)
+
     async def test_valid_clarification_response_is_accepted_without_retry(self) -> None:
         payload = {
             "needs_clarification": True,
@@ -542,12 +686,30 @@ class PlannerOutputContractTests(PlannerContractTestCase):
             "proposed risk OR registered tool minimum risk is R2 or higher",
             "window.focused_element",
             "at least one explicit postcondition",
+            "same ConditionModel",
+            "Each array item is the condition object itself, not a wrapper",
+            "never in a field named condition",
+            "ConditionModel JSON Schema",
         ):
             with self.subTest(rule=rule):
                 self.assertIn(rule, system)
         # Exact enum spellings come from the current contracts.
         self.assertIn(f'"{Idempotency.UNKNOWN.value}"', system)
         self.assertIn(f'"{ConditionOperator.EQUALS.value}"', system)
+        condition_example = ConditionModel(
+            key="window.focused_element",
+            operator=ConditionOperator.EQUALS,
+            expected="Address bar",
+            description="Address bar has keyboard focus",
+        ).model_dump(mode="json", exclude={"schema_version"})
+        condition_example_json = json.dumps(
+            condition_example, ensure_ascii=False, separators=(",", ":")
+        )
+        self.assertEqual(set(condition_example), {"key", "operator", "expected", "description"})
+        ConditionModel.model_validate(condition_example)
+        self.assertIn(condition_example_json, system)
+        self.assertNotIn("schema_version", condition_example_json)
+        self.assertIn('"additionalProperties":false', system)
         # The example is concrete, uses a registered tool, and validates.
         example = minimal_plan_example(self.tools.list_specs())
         example_json = json.dumps(example, ensure_ascii=False, separators=(",", ":"))

@@ -23,6 +23,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from arise.core.contracts import ConditionOperator, Idempotency, RiskLevel
+from arise.core.models import ConditionModel
 from arise.core.ports import ToolSpec
 
 MAX_DIAGNOSTIC_DETAIL_LENGTH = 400
@@ -30,6 +31,35 @@ _MAX_REPORTED_ERRORS = 8
 _MAX_FIELD_SEGMENT_LENGTH = 32
 
 _JSON_FENCES = ("```json", "```JSON", "```")
+
+
+def _condition_object_schema() -> dict[str, Any]:
+    """Return the live condition schema in the exact form emitted by planners.
+
+    ``schema_version`` is inherited from ``ContractModel`` and optional. It is
+    intentionally omitted from model output so condition objects have the small,
+    stable shape used by the planner contract.
+    """
+
+    schema = ConditionModel.model_json_schema()
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("schema_version", None)
+    required = schema.get("required")
+    if isinstance(required, list):
+        schema["required"] = [field for field in required if field != "schema_version"]
+    return schema
+
+
+def _condition_object_example() -> dict[str, Any]:
+    """Build an explicit condition example from the typed contract itself."""
+
+    return ConditionModel(
+        key="window.focused_element",
+        operator=ConditionOperator.EQUALS,
+        expected="Address bar",
+        description="Address bar has keyboard focus",
+    ).model_dump(mode="json", exclude={"schema_version"})
 
 
 def describe_validation_failure(exc: Exception) -> str:
@@ -114,12 +144,24 @@ def correction_instruction(category: str, detail: str) -> str:
     rejection = f"category={safe_category}"
     if safe_detail:
         rejection += f"; rejected rules={safe_detail}"
+    condition_guidance = ""
+    if any(marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")):
+        condition_example = json.dumps(
+            _condition_object_example(), ensure_ascii=False, separators=(",", ":")
+        )
+        condition_guidance = (
+            " For the rejected condition path, use a direct ConditionModel object with this "
+            f"shape: {condition_example}. Each preconditions/postconditions array item and "
+            "PlanStep.condition value is the object itself; put the fact identifier in "
+            '"key" and never use or wrap it in a '
+            '"condition" field.'
+        )
     return (
         "CORRECTION_REQUIRED: the previous assistant message was rejected by ARISE plan "
         f"validation ({rejection}). Return exactly one JSON object that satisfies the ARISE "
         "TaskPlan schema in the system message. Do not repeat the rejected shape. Use only "
         "registered tools, integer risk values, and the exact enum spellings. No Markdown "
-        "fences, no prose, no extra keys."
+        f"fences, no prose, no extra keys.{condition_guidance}"
     )
 
 
@@ -245,9 +287,24 @@ def _schema_lines() -> tuple[str, ...]:
         "window.focused_element equals that target's observed accessible name; mere element "
         "presence does not verify a click. If the exact accessible name is not grounded, do not "
         "guess it.",
-        "- Condition keys: key (bounded non-empty safe identifier, max 128 characters; letters, "
-        "numbers, dot, underscore, colon, or hyphen), "
-        f"operator ({operator_values}), expected, description.",
+        "- PlanStep.condition and every ActionProposal.preconditions/postconditions item use "
+        "the same ConditionModel. Each array item is the condition object itself, not a wrapper. "
+        "Use the exact planner-output fields key, operator, expected, and description; put the "
+        "fact identifier in key, never in a field named condition, and omit inherited "
+        "schema_version.",
+        "- The ConditionModel JSON Schema below is generated from the live typed contract; "
+        "unknown condition-object keys are rejected: "
+        + json.dumps(_condition_object_schema(), ensure_ascii=False, separators=(",", ":")),
+        "- Valid ActionProposal.postconditions field (put this under action; each array item is "
+        "a direct ConditionModel object): "
+        + json.dumps(
+            {"postconditions": [_condition_object_example()]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+        "- Condition key is a bounded non-empty safe identifier, max 128 characters; letters, "
+        "numbers, dot, underscore, colon, or hyphen. "
+        f"operator must be one of ({operator_values}).",
         "- For an exists condition, omit expected or set it to null; true is not valid. "
         "For boolean facts such as window.open, use equals with expected true instead.",
         "- target keys: platform, application, process_id, window_id, browser_profile, page_id, "
