@@ -18,6 +18,7 @@ from arise.core.contracts import (
     AuthorizationContext,
     Condition,
     ConditionOperator,
+    ContractValidationError,
     Idempotency,
     RiskLevel,
     TargetIdentity,
@@ -204,6 +205,15 @@ class ActionProposal(ContractModel):
     verification_strategy: str = Field(default="observed_postconditions", max_length=128)
 
     def to_domain(self, *, task_id: str, authority: AuthorizationContext) -> ActionContract:
+        conditions: dict[str, tuple[Condition, ...]] = {}
+        for field in ("preconditions", "postconditions"):
+            converted = []
+            for index, item in enumerate(getattr(self, field)):
+                try:
+                    converted.append(item.to_domain())
+                except ContractValidationError as exc:
+                    raise ContractValidationError(f"{field}.{index}: {exc.diagnostic}") from exc
+            conditions[field] = tuple(converted)
         return ActionContract(
             task_id=task_id,
             action_id=self.action_id,
@@ -212,8 +222,8 @@ class ActionProposal(ContractModel):
             risk=self.risk,
             authority=authority,
             parameters=self.parameters,
-            preconditions=tuple(item.to_domain() for item in self.preconditions),
-            postconditions=tuple(item.to_domain() for item in self.postconditions),
+            preconditions=conditions["preconditions"],
+            postconditions=conditions["postconditions"],
             required_resources=self.required_resources,
             idempotency=self.idempotency,
             idempotency_key=self.idempotency_key,
@@ -511,7 +521,7 @@ class PlannerDiagnostic(ContractModel):
     transport_normalization: Literal["none", "code_fence_unwrapped"] = "none"
     provider_id: str = Field(default="", max_length=128)
     model_id: str = Field(default="", max_length=256)
-    contract_version: str = Field(default="planner-contract-3", max_length=64)
+    contract_version: str = Field(default="planner-contract-4", max_length=64)
     context_sources: tuple[str, ...] = Field(default=(), max_length=8)
     occurred_at: datetime = Field(default_factory=_utc_now)
 

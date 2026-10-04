@@ -512,6 +512,7 @@ class PlaywrightBrowserProvider:
         self.allow_stale_regrounding = allow_stale_regrounding
         self.secret_provider = secret_provider
         self._resolver = TargetResolver()
+        self._lifecycle_lock = asyncio.Lock()
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -546,8 +547,11 @@ class PlaywrightBrowserProvider:
         return self._context is not None
 
     async def start(self) -> None:
-        """Explicitly launch Chromium in a new ephemeral context."""
+        """Explicitly launch one isolated context, even for concurrent callers."""
+        async with self._lifecycle_lock:
+            await self._start()
 
+    async def _start(self) -> None:
         if self.started:
             return
         try:
@@ -569,8 +573,11 @@ class PlaywrightBrowserProvider:
             self._context.on("page", self._register_page)
             page = await self._context.new_page()
             self._default_page_id = self._register_page(page)
+        except asyncio.CancelledError:
+            await self._close()
+            raise
         except Exception as exc:
-            await self.close()
+            await self._close()
             raise ComputerAdapterError(
                 ComputerFailureCode.ADAPTER_UNAVAILABLE,
                 f"Isolated Chromium context could not be started ({type(exc).__name__}).",
@@ -579,7 +586,10 @@ class PlaywrightBrowserProvider:
 
     async def close(self) -> None:
         """Close the isolated context and browser; safe to call more than once."""
+        async with self._lifecycle_lock:
+            await self._close()
 
+    async def _close(self) -> None:
         context, browser, playwright = self._context, self._browser, self._playwright
         self._context = self._browser = self._playwright = None
         self._pages.clear()
@@ -968,6 +978,18 @@ class PlaywrightBrowserProvider:
                 evidence=(),
             )
         observation = post_observation or await self.observe(action)
+        if (
+            not action.postconditions
+            or action.target is None
+            or observation.target_fingerprint != action.target.fingerprint
+            or not await self.is_current(observation)
+        ):
+            return VerificationResult(
+                status=VerificationStatus.UNKNOWN,
+                level=0,
+                summary="Browser verification requires fresh target-bound postcondition evidence.",
+                evidence=(),
+            )
         failed = [
             condition.key
             for condition in action.postconditions
@@ -1817,6 +1839,10 @@ class PlaywrightActionTool:
                 )
             parameters = action.parameters
             if self.operation == "navigate":
+                try:
+                    await resources.ensure_valid()
+                except ResourceLeaseLost:
+                    return self._pre_dispatch_failure("RESOURCE_LEASE_LOST", started_at)
                 await self.provider.navigate(
                     target.page_id,
                     str(parameters["url"]),

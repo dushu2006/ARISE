@@ -302,12 +302,24 @@ class OpenAICompatibleProvider:
                         )
                         return
                     chunk_obj = json.loads(data_str)
-                    choices = chunk_obj.get("choices") if isinstance(chunk_obj, Mapping) else None
-                    if not isinstance(choices, list) or not choices:
+                    if not isinstance(chunk_obj, Mapping):
+                        raise ValueError("model stream event must be an object")
+                    choices = chunk_obj.get("choices")
+                    if not isinstance(choices, list):
+                        raise ValueError("model stream choices must be an array")
+                    if not choices:  # optional usage-only event
                         continue
+                    if not isinstance(choices[0], Mapping):
+                        raise ValueError("model stream choice must be an object")
                     delta = choices[0].get("delta", {})
+                    if not isinstance(delta, Mapping):
+                        raise ValueError("model stream delta must be an object")
                     text_delta = delta.get("content") or ""
                     finish_reason = choices[0].get("finish_reason")
+                    if not isinstance(text_delta, str) or (
+                        finish_reason is not None and not isinstance(finish_reason, str)
+                    ):
+                        raise ValueError("model stream text and finish reason must be strings")
                     is_final = finish_reason is not None
                     yield ModelStreamChunk(
                         request_id=request.request_id,
@@ -319,6 +331,11 @@ class OpenAICompatibleProvider:
                         finish_reason=str(finish_reason) if finish_reason is not None else None,
                     )
                     seq += 1
+                    if is_final:
+                        # OpenAI-style servers often send both finish_reason and [DONE].
+                        # A logical stream has one terminal chunk, not two.
+                        return
+                raise ValueError("model stream ended before its terminal marker")
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             raise ProviderUnavailableError(
                 "Model provider stream was unavailable or malformed.",

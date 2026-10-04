@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ntpath
 import os
 import re
 import shutil
@@ -556,6 +557,8 @@ class WindowsAppLaunchBackend(Protocol):
 class Win32AppLaunchBackend:
     """Production backend using direct, safe OS subprocess spawning."""
 
+    requires_visible_window = True
+
     def __init__(self, *, uia_backend: Any | None = None) -> None:
         self._uia_backend = uia_backend
 
@@ -583,6 +586,12 @@ class Win32AppLaunchBackend:
         return await asyncio.to_thread(self._sync_launch_process, executable_path)
 
     def _sync_launch_process(self, executable_path: str) -> int:
+        if sys.platform != "win32":
+            raise ComputerAdapterError(
+                ComputerFailureCode.ADAPTER_UNAVAILABLE,
+                "Native application launch requires a Windows desktop host.",
+                source=PerceptionSource.APPLICATION_API,
+            )
         norm_path = os.path.normpath(executable_path)
         if not os.path.isfile(norm_path):
             raise FileNotFoundError(f"Executable not found: {norm_path}")
@@ -593,6 +602,7 @@ class Win32AppLaunchBackend:
 
         proc = subprocess.Popen(
             [norm_path],
+            shell=False,
             close_fds=True,
             creationflags=creationflags,
             stdin=subprocess.DEVNULL,
@@ -617,11 +627,12 @@ class Win32AppLaunchBackend:
 
     async def list_windows(self) -> Sequence[WindowRecord]:
         if self._uia_backend is not None and hasattr(self._uia_backend, "list_windows"):
-            try:
-                return await self._uia_backend.list_windows()
-            except Exception:
-                return ()
-        return ()
+            return await self._uia_backend.list_windows()
+        raise ComputerAdapterError(
+            ComputerFailureCode.ADAPTER_UNAVAILABLE,
+            "Application window observation backend is unavailable.",
+            source=PerceptionSource.APPLICATION_API,
+        )
 
     async def focus_window(self, window_id: str) -> WindowRecord:
         if self._uia_backend is not None and hasattr(self._uia_backend, "focus_window"):
@@ -645,6 +656,12 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self._backend = backend or Win32AppLaunchBackend()
         self._resolver = resolver or WindowsApplicationResolver()
         self._observations: OrderedDict[str, ObservationLease] = OrderedDict()
+        self._launch_diagnostic: dict[str, Any] = {}
+
+    @property
+    def launch_diagnostic(self) -> dict[str, Any]:
+        """Bounded dispatch metadata, not verification evidence; no paths or UI text."""
+        return dict(self._launch_diagnostic)
 
     @property
     def resolver(self) -> WindowsApplicationResolver:
@@ -653,6 +670,23 @@ class WindowsAppLaunchProvider(ApplicationProvider):
     @property
     def backend(self) -> WindowsAppLaunchBackend:
         return self._backend
+
+    @property
+    def _requires_window(self) -> bool:
+        # Native desktop launches require visible evidence. Alternate application
+        # backends may intentionally implement process-only applications.
+        return bool(getattr(self._backend, "requires_visible_window", False))
+
+    def _matches(self, proc: Mapping[str, Any], resolved: ResolvedApplication) -> bool:
+        if self._requires_window:
+            return ntpath.normcase(str(proc.get("exe") or "")) == ntpath.normcase(
+                resolved.executable_path
+            )
+        names = {_safe_basename(p).casefold() for p in resolved.process_names}
+        return (
+            _safe_basename(str(proc.get("name", ""))).casefold() in names
+            or _safe_basename(str(proc.get("exe", ""))).casefold() in names
+        )
 
     async def running_applications(self) -> Sequence[RunningApplication]:
         processes = await self._backend.list_running_processes()
@@ -703,50 +737,48 @@ class WindowsAppLaunchProvider(ApplicationProvider):
     async def launch_application(
         self, application_id: str, *, timeout_seconds: float = 10.0
     ) -> RunningApplication:
+        self._launch_diagnostic = {"stage": "resolution", "mode": "not_dispatched"}
         resolved = self._resolver.resolve(application_id)
+        self._launch_diagnostic.update(
+            stage="existing_window_observation",
+            executable_identity=hashlib.sha256(
+                ntpath.normcase(resolved.executable_path).encode("utf-8")
+            ).hexdigest(),
+        )
 
-        # 1. Idempotency check: see if application is already running
+        # A background process is not an open application. Reuse only an observed
+        # window belonging to the resolved executable, and do not swallow focus errors.
         running = await self._backend.list_running_processes()
-        matched_pid: int | None = None
-        target_process_names = {_safe_basename(p).casefold() for p in resolved.process_names}
-
-        for proc in running:
-            name = _safe_basename(str(proc.get("name", ""))).casefold()
-            exe = _safe_basename(str(proc.get("exe", ""))).casefold()
-            if name in target_process_names or exe in target_process_names:
-                matched_pid = int(proc.get("pid", 0))
-                break
-
-        if matched_pid and matched_pid > 0 and resolved.allow_reuse:
-            window_ids: list[str] = []
-            try:
-                windows = await self._backend.list_windows()
-                for win in windows:
-                    if (
-                        win.process_id == matched_pid
-                        or (
-                            win.application
-                            and win.application.casefold() == resolved.name.casefold()
+        matching_pids = {
+            int(proc.get("pid", 0)) for proc in running if self._matches(proc, resolved)
+        }
+        if resolved.allow_reuse:
+            windows = await self._backend.list_windows()
+            for win in windows:
+                if win.process_id in matching_pids and win.visible:
+                    self._launch_diagnostic.update(
+                        stage="focus_existing_window", mode="reuse", process_id=win.process_id
+                    )
+                    focused = await self._backend.focus_window(win.window_id)
+                    if self._requires_window and (not focused.foreground or focused.minimized):
+                        raise ComputerAdapterError(
+                            ComputerFailureCode.ACTION_UNKNOWN_OUTCOME,
+                            "Existing application window could not be made visible and foreground.",
+                            source=PerceptionSource.APPLICATION_API,
                         )
-                    ):
-                        window_ids.append(win.window_id)
-                if window_ids:
-                    try:
-                        await self._backend.focus_window(window_ids[0])
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            return RunningApplication(
-                process_id=matched_pid,
-                name=resolved.name,
-                executable_path=resolved.executable_path,
-                window_ids=tuple(window_ids),
-            )
+                    return RunningApplication(
+                        process_id=win.process_id,
+                        name=resolved.name,
+                        executable_path=resolved.executable_path,
+                        window_ids=(win.window_id,),
+                    )
 
         # 2. Launch process safely
+        self._launch_diagnostic.update(stage="process_dispatch", mode="spawn_attempt")
         try:
             pid = await self._backend.launch_process(resolved.executable_path)
+        except ComputerAdapterError:
+            raise
         except Exception as exc:
             raise ComputerAdapterError(
                 ComputerFailureCode.INTERNAL_ADAPTER_ERROR,
@@ -761,6 +793,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 source=PerceptionSource.APPLICATION_API,
             )
 
+        self._launch_diagnostic.update(stage="window_poll", mode="spawn", dispatched_process_id=pid)
         # 3. Bounded polling verification
         poll_deadline = time.monotonic() + min(max(timeout_seconds, 2.0), 15.0)
         poll_interval = 0.15
@@ -773,12 +806,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             if not alive:
                 running_now = await self._backend.list_running_processes()
                 child_matched = next(
-                    (
-                        int(p.get("pid", 0))
-                        for p in running_now
-                        if _safe_basename(str(p.get("name", ""))).casefold() in target_process_names
-                        or _safe_basename(str(p.get("exe", ""))).casefold() in target_process_names
-                    ),
+                    (int(p.get("pid", 0)) for p in running_now if self._matches(p, resolved)),
                     None,
                 )
                 if child_matched:
@@ -791,23 +819,22 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                         source=PerceptionSource.APPLICATION_API,
                     )
 
-            try:
-                windows = await self._backend.list_windows()
-                for win in windows:
-                    if (
-                        win.process_id == pid
-                        or (
-                            win.application
-                            and win.application.casefold() == resolved.name.casefold()
-                        )
-                    ):
-                        if win.window_id not in window_ids:
-                            window_ids.append(win.window_id)
-            except Exception:
-                pass
-
-            stable_checks += 1
+            running_now = await self._backend.list_running_processes()
+            matching_pids = {
+                int(p.get("pid", 0)) for p in running_now if self._matches(p, resolved)
+            }
+            windows = await self._backend.list_windows()
+            window_ids = [
+                win.window_id
+                for win in windows
+                if win.process_id in matching_pids and win.visible and not win.minimized
+            ]
+            stable_checks = (
+                stable_checks + 1 if alive and (window_ids or not self._requires_window) else 0
+            )
             if stable_checks >= required_stable_checks:
+                if window_ids:
+                    await self._backend.focus_window(window_ids[0])
                 break
 
             await asyncio.sleep(poll_interval)
@@ -838,33 +865,30 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         is_running = False
         pid: int | None = None
         window_ids: list[str] = []
+        observation_error: str | None = None
 
         if app_name:
             try:
                 resolved = self._resolver.resolve(str(app_name))
                 resolved_name = resolved.name
-                target_names = {_safe_basename(p).casefold() for p in resolved.process_names}
                 running = await self._backend.list_running_processes()
-                for proc in running:
-                    name = _safe_basename(str(proc.get("name", ""))).casefold()
-                    exe = _safe_basename(str(proc.get("exe", ""))).casefold()
-                    if name in target_names or exe in target_names:
-                        is_running = True
-                        pid = int(proc.get("pid", 0))
-                        break
-                if pid:
-                    windows = await self._backend.list_windows()
-                    for win in windows:
-                        if (
-                            win.process_id == pid
-                            or (
-                                win.application
-                                and win.application.casefold() == resolved.name.casefold()
-                            )
-                        ):
-                            window_ids.append(win.window_id)
-            except Exception:
-                pass
+                matching_pids = {
+                    int(p.get("pid", 0))
+                    for p in running
+                    if self._matches(p, resolved) and int(p.get("pid", 0)) > 0
+                }
+                is_running = bool(matching_pids)
+                pid = min(matching_pids) if matching_pids else None
+                windows = await self._backend.list_windows()
+                window_ids = [
+                    win.window_id
+                    for win in windows
+                    if win.process_id in matching_pids and win.visible and not win.minimized
+                ]
+            except Exception as exc:
+                observation_error = (
+                    exc.code.value if isinstance(exc, ComputerAdapterError) else type(exc).__name__
+                )
 
         facts: dict[str, Any] = {
             "application": str(app_name),
@@ -875,6 +899,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             "window.open": len(window_ids) > 0,
             "window_ids": list(window_ids),
             "domain": "system.application",
+            "observation.error": observation_error,
         }
         serialized = canonical_json(facts)
         state_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -925,17 +950,21 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         )
         pid = observation.facts.get("process_id")
 
-        if not is_running or not pid:
+        if (
+            not is_running
+            or not pid
+            or (self._requires_window and not observation.facts.get("window.open"))
+        ):
             return VerificationResult(
                 status=VerificationStatus.FAILED,
                 level=1,
-                summary=f"Application '{app_name}' is not running.",
+                summary="Resolved process and required visible window were not observed.",
                 evidence=(
                     EvidenceRecord(
                         source="observed",
                         observation_id=observation.lease_id,
                         state_hash=observation.state_hash,
-                        statement=f"Application '{app_name}' process was not observed running.",
+                        statement="Required process/window evidence was not observed.",
                     ),
                 ),
             )
@@ -960,18 +989,21 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 ),
             )
 
+        observed_summary = (
+            f"Resolved application process (PID {pid}) and visible window were observed."
+            if self._requires_window
+            else f"Application '{app_name}' verified running (PID {pid})."
+        )
         return VerificationResult(
             status=VerificationStatus.PASSED,
             level=2,
-            summary=f"Application '{app_name}' verified running (PID {pid}).",
+            summary=observed_summary,
             evidence=(
                 EvidenceRecord(
                     source="observed",
                     observation_id=observation.lease_id,
                     state_hash=observation.state_hash,
-                    statement=(
-                        f"Application '{app_name}' (PID {pid}) verified running."
-                    ),
+                    statement=observed_summary,
                 ),
             ),
         )

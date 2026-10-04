@@ -261,20 +261,38 @@ class BackendSupervisor:
             )
             proc = _AsyncioSupervisedProcess(raw_proc)
 
-        ready = await proc.wait_ready(self.config.startup_timeout_seconds)
-        if not ready:
+        try:
+            # The lifespan readiness signal can precede the HTTP socket accepting
+            # requests. Bound the entire handshake, but tolerate that short gap.
+            async with asyncio.timeout(self.config.startup_timeout_seconds):
+                ready = await proc.wait_ready(self.config.startup_timeout_seconds)
+                if not ready:
+                    raise RuntimeError(
+                        "The local backend did not report ARISE_BACKEND_READY in time."
+                    )
+                if self._health_probe is not None:
+                    while True:
+                        probe_res = self._health_probe()
+                        healthy = (
+                            await probe_res if asyncio.iscoroutine(probe_res) else bool(probe_res)
+                        )
+                        if healthy:
+                            break
+                        if proc.returncode is not None:
+                            raise RuntimeError("The local backend exited during its handshake.")
+                        await asyncio.sleep(
+                            max(0.01, min(self.config.health_check_interval_seconds, 0.1))
+                        )
+        except BaseException as exc:
+            # The process is not yet published in self._process; stop() cannot
+            # find it when startup or a restart is cancelled mid-handshake.
             proc.terminate_forcefully()
             await proc.wait_exit(1.0)
-            raise RuntimeError("The local backend did not report ARISE_BACKEND_READY in time.")
-        if self._health_probe is not None:
-            probe_res = self._health_probe()
-            healthy = await probe_res if asyncio.iscoroutine(probe_res) else bool(probe_res)
-            if not healthy:
-                proc.terminate_forcefully()
-                await proc.wait_exit(1.0)
+            if isinstance(exc, TimeoutError):
                 raise RuntimeError(
-                    "The local backend failed its post-startup health-check handshake."
-                )
+                    "The local backend did not become ready and healthy in time."
+                ) from None
+            raise
         self._process = proc
 
     async def _watchdog_loop(self) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -21,7 +22,7 @@ from arise.core.models import (
     ModelStreamChunk,
     ProviderStatus,
 )
-from arise.core.retry import CircuitBreaker, CircuitOpenError
+from arise.core.retry import CircuitBreaker, CircuitOpenError, CircuitState
 
 
 class ModelProvider(Protocol):
@@ -191,7 +192,10 @@ class ModelRouter:
                     },
                 )
                 continue
+            half_open_probe = runtime.breaker.state is CircuitState.HALF_OPEN
             if request.model_id is not None and request.model_id not in provider.model_ids:
+                if half_open_probe:
+                    runtime.breaker.record_cancelled()
                 last_error = CapabilityUnavailableError(
                     "Requested model ID is not exposed by the selected provider.",
                     component="model-router",
@@ -242,6 +246,8 @@ class ModelRouter:
             )
             started = time.perf_counter()
             if self._queued_requests >= self.max_queued_requests:
+                if half_open_probe:
+                    runtime.breaker.record_cancelled()
                 self._record_model_event(
                     "MODEL_QUEUE_BACKPRESSURE",
                     request,
@@ -262,7 +268,7 @@ class ModelRouter:
             self._queued_requests += 1
             dequeued = False
             try:
-                async with runtime.semaphore:
+                async with asyncio.timeout(request.timeout_seconds), runtime.semaphore:
                     self._queued_requests = max(0, self._queued_requests - 1)
                     dequeued = True
                     response = await asyncio.wait_for(
@@ -271,6 +277,8 @@ class ModelRouter:
                 if (
                     not isinstance(response, ModelResponse)
                     or response.request_id != request.request_id
+                    or response.provider_id != provider.provider_id
+                    or response.model_id != model_id
                 ):
                     raise ProviderUnavailableError(
                         "Model provider returned a malformed or mismatched response.",
@@ -278,6 +286,8 @@ class ModelRouter:
                         operation="complete",
                     )
             except asyncio.CancelledError:
+                if half_open_probe:
+                    runtime.breaker.record_cancelled()
                 if not dequeued:
                     self._queued_requests = max(0, self._queued_requests - 1)
                 self._record_model_event(
@@ -296,11 +306,18 @@ class ModelRouter:
             except Exception as exc:
                 if not dequeued:
                     self._queued_requests = max(0, self._queued_requests - 1)
-                runtime.breaker.record_failure()
-                runtime.failures += 1
+                    if half_open_probe:
+                        runtime.breaker.record_cancelled()
+                else:
+                    runtime.breaker.record_failure()
+                    runtime.failures += 1
                 last_error = exc
                 last_failed_provider = provider.provider_id
-                fallback_reason = self._failure_code(exc)
+                fallback_reason = (
+                    "MODEL_QUEUE_TIMEOUT"
+                    if not dequeued and isinstance(exc, TimeoutError)
+                    else self._failure_code(exc)
+                )
                 self._record_model_event(
                     "MODEL_REQUEST_FAILED",
                     request,
@@ -404,25 +421,64 @@ class ModelRouter:
             provider = runtime.provider
             if not getattr(provider, "supports_streaming", False):
                 continue
+            if (
+                stream_request.model_id is not None
+                and stream_request.model_id not in provider.model_ids
+            ):
+                continue
+            if self._queued_requests >= self.max_queued_requests:
+                raise ProviderUnavailableError(
+                    "Model router queue backpressure limit reached.",
+                    component="model-router",
+                    operation="stream",
+                    retryable=True,
+                )
             if not runtime.breaker.allow_request():
                 continue
+            half_open_probe = runtime.breaker.state is CircuitState.HALF_OPEN
             model_id = stream_request.model_id or self._select_model(provider, selector)
             routed = stream_request.model_copy(update={"model_id": model_id})
             stream_fn = getattr(provider, "stream", None)
             started = time.perf_counter()
+            emitted = False
+            self._queued_requests += 1
+            dequeued = False
             try:
-                async with runtime.semaphore:
+                # The streaming deadline includes admission wait, not just network I/O.
+                async with asyncio.timeout(routed.timeout_seconds), runtime.semaphore:
+                    self._queued_requests -= 1
+                    dequeued = True
                     if callable(stream_fn):
                         seq = 0
-                        async with asyncio.timeout(routed.timeout_seconds):
-                            async for chunk in stream_fn(routed):
+                        final = False
+                        async with aclosing(stream_fn(routed)) as chunks:
+                            async for chunk in chunks:
+                                if (
+                                    not isinstance(chunk, ModelStreamChunk)
+                                    or chunk.request_id != routed.request_id
+                                    or chunk.provider_id != provider.provider_id
+                                    or chunk.model_id != model_id
+                                    or chunk.sequence != seq
+                                ):
+                                    raise ValueError("malformed model stream identity or sequence")
+                                emitted = True
+                                final = chunk.is_final
                                 yield chunk
                                 seq += 1
+                                if final:
+                                    break
+                        if not final:
+                            raise ValueError("model stream ended without a final chunk")
                     else:
-                        non_stream = routed.model_copy(update={"stream": False})
-                        resp = await asyncio.wait_for(
-                            provider.complete(non_stream), timeout=routed.timeout_seconds
-                        )
+                        resp = await provider.complete(routed.model_copy(update={"stream": False}))
+                        if (
+                            not isinstance(resp, ModelResponse)
+                            or resp.request_id != routed.request_id
+                            or resp.provider_id != provider.provider_id
+                            or resp.model_id != model_id
+                        ):
+                            raise ValueError("malformed model response identity")
+                        emitted = True
                         yield ModelStreamChunk(
                             request_id=routed.request_id,
                             provider_id=provider.provider_id,
@@ -437,13 +493,28 @@ class ModelRouter:
                 runtime.last_success_at = datetime.now(UTC)
                 runtime.last_latency_ms = (time.perf_counter() - started) * 1000
                 return
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit):
+                if half_open_probe:
+                    runtime.breaker.record_cancelled()
                 raise
             except Exception as exc:
-                runtime.breaker.record_failure()
-                runtime.failures += 1
+                if dequeued:
+                    runtime.breaker.record_failure()
+                    runtime.failures += 1
+                elif half_open_probe:
+                    runtime.breaker.record_cancelled()
                 last_error = exc
-                continue
+                if emitted:
+                    # Never concatenate a replacement answer onto already-delivered output.
+                    raise ProviderUnavailableError(
+                        "Model stream interrupted after output; no fallback was attempted.",
+                        component="model-router",
+                        operation="stream",
+                        retryable=False,
+                    ) from None
+            finally:
+                if not dequeued:
+                    self._queued_requests = max(0, self._queued_requests - 1)
         raise ProviderUnavailableError(
             "No streaming model provider succeeded.",
             component="model-router",

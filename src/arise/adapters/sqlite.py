@@ -451,6 +451,12 @@ class SQLiteTaskRepository(TaskRepository):
 
     def __init__(self, database: SQLiteDatabase) -> None:
         self.database = database
+        with database.transaction() as connection:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS tasks_owned_children ON tasks ("
+                "json_extract(payload_json, '$.authorization.principal_id'), "
+                "json_extract(payload_json, '$.parent_task_id'), task_id)"
+            )
 
     @staticmethod
     def _request_key(task: TaskRecord) -> tuple[str, str, str] | None:
@@ -688,6 +694,26 @@ class SQLiteTaskRepository(TaskRepository):
             if record.authorization is not None
             and record.authorization.principal_id == principal_id
         ]
+
+    def list_children(
+        self,
+        *,
+        principal_id: str,
+        parent_task_id: str,
+        after_task_id: str = "",
+        limit: int = 100,
+    ) -> list[TaskRecord]:
+        if not principal_id or limit < 1:
+            raise ValueError("principal and positive limit required")
+        with self.database.locked() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM tasks WHERE task_id > ? "
+                "AND json_extract(payload_json, '$.parent_task_id') = ? "
+                "AND json_extract(payload_json, '$.authorization.principal_id') = ? "
+                "ORDER BY task_id LIMIT ?",
+                (after_task_id, parent_task_id, principal_id, limit),
+            ).fetchall()
+        return [self._decode_task(row["payload_json"]) for row in rows]
 
     def prune_terminal_history(self, *, before: datetime) -> dict[str, int]:
         """Apply configured retention to settled tasks older than an aware UTC cutoff."""
@@ -957,9 +983,10 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
     """Explicit-consent, principal-scoped local memory with lexical retrieval.
 
     Consent references are stored only as SHA-256 digests and are scoped to a fingerprint of
-    the exact text, category, source task, and retention expiry. A grant is consumed immediately
-    before the record insert; if persistence then fails, the grant remains consumed and clients
-    must obtain new consent rather than retrying an unknown write.
+    the exact text, category, source task, and retention expiry. A grant is consumed before
+    optional embedding and persistence; if persistence fails, clients must obtain new consent
+    rather than retrying an unknown write. A durable per-principal deletion epoch prevents
+    previously admitted writes from restoring records after delete_all().
     """
 
     _TOKEN_PATTERN = re.compile(r"[\w'-]{2,}", re.UNICODE)
@@ -1006,6 +1033,24 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
                 "enabled INTEGER NOT NULL DEFAULT 1, "
                 "updated_at TEXT NOT NULL)"
             )
+
+            settings_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(memory_principal_settings)")
+            }
+            if "deletion_epoch" not in settings_columns:
+                connection.execute(
+                    "ALTER TABLE memory_principal_settings "
+                    "ADD COLUMN deletion_epoch INTEGER NOT NULL DEFAULT 0"
+                )
+
+    def _deletion_epoch(self, principal_id: str) -> int:
+        with self.database.locked() as connection:
+            row = connection.execute(
+                "SELECT deletion_epoch FROM memory_principal_settings WHERE principal_id = ?",
+                (principal_id,),
+            ).fetchone()
+        return int(row["deletion_epoch"]) if row is not None else 0
 
     def is_enabled(self, *, principal_id: str) -> bool:
         with self.database.locked() as connection:
@@ -1093,6 +1138,7 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
             return cursor.rowcount == 1
 
     async def store(self, entry: MemoryEntry) -> str:
+        deletion_epoch = self._deletion_epoch(entry.principal_id)
         if not self.is_enabled(principal_id=entry.principal_id):
             raise MemoryDisabledError("memory storage is disabled for this principal")
         safe_text = self.redactor.redact(entry.text).strip()
@@ -1117,6 +1163,12 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
         )
         embedding_model_id = embedding.model_id if embedding is not None else None
         with self.database.transaction() as connection:
+            # Check inside the same write transaction as INSERT: delete_all cannot
+            # commit between this check and persistence, including on other connections.
+            if self._deletion_epoch(entry.principal_id) != deletion_epoch:
+                raise MemoryConsentError("memory write invalidated by deletion")
+            if not self.is_enabled(principal_id=entry.principal_id):
+                raise MemoryDisabledError("memory storage is disabled for this principal")
             connection.execute(
                 "DELETE FROM memory_records WHERE principal_id = ? AND expires_at <= ?",
                 (entry.principal_id, created_at.isoformat()),
@@ -1234,14 +1286,32 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
         *,
         principal_id: str,
         record_id: str,
+        consent_reference: str | None = None,
         text: str | None = None,
         confidence: float | None = None,
         sensitivity: str | None = None,
         expires_at: datetime | None = None,
     ) -> MemoryRecord:
+        deletion_epoch = self._deletion_epoch(principal_id)
+        if not self.is_enabled(principal_id=principal_id):
+            raise MemoryDisabledError("memory storage is disabled for this principal")
         existing = self.get_record(principal_id=principal_id, record_id=record_id)
         if existing is None:
             raise LookupError("memory record does not exist")
+        if not consent_reference:
+            raise MemoryConsentError("valid, unexpired, unused memory-write consent is required")
+        proposal = MemoryEntry(
+            principal_id=principal_id,
+            text=existing.text if text is None else text,
+            consent_reference=consent_reference,
+            expires_at=existing.expires_at if expires_at is None else expires_at,
+            source_task_id=existing.source_task_id,
+            kind=existing.kind,
+            confidence=existing.confidence if confidence is None else confidence,
+            sensitivity=existing.sensitivity if sensitivity is None else sensitivity,
+            expiration_policy=existing.expiration_policy,
+        )
+        await require_memory_write_consent(proposal, self)
         new_text = existing.text
         embedding_json = (
             json.dumps(existing.embedding, separators=(",", ":"))
@@ -1280,7 +1350,11 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
             expiration_policy=existing.expiration_policy,
         )
         with self.database.transaction() as connection:
-            connection.execute(
+            if self._deletion_epoch(principal_id) != deletion_epoch:
+                raise MemoryConsentError("memory write invalidated by deletion")
+            if not self.is_enabled(principal_id=principal_id):
+                raise MemoryDisabledError("memory storage is disabled for this principal")
+            cursor = connection.execute(
                 "UPDATE memory_records SET text = ?, confidence = ?, sensitivity = ?, "
                 "expires_at = ?, embedding_json = ?, embedding_model_id = ? "
                 "WHERE record_id = ? AND principal_id = ?",
@@ -1295,29 +1369,41 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
                     principal_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                raise LookupError("memory record does not exist")
         return updated
 
-    async def record_episodic_task_summary(
+    def propose_episodic_task_summary(
         self,
         task: TaskRecord,
         *,
         retention_days: int = 30,
         now: datetime | None = None,
-    ) -> str:
-        """Summarize and store a settled task outcome as an episodic memory entry."""
-
+    ) -> MemoryEntry:
+        """Prepare content for explicit consent; never persist or request embeddings."""
         if task.authorization is None or not task.authorization.principal_id:
             raise ValueError("task must have an authenticated principal")
         principal_id = task.authorization.principal_id
         if not self.is_enabled(principal_id=principal_id):
             raise MemoryDisabledError("memory storage is disabled for this principal")
-        issued_at = now or utc_now()
+        if task.status not in {
+            TaskStatus.COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+            TaskStatus.INTERRUPTED,
+            TaskStatus.BLOCKED,
+        }:
+            raise ValueError("episodic summaries require an unambiguously settled task")
+        if not 1 <= retention_days <= 3650:
+            raise ValueError("episodic retention must be bounded")
+        issued_at = now or task.updated_at
         step_tools = ", ".join(step.tool_name for step in task.steps[:8]) or "no steps"
         summary = (
             f"Task '{self.redactor.redact(task.goal)[:300]}' finished with status "
             f"'{task.status.value}' ({len(task.steps)} steps: {step_tools})."
         )
-        proposal = MemoryEntry(
+        return MemoryEntry(
             principal_id=principal_id,
             text=summary,
             consent_reference="pending-episodic-consent",
@@ -1328,10 +1414,22 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
             sensitivity="internal",
             expiration_policy="ttl",
         )
-        ref, _ = await self.issue_write_consent(proposal, now=issued_at)
+
+    async def record_episodic_task_summary(
+        self,
+        task: TaskRecord,
+        *,
+        consent_reference: str | None = None,
+        retention_days: int = 30,
+        now: datetime | None = None,
+    ) -> str:
+        """Persist only under an externally issued, exact one-time consent grant."""
         from dataclasses import replace
 
-        return await self.store(replace(proposal, consent_reference=ref))
+        if not consent_reference:
+            raise MemoryConsentError("episodic persistence requires explicit memory-write consent")
+        proposal = self.propose_episodic_task_summary(task, retention_days=retention_days, now=now)
+        return await self.store(replace(proposal, consent_reference=consent_reference))
 
     def delete(self, *, principal_id: str, record_id: str) -> bool:
         with self.database.transaction() as connection:
@@ -1343,6 +1441,16 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
 
     def delete_all(self, *, principal_id: str) -> int:
         with self.database.transaction() as connection:
+            # Retain the epoch even when there are no records/settings yet. Already
+            # consented writes may still be awaiting optional embedding generation.
+            connection.execute(
+                "INSERT INTO memory_principal_settings "
+                "(principal_id, enabled, updated_at, deletion_epoch) VALUES (?, 1, ?, 1) "
+                "ON CONFLICT(principal_id) DO UPDATE SET "
+                "deletion_epoch = memory_principal_settings.deletion_epoch + 1, "
+                "updated_at = excluded.updated_at",
+                (principal_id, utc_now().isoformat()),
+            )
             cursor = connection.execute(
                 "DELETE FROM memory_records WHERE principal_id = ?", (principal_id,)
             )

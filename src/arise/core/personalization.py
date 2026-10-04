@@ -96,6 +96,8 @@ class WorkingMemoryStore:
         if existing is not None and existing.is_expired(now):
             self._entries.pop(task_id, None)
             existing = None
+        if existing is not None and existing.principal_id != principal_id:
+            raise PermissionError("working memory belongs to another principal")
         obs = dict(existing.observations) if existing is not None else {}
         if observations:
             obs.update(self.redactor.redact_object(dict(observations)))

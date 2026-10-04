@@ -254,7 +254,7 @@ class MemoryEntry:
 
 
 def memory_entry_fingerprint(entry: MemoryEntry) -> str:
-    """Stable consent scope for exact principal, text, kind, source, and retention."""
+    """Stable consent scope for exact principal, content, governance metadata, and retention."""
 
     material = json.dumps(
         {
@@ -262,6 +262,9 @@ def memory_entry_fingerprint(entry: MemoryEntry) -> str:
             "text": entry.text,
             "kind": entry.kind.value,
             "source_task_id": entry.source_task_id,
+            "confidence": float(entry.confidence),
+            "sensitivity": entry.sensitivity,
+            "expiration_policy": entry.expiration_policy,
             "expires_at": entry.expires_at.isoformat(),
         },
         ensure_ascii=False,

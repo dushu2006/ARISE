@@ -12,8 +12,10 @@ import re
 import time
 import unicodedata
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol
 
@@ -69,7 +71,6 @@ _TERMINAL_VOICE_TASK_STATES = frozenset(
         "blocked",
         "cancelled",
         "unknown",
-        "partially_completed",
         "interrupted",
     }
 )
@@ -294,8 +295,11 @@ class LiveToolCall:
     call_id: str
     name: str
     arguments: Mapping[str, FrozenJSON]
+    utterance_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.utterance_id is not None:
+            validate_safe_token(self.utterance_id, "voice utterance_id")
         if not self.call_id.strip() or len(self.call_id) > 128:
             raise ValueError("live tool call id must be non-empty and bounded")
         if not _TOOL_NAME.fullmatch(self.name):
@@ -321,8 +325,13 @@ class LiveEvent:
     retryable: bool = False
     error_code: str | None = None
     generation_id: int | None = None
+    # Transcription accompanying provider audio is not a separate local TTS request.
+    is_audio_transcript: bool = False
+    utterance_id: str | None = None
 
     def __post_init__(self) -> None:
+        if self.utterance_id is not None:
+            validate_safe_token(self.utterance_id, "voice utterance_id")
         if self.generation_id is not None and (
             type(self.generation_id) is not int or self.generation_id < 0
         ):
@@ -486,6 +495,7 @@ class VoiceEvent:
     task_id: str | None = None
     error_code: str | None = None
     timestamp_monotonic_ns: int = field(default_factory=time.monotonic_ns)
+    utterance_id: str | None = None
 
 
 class VoiceEventSink(Protocol):
@@ -697,7 +707,19 @@ class AudioHub:
         self._task_submission_used = False
         self._allowed_spoken_texts: set[str] = set()
         self._task_monitor_tasks: dict[str, asyncio.Task[None]] = {}
-        self._pending_runtime_update: tuple[str, dict[str, Any]] | None = None
+        self._pending_runtime_updates: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._utterance_lock = asyncio.Lock()
+        self._live_utterance_id: str | None = None
+        self._retired_live_session: LiveConversationSession | None = None
+        self._runtime_reply_identity: str | None = None
+        self._runtime_reply_task_id: str | None = None
+        self._settled_utterances: OrderedDict[str, None] = OrderedDict()
+        self._output_text_seen: set[str] = set()
+        self._output_audio_sequence = -1
+        self._utterance_context: ContextVar[str | None] = ContextVar(
+            "voice_utterance", default=None
+        )
+        self._task_update_signatures: OrderedDict[str, tuple[int | None, str, bool]] = OrderedDict()
 
     @property
     def state(self) -> VoiceState:
@@ -1032,7 +1054,7 @@ class AudioHub:
             self._task_submission_used = False
             if self._closed:
                 await self._cancel_task_monitors()
-                self._pending_runtime_update = None
+                self._pending_runtime_updates.clear()
             return
         self._set_state(VoiceState.DEACTIVATING)
         await self._stop_local_asr()
@@ -1060,6 +1082,7 @@ class AudioHub:
             except Exception:
                 self._last_error_code = "VOICE_SESSION_CLOSE_FAILED"
         self._session_id = None
+        self._live_utterance_id = None
         self._interrupt_started_at_ns = None
         self._provider_status = (
             VoiceProviderStatus.DISCONNECTED
@@ -1102,7 +1125,7 @@ class AudioHub:
             self._closed = True
             await self._stop_unlocked()
             await self._cancel_task_monitors()
-            self._pending_runtime_update = None
+            self._pending_runtime_updates.clear()
             if self.microphone is not None:
                 try:
                     await self.microphone.close()
@@ -1235,7 +1258,7 @@ class AudioHub:
             elif (
                 intent is not None and intent.may_require_runtime_task and intent.confidence >= 0.75
             ):
-                acknowledgement = "ARISE accepted the task and is working on it."
+                acknowledgement = "ARISE heard your action request; admission is not yet confirmed."
             else:
                 acknowledgement = "ARISE heard your request."
         normalized = _normalize_spoken_text(acknowledgement)
@@ -1286,7 +1309,7 @@ class AudioHub:
             async for chunk in self.speech_synthesizer.synthesize(
                 cleaned,
                 locale=self.config.locale,
-                correlation_id=self._session_id or "local-tts",
+                correlation_id=self._utterance_context.get() or self._session_id or "local-tts",
             ):
                 if (
                     self._closed
@@ -1330,6 +1353,25 @@ class AudioHub:
         user_text: str,
         *,
         speak_response: bool = True,
+        utterance_id: str | None = None,
+    ) -> dict[str, Any]:
+        identity = utterance_id or str(uuid.uuid4())
+        validate_safe_token(identity, "voice utterance_id")
+        async with self._utterance_lock:
+            token = self._utterance_context.set(identity)
+            try:
+                return await self._process_spoken_utterance(
+                    user_text, speak_response=speak_response, utterance_id=identity
+                )
+            finally:
+                self._utterance_context.reset(token)
+
+    async def _process_spoken_utterance(
+        self,
+        user_text: str,
+        *,
+        speak_response: bool = True,
+        utterance_id: str,
     ) -> dict[str, Any]:
         """Process a transcribed spoken utterance through VoiceConversationBridge and TTS."""
 
@@ -1348,11 +1390,12 @@ class AudioHub:
                 principal_id=self.principal_id,
                 session_id=self._session_id,
                 locale=self.config.locale,
+                utterance_id=utterance_id,
             )
             response = dict(raw_result)
         else:
             call = LiveToolCall(
-                call_id=str(uuid.uuid4()),
+                call_id=utterance_id,
                 name="execute_task",
                 arguments={"text": user_text},
             )
@@ -1364,6 +1407,9 @@ class AudioHub:
                 user_text=user_text,
             )
             response = dict(raw_result)
+        response["utterance_id"] = utterance_id
+        if response.get("replayed"):
+            return response
         for key in ("acknowledgement", "summary", "question", "spoken_response"):
             spoken = response.get(key)
             if isinstance(spoken, str) and spoken.strip():
@@ -1547,6 +1593,31 @@ class AudioHub:
                 return
             current = replacement
 
+    def _invalidate_connection_turn(self) -> None:
+        """Retire connection-owned speech/authority, not admitted tasks or queued updates.
+
+        A replacement provider session creates fresh turn IDs even when it resumes
+        the conversation. It must not inherit an unfinished turn or authorize a tool
+        using the previous connection's input. Keep old IDs as stale-output tombstones.
+        """
+        if self._live_utterance_id is not None:
+            self._settled_utterances[self._live_utterance_id] = None
+        while len(self._settled_utterances) > 256:
+            self._settled_utterances.popitem(last=False)
+        self._live_utterance_id = None
+        self._turn_in_flight = False
+        self._turn_started_at = 0.0
+        self._first_response_recorded = self._first_audio_recorded = False
+        self._interrupt_started_at_ns = None
+        self._last_user_transcript = self._provider_user_transcript = None
+        self._local_final_transcript = None
+        self._task_submission_used = False
+        self._runtime_reply_identity = self._runtime_reply_task_id = None
+        self._allowed_spoken_texts.clear()
+        self._output_text_seen.clear()
+        self._output_audio_sequence = -1
+        self._tts_generation_id += 1
+
     async def _reconnect(
         self,
         old_session: LiveConversationSession,
@@ -1556,6 +1627,12 @@ class AudioHub:
         if self.provider is None:
             return None
         started = time.perf_counter()
+        async with self._session_lock:
+            if self._closed or self._session is not old_session:
+                return None
+            self._session = None
+            self._retired_live_session = old_session
+            self._invalidate_connection_turn()
         self._provider_status = VoiceProviderStatus.RECONNECTING
         self._set_state(VoiceState.DISCONNECTED)
         if self.playback is not None:
@@ -1563,9 +1640,6 @@ class AudioHub:
                 await self.playback.stop()
             except Exception:
                 pass
-        async with self._session_lock:
-            if self._session is old_session:
-                self._session = None
         try:
             await old_session.close()
         except Exception:
@@ -1592,7 +1666,17 @@ class AudioHub:
                 )
             else:
                 async with self._session_lock:
-                    self._session = replacement
+                    abandoned = (
+                        self._closed
+                        or self._session_id != config.session_id
+                        or self._session is not None
+                        or self._retired_live_session is not old_session
+                    )
+                    if not abandoned:
+                        self._session = replacement
+                if abandoned:
+                    await replacement.close()
+                    return None
                 self._minimum_output_generation = None
                 self._suppress_provider_output = False
                 self._provider_status = VoiceProviderStatus.CONNECTED
@@ -1613,6 +1697,58 @@ class AudioHub:
         return None
 
     async def _handle_live_event(self, session: LiveConversationSession, event: LiveEvent) -> None:
+        if session is self._retired_live_session or (
+            self._session is not None and self._session is not session
+        ):
+            return
+        identity = event.utterance_id
+        if identity is not None:
+            if identity in self._settled_utterances:
+                return
+            if identity != self._live_utterance_id:
+                if self._live_utterance_id is not None and (
+                    self._live_utterance_id not in self._settled_utterances
+                    and event.type is not LiveEventType.INPUT_TRANSCRIPT
+                ):
+                    return  # late output or tool call cannot borrow a newer input's authority
+                if self._live_utterance_id is not None:
+                    self._settled_utterances[self._live_utterance_id] = None
+                self._live_utterance_id = identity
+                self._provider_user_transcript = None
+                self._last_user_transcript = None
+                self._task_submission_used = False
+                self._output_text_seen.clear()
+                self._output_audio_sequence = -1
+            if event.type is LiveEventType.OUTPUT_AUDIO and event.audio is not None:
+                if event.audio.sequence <= self._output_audio_sequence:
+                    return
+                self._output_audio_sequence = event.audio.sequence
+            if event.type is LiveEventType.OUTPUT_TRANSCRIPT and event.is_final and event.text:
+                if event.text in self._output_text_seen:
+                    return
+                if len(self._output_text_seen) >= 128:
+                    self._emit(VoiceEventKind.ERROR, error_code="VOICE_TRANSCRIPT_LIMIT")
+                    return
+                self._output_text_seen.add(event.text)
+            if event.tool_call is not None:
+                event = replace(event, tool_call=replace(event.tool_call, utterance_id=identity))
+        reply_identity = self._runtime_reply_identity
+        if event.type is LiveEventType.INPUT_TRANSCRIPT:
+            self._runtime_reply_identity = self._runtime_reply_task_id = None
+            reply_identity = None
+        if event.type is LiveEventType.TURN_COMPLETE:
+            self._runtime_reply_identity = self._runtime_reply_task_id = None
+        token = self._utterance_context.set(reply_identity or identity)
+        try:
+            await self._apply_live_event(session, event)
+        finally:
+            if identity is not None and event.type is LiveEventType.TURN_COMPLETE:
+                self._settled_utterances[identity] = None
+            while len(self._settled_utterances) > 256:
+                self._settled_utterances.popitem(last=False)
+            self._utterance_context.reset(token)
+
+    async def _apply_live_event(self, session: LiveConversationSession, event: LiveEvent) -> None:
         if event.type in {LiveEventType.OUTPUT_TRANSCRIPT, LiveEventType.OUTPUT_AUDIO}:
             generation = event.generation_id
             if self._suppress_provider_output or (
@@ -1621,6 +1757,10 @@ class AudioHub:
             ):
                 self._emit(VoiceEventKind.OUTPUT_GATED)
                 return
+            # Resumed output starts a turn without new input, even if a resumption
+            # metadata event already introduced its identity. Gated generations above
+            # must not resurrect a cancelled/interrupted turn.
+            self._turn_in_flight = True
         if event.type is LiveEventType.INPUT_TRANSCRIPT:
             if not event.is_final:
                 return
@@ -1659,6 +1799,7 @@ class AudioHub:
                 self._first_response_recorded = True
             if (
                 event.is_final
+                and not event.is_audio_transcript
                 and event.text
                 and self.speech_synthesizer is not None
                 and not self._first_audio_recorded
@@ -1713,8 +1854,11 @@ class AudioHub:
                     self._guard_reset_after_turn = False
                     self._allowed_spoken_texts.clear()
                 self._set_state(VoiceState.LISTENING)
-            pending = self._pending_runtime_update
-            self._pending_runtime_update = None
+            pending = (
+                self._pending_runtime_updates.popitem(last=False)
+                if self._pending_runtime_updates
+                else None
+            )
             self._last_user_transcript = None
             self._provider_user_transcript = None
             self._local_final_transcript = None
@@ -1876,20 +2020,26 @@ class AudioHub:
                     continue
                 self._task_claim_guard = True
                 self._guard_reset_after_turn = True
-                self._record_task_state(task_id, state)
+                if not self._record_task_state(
+                    task_id,
+                    state,
+                    settled=update.get("settled") is True,
+                    version=update.get("version", -1),
+                ):
+                    continue
                 normalized_summary = _normalize_spoken_text(summary)
                 if normalized_summary:
                     self._allowed_spoken_texts.add(normalized_summary)
                 self._emit(VoiceEventKind.TASK_STATUS, task_id=task_id)
                 session = self._session
                 if session is None:
-                    self._pending_runtime_update = (task_id, update)
+                    self._queue_runtime_update(task_id, update)
                     continue
                 if self._turn_in_flight or self._state not in {
                     VoiceState.LISTENING,
                     VoiceState.EXECUTING,
                 }:
-                    self._pending_runtime_update = (task_id, update)
+                    self._queue_runtime_update(task_id, update)
                     continue
                 await self._send_runtime_update(session, task_id, update)
         except asyncio.CancelledError:
@@ -1902,6 +2052,19 @@ class AudioHub:
                 self._task_monitor_tasks.pop(task_id, None)
 
     async def _send_runtime_update(
+        self,
+        session: LiveConversationSession,
+        task_id: str,
+        update: Mapping[str, Any],
+    ) -> None:
+        identity = update.get("utterance_id")
+        token = self._utterance_context.set(identity if isinstance(identity, str) else None)
+        try:
+            await self._apply_runtime_update(session, task_id, update)
+        finally:
+            self._utterance_context.reset(token)
+
+    async def _apply_runtime_update(
         self,
         session: LiveConversationSession,
         task_id: str,
@@ -1927,6 +2090,9 @@ class AudioHub:
         self._allowed_spoken_texts.add(normalized_summary)
         self._task_claim_guard = True
         self._guard_reset_after_turn = True
+        identity = update.get("utterance_id")
+        self._runtime_reply_identity = identity if isinstance(identity, str) else None
+        self._runtime_reply_task_id = task_id
         self._turn_in_flight = True
         self._turn_started_at = time.perf_counter()
         self._first_response_recorded = False
@@ -1936,7 +2102,8 @@ class AudioHub:
         self._last_activity = time.monotonic()
         message = (
             "ARISE_RUNTIME_UPDATE: "
-            f"task_id={task_id}; state={state}; verified={str(verified).lower()}. "
+            f"task_id={task_id}; utterance_id={update.get('utterance_id', 'unknown')}; "
+            f"state={state}; verified={str(verified).lower()}. "
             "Relay this authoritative summary without embellishment: "
             f"{summary.strip()}"
         )
@@ -2017,14 +2184,47 @@ class AudioHub:
         normalized = _normalize_spoken_text(text)
         return bool(normalized) and normalized in self._allowed_spoken_texts
 
-    def _record_task_state(self, task_id: str, state: str) -> None:
-        if state not in _VOICE_TASK_STATES:
+    @property
+    def _pending_runtime_update(self) -> tuple[str, dict[str, Any]] | None:
+        return next(iter(self._pending_runtime_updates.items()), None)
+
+    def _queue_runtime_update(self, task_id: str, update: dict[str, Any]) -> None:
+        if (
+            task_id not in self._pending_runtime_updates
+            and len(self._pending_runtime_updates) >= 128
+        ):
+            self._emit(VoiceEventKind.ERROR, task_id=task_id, error_code="VOICE_UPDATE_QUEUE_FULL")
             return
-        if state in _TERMINAL_VOICE_TASK_STATES:
+        self._pending_runtime_updates[task_id] = update
+
+    def _record_task_state(
+        self,
+        task_id: str,
+        state: str,
+        *,
+        settled: bool = False,
+        version: int | None = None,
+    ) -> bool:
+        if state not in _VOICE_TASK_STATES:
+            return False
+        settled = settled or state in _TERMINAL_VOICE_TASK_STATES
+        previous = self._task_update_signatures.get(task_id)
+        signature = (version, state, settled)
+        if previous is not None:
+            if previous[2] or previous == signature:
+                return False
+            if version is not None and previous[0] is not None and version < previous[0]:
+                return False
+        self._task_update_signatures[task_id] = signature
+        self._task_update_signatures.move_to_end(task_id)
+        while len(self._task_update_signatures) > 256:
+            self._task_update_signatures.popitem(last=False)
+        if settled:
             self._task_states.pop(task_id, None)
         else:
             self._task_states[task_id] = state
         self._active_task_id = next(reversed(self._task_states), None)
+        return True
 
     def _set_state(self, state: VoiceState) -> None:
         if self._state is state:
@@ -2048,8 +2248,11 @@ class AudioHub:
                 kind=kind,
                 state=self._state,
                 session_id=self._session_id,
-                task_id=task_id if task_id is not None else self._active_task_id,
+                task_id=task_id
+                if task_id is not None
+                else (self._runtime_reply_task_id or self._active_task_id),
                 error_code=error_code,
+                utterance_id=self._utterance_context.get(),
             )
         )
 

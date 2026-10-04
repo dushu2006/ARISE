@@ -614,6 +614,15 @@ class TaskRepository(Protocol):
         self, *, limit: int = 100, after_task_id: str | None = None
     ) -> list[TaskRecord]: ...
 
+    def list_children(
+        self,
+        *,
+        principal_id: str,
+        parent_task_id: str,
+        after_task_id: str = "",
+        limit: int = 100,
+    ) -> list[TaskRecord]: ...
+
     def list_recent(self, *, limit: int = 100) -> list[TaskRecord]: ...
 
     def list_for_principal(self, *, principal_id: str, limit: int = 5000) -> list[TaskRecord]: ...
@@ -764,3 +773,24 @@ class InMemoryTaskRepository:
             ]
         tasks.sort(key=lambda task: task.updated_at, reverse=True)
         return tasks[:limit]
+
+    def list_children(
+        self,
+        *,
+        principal_id: str,
+        parent_task_id: str,
+        after_task_id: str = "",
+        limit: int = 100,
+    ) -> list[TaskRecord]:
+        if not principal_id or limit < 1:
+            raise ValueError("principal and positive limit required")
+        with self._lock:
+            rows = [
+                TaskRecord.from_dict(value)
+                for key, value in self._tasks.items()
+                if key > after_task_id
+                and value.get("parent_task_id") == parent_task_id
+                and value.get("authorization") is not None
+                and value["authorization"].get("principal_id") == principal_id
+            ]
+        return sorted(rows, key=lambda row: row.task_id)[:limit]

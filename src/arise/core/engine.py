@@ -138,6 +138,8 @@ class TaskEngine:
         self._confirmation_requests: dict[str, ConfirmationRequest] = {}
         self._principal_confirmations: dict[tuple[str, str], str] = {}
         self._closed = False
+        self._cancellation_lock = asyncio.Lock()
+        self._cancelling_tasks: set[str] = set()
 
     @property
     def queued_count(self) -> int:
@@ -233,16 +235,8 @@ class TaskEngine:
                 raise PermissionError("parent task does not belong to the authenticated principal")
             if parent.session_id != chosen_session:
                 raise ValueError("child task must remain in the parent conversation session")
-            if parent.status in {
-                TaskStatus.COMPLETED,
-                TaskStatus.CANCELLED,
-                TaskStatus.FAILED,
-                TaskStatus.UNKNOWN,
-                TaskStatus.INTERRUPTED,
-                TaskStatus.BLOCKED,
-                TaskStatus.PARTIALLY_COMPLETED,
-            }:
-                raise ValueError("a terminal parent task cannot accept new child tasks")
+            if parent_task_id in self._cancelling_tasks or self.is_settled(parent_task_id):
+                raise ValueError("a settled or cancelling parent cannot accept child tasks")
         if self._queue.full():
             raise TaskQueueFull("the task queue is full; retry after current work completes")
         authority = AuthorizationContext(
@@ -335,6 +329,26 @@ class TaskEngine:
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         return self.tasks.get(task_id)
+
+    def is_active(self, task_id: str) -> bool:
+        """Whether an in-process plan worker is still running, including between steps."""
+        processor = self._active.get(task_id)
+        return processor is not None and not processor.done()
+
+    def is_settled(self, task_id: str) -> bool:
+        task = self.tasks.get(task_id)
+        if task is None:
+            return False
+        if task.status is TaskStatus.PARTIALLY_COMPLETED:
+            return not self.is_active(task_id)
+        return task.status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+            TaskStatus.INTERRUPTED,
+            TaskStatus.BLOCKED,
+        }
 
     def can_accept_input(self, task_id: str) -> bool:
         task = self.tasks.get(task_id)
@@ -491,44 +505,69 @@ class TaskEngine:
             )
 
     async def cancel(self, task_id: str, *, principal_id: str) -> TaskRecord:
-        task = self.tasks.get(task_id)
-        if task is None:
-            raise TaskNotFoundError(task_id)
-        owner = task.authorization.principal_id if task.authorization is not None else None
-        if owner and owner != principal_id:
-            raise PermissionError("task does not belong to the authenticated principal")
-        terminal_states = {
-            TaskStatus.COMPLETED,
-            TaskStatus.CANCELLED,
-            TaskStatus.FAILED,
-            TaskStatus.UNKNOWN,
-            TaskStatus.INTERRUPTED,
-            TaskStatus.BLOCKED,
-            TaskStatus.PARTIALLY_COMPLETED,
-        }
-        for child in self.tasks.list_for_principal(principal_id=principal_id, limit=5000):
-            if child.parent_task_id == task_id and child.status not in terminal_states:
-                await self.cancel(child.task_id, principal_id=principal_id)
-        active = self._active.get(task_id)
-        if active is not None:
-            active.cancel()
-            await asyncio.gather(active, return_exceptions=True)
-        latest = self.tasks.get(task_id)
-        if latest is None:
-            raise TaskNotFoundError(task_id)
-        if latest.status not in {
-            TaskStatus.CANCELLED,
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.UNKNOWN,
-        }:
-            latest.transition_to(
-                TaskStatus.CANCELLED, reason="Cancelled by the authenticated user."
-            )
-            latest = self.tasks.save(latest)
-            self._emit("TASK_CANCELLED", latest, {"by_user": True})
-        self._drop_confirmations(task_id)
-        return latest
+        # Serialize overlapping cancellation requests. Discover/mark the complete owned
+        # tree before awaiting workers, so they cannot admit new descendants mid-cancel.
+        async with self._cancellation_lock:
+            root = self.tasks.get(task_id)
+            if root is None:
+                raise TaskNotFoundError(task_id)
+            owner = root.authorization.principal_id if root.authorization else None
+            if owner != principal_id:
+                raise PermissionError("task does not belong to the authenticated principal")
+            pending = [root]
+            owned: dict[str, TaskRecord] = {}
+            while pending:
+                task = pending.pop()
+                if task.task_id in owned:
+                    continue
+                owned[task.task_id] = task
+                cursor = ""
+                while True:
+                    children = self.tasks.list_children(
+                        principal_id=principal_id,
+                        parent_task_id=task.task_id,
+                        after_task_id=cursor,
+                        limit=100,
+                    )
+                    if not children:
+                        break
+                    pending.extend(
+                        child for child in children if child.session_id == root.session_id
+                    )
+                    cursor = children[-1].task_id
+            self._cancelling_tasks.update(owned)
+            try:
+                active = []
+                running_ids: set[str] = set()
+                for child_id in owned:
+                    worker = self._active.get(child_id)
+                    if worker is not None and not worker.done():
+                        running_ids.add(child_id)
+                        worker.cancel()
+                        active.append(worker)
+                try:
+                    if active:
+                        await asyncio.gather(*active, return_exceptions=True)
+                finally:
+                    for child_id in owned:
+                        latest = self.tasks.get(child_id)
+                        if latest is None:
+                            continue
+                        # Preserve settled partial/unknown/completed outcomes. Cancelling
+                        # an in-flight partial worker may already have persisted UNKNOWN.
+                        was_active = child_id in running_ids
+                        if not self.is_settled(child_id) or (
+                            was_active and latest.status is TaskStatus.PARTIALLY_COMPLETED
+                        ):
+                            latest.transition_to(
+                                TaskStatus.CANCELLED, reason="Cancelled by the authenticated user."
+                            )
+                            latest = self.tasks.save(latest)
+                            self._emit("TASK_CANCELLED", latest, {"by_user": True})
+                        self._drop_confirmations(child_id)
+                return self.tasks.get(task_id) or root
+            finally:
+                self._cancelling_tasks.difference_update(owned)
 
     async def _worker(self, index: int) -> None:
         del index
@@ -539,7 +578,11 @@ class TaskEngine:
                     return
                 task_id = item.task_id if isinstance(item, _ApprovalContinuation) else item[0]
                 task = self.tasks.get(task_id)
-                if task is None or task.status in {TaskStatus.CANCELLED, TaskStatus.COMPLETED}:
+                if (
+                    task_id in self._cancelling_tasks
+                    or task is None
+                    or task.status in {TaskStatus.CANCELLED, TaskStatus.COMPLETED}
+                ):
                     continue
                 if isinstance(item, _ApprovalContinuation):
                     processor = asyncio.create_task(
@@ -1204,6 +1247,16 @@ class TaskEngine:
         task = self.tasks.get(task_id)
         if task is None or task.authorization is None or task.authorization.principal_id is None:
             return
+        if result.bound_action is not None:
+            action = result.bound_action
+            self._actions[(task_id, action.action_id)] = action
+            plan_info = self._plans.get(task_id)
+            if plan_info is not None:
+                ordered = plan_info[1]
+                for index, (step, previous) in enumerate(ordered):
+                    if previous.action_id == action.action_id:
+                        ordered[index] = (step, action)
+                        break
         action_id = action.action_id
         deadline = self._deadlines.pop(task_id, None)
         if deadline is not None:
@@ -1298,7 +1351,7 @@ class TaskEngine:
 
         category = getattr(exc, "category", None)
         category_value = category.value if isinstance(category, PlanFailureCategory) else None
-        detail = getattr(exc, "detail", "")
+        detail = getattr(exc, "detail", getattr(exc, "diagnostic", ""))
         attempts = getattr(exc, "attempts", None)
         code = f"{type(exc).__name__}:{category_value}" if category_value else type(exc).__name__
         self._fail_before_dispatch(

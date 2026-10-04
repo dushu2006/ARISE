@@ -216,7 +216,10 @@ def _schema_lines() -> tuple[str, ...]:
         "timeout_seconds (number, greater than 0 and at most 3600), rollback_strategy, "
         "verification_strategy (string). Omit optional keys you do not need, except where a "
         "policy rule below requires them.",
-        "- plan.action_id is optional: leave it out so the runtime assigns it.",
+        "- action.action_id is optional: omit it so the runtime assigns it. If supplied, it and "
+        "every required_resources entry must match ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$. "
+        "Prefer omitting required_resources: registered tools derive required locks.",
+        "- idempotency_key must not be blank when supplied.",
         f"- risk must be an integer: {risk_values} (0 observation, 1 harmless local action, "
         "2 reversible change, 3 external side effect, 4 destructive or privileged). "
         "Never write words such as 'low' or 'high'.",
@@ -245,6 +248,8 @@ def _schema_lines() -> tuple[str, ...]:
         "- Condition keys: key (bounded non-empty safe identifier, max 128 characters; letters, "
         "numbers, dot, underscore, colon, or hyphen), "
         f"operator ({operator_values}), expected, description.",
+        "- For an exists condition, omit expected or set it to null; true is not valid. "
+        "For boolean facts such as window.open, use equals with expected true instead.",
         "- target keys: platform, application, process_id, window_id, browser_profile, page_id, "
         "semantic_name, stable_id, display_id, confidence. For UIA tools platform is "
         '"windows"; for browser tools platform is "browser".',
