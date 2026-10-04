@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+from arise.adapters.openai_compatible import OpenAICompatibleProvider
 from arise.adapters.process_lock import DatabaseInstanceLock, InstanceLockError
 from arise.adapters.secrets import SecretUnavailable
 from arise.config.settings import (
@@ -681,6 +682,48 @@ class ServerTests(unittest.TestCase):
             prune.assert_called_once()
             cutoff = prune.call_args.kwargs["before"]
             self.assertIsNotNone(cutoff.tzinfo)
+
+    def test_nvidia_provider_composition_disables_nemotron_thinking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = AppSettings(
+                data_dir=root,
+                database=DatabaseSettings(path=root / "nvidia-model.sqlite3"),
+                model=ModelSettings(
+                    provider_id="nvidia",
+                    base_url="https://integrate.api.nvidia.com/v1",
+                    model_id="nvidia/nemotron-test",
+                    provider_options={
+                        "chat_template_kwargs": {"thinking_budget": 128},
+                        "top_k": 16,
+                    },
+                    allow_cloud=True,
+                ),
+                security=SecuritySettings(
+                    environment="test",
+                    require_api_auth=True,
+                    allow_cloud_models=True,
+                ),
+            )
+            services = _build_services(settings)
+            try:
+                provider = services.router._providers["nvidia"].provider
+                self.assertIsInstance(provider, OpenAICompatibleProvider)
+                self.assertTrue(provider.is_cloud)
+                self.assertTrue(services.router.allow_cloud)
+                self.assertEqual(
+                    provider.provider_options,
+                    {
+                        "chat_template_kwargs": {
+                            "thinking_budget": 128,
+                            "enable_thinking": False,
+                        },
+                        "top_k": 16,
+                    },
+                )
+            finally:
+                asyncio.run(services.router.close())
+                services.database.close()
 
     def test_shutdown_failure_still_closes_model_provider_and_database(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
