@@ -109,6 +109,7 @@ class SetFactTool:
             required_resources=("simulator-state",),
             declared_side_effects=("mutates in-memory simulator state",),
             idempotency=Idempotency.IDEMPOTENT,
+            parameter_names=("key", "value"),
         )
 
     @property

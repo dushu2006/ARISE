@@ -1795,6 +1795,15 @@ class WindowsUiaActionTool:
         "focus": (RiskLevel.R1, Idempotency.IDEMPOTENT, "focuses a grounded Windows UIA control"),
         "press": (RiskLevel.R3, Idempotency.UNKNOWN, "sends a bounded key chord to a UIA control"),
     }
+    # Trusted parameter keys per operation, mirrored from validate_parameters.
+    _PARAMETERS = {
+        "invoke": (),
+        "click": (),
+        "fill": ("text",),
+        "fill_secret": ("text",),
+        "focus": (),
+        "press": ("key",),
+    }
 
     def __init__(self, provider: WindowsUiaProvider, operation: str) -> None:
         if operation not in self._POLICY:
@@ -1812,6 +1821,8 @@ class WindowsUiaActionTool:
             declared_side_effects=(effect,),
             idempotency=idempotency,
             max_result_bytes=4096,
+            parameter_names=self._PARAMETERS[operation],
+            target_scope="windows.window_id",
         )
 
     @property
