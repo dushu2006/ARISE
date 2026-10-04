@@ -732,13 +732,13 @@
   - Evidence: Re-read README.md, docs/security.md, docs/architecture.md, docs/roadmap.md, phase1-audit historical banner, final-runtime audit, and current source/config; contradictory unregistered-adapter claims corrected.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M13. Master checklist counts are internally consistent.
-  - Evidence: Recount of docs/master-completion-checklist.md -> 468 rows: 454 [x], 9 [!], 5 [?], 0 [-], 0 [ ]. Seven rows added by this gate (redaction, browser-discovery gate, two workflow-adapt rows, two conversation-memory rows); no row removed or merged.
+  - Evidence: Recount of docs/master-completion-checklist.md -> 469 rows: 455 [x], 9 [!], 5 [?], 0 [-], 0 [ ]. Eight rows added by this gate (redaction, browser-discovery gate, two workflow-adapt rows, two conversation-memory rows); no row removed or merged.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M14. No validation result is incorrectly labelled REAL.
   - Evidence: Manual audit of every evidence label in this file: no FAKE/REPLAY/SIMULATION fixture is labelled live provider/device/browser/Windows execution; category counts below are per checklist row and may overlap.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M15. No environment-blocked test is falsely labelled COMPLETE.
-  - Evidence: Manual cross-check of every [!] and [?] item against the Windows/platform and missing-config inventory below; all 238 rows have an evidence record and none remains [ ].
+  - Evidence: Manual cross-check of every [!] and [?] item against the Windows/platform and missing-config inventory below; all 239 rows have an evidence record and none remains [ ].
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 
 ## N — RELEASE-GATE DEFECT REGRESSION (added by this validation cycle)
@@ -761,6 +761,10 @@
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed on this host; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim); External config: N/A for the exact criterion; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — N6. Memory expiry and bound claims are backed by enforcement.
   - Evidence: Two master-checklist claims were false before this cycle and are now implemented: `WorkingMemorySnapshot` had no `expires_at` and `WorkingMemoryStore` had no TTL logic, and `ShortTermConversationMemory` had no `max_chars_per_turn`. `src/arise/core/personalization.py` now carries a validated timezone-aware `expires_at` plus `is_expired()`, a `default_ttl_seconds=1800.0` honoured on `upsert`/`get` with `purge_expired()`, and a 4000-character per-turn bound applied after redaction. `ConversationMemoryWiringTests::test_working_memory_expiry_and_short_term_bounds_are_enforced` exercises expiry on read, expired-entry isolation from a later `upsert`, purge counting, naive-timezone rejection, and both the turn-count and character bounds.
+  - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed on this host; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim); External config: N/A for the exact criterion; Final status: COMPLETE for this exact criterion and scope.
+
+- [!] ENVIRONMENT BLOCKED — N7. The discovery fix from this gate was itself wrong and only hosted CI caught it.
+  - Evidence: Commit `bc437f8` failed all four backend CI jobs (`ubuntu-latest` and `windows-latest`, Python 3.11 and 3.12) at the `Run backend tests` step with `tests/test_browser_playwright.py::PlaywrightBrowserTests::test_browser_discovery_reports_a_missing_chromium_binary_truthfully -> AssertionError: False is not true`, while the local venv passed. Cause: the fix conflated the wheel with the binary (`chromium_installed = playwright_installed and _playwright_chromium_installed()`), so a registry containing a browser but no wheel reported no browser; CI installs only `-e ".[dev]"`, where `playwright` is absent. This is recorded as a [!] item rather than [FAIL] because the shipped defect was caught and corrected before release validation, and because the corrected result cannot be marked REAL VALIDATED until the rerun of hosted CI passes on the follow-up commit. Fixed by reporting the two conditions independently and only requiring both for adapter availability; verified locally in a clean `-e ".[dev]"` venv and in the full venv across all four wheel/binary combinations (330 passed / 88 subtests each). Remaining: confirm the green rerun on hosted Windows runners; failure detail is reconstructed from the GitHub Actions job metadata (`gh api .../jobs` -> failed step "Run backend tests"), because `gh run view --log-failed` and the job-log endpoint both returned EOF from this sandbox, so the raw runner log text was not read directly here.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed on this host; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim); External config: N/A for the exact criterion; Final status: COMPLETE for this exact criterion and scope.
 
 ## Execution ledger (exact commands and outcomes)
@@ -790,6 +794,7 @@
 - Live redactor comparison on this host (pre-fix `git show HEAD:src/arise/core/redaction.py` vs fixed): `Charge card 4111 1111 1111 1111 today` -> OLD unchanged / NEW `Charge card [REDACTED] today`; `secret=4111 1111 1111 1111` -> OLD `secret=[REDACTED] 1111 1111 1111` / NEW `secret=[REDACTED]`; `order 1324 1567 8910 1234 shipped` -> unchanged in both (no over-redaction). **REAL host execution.**
 - Canary secret scan against the production app (`create_app` + `TestClient`, real `arise.sqlite3`): `POST /api/v1/tasks` -> **202**, snapshot goal `open notepad then card [REDACTED] and password: [REDACTED]`; byte scan of `arise.sqlite3` and `arise.sqlite3.instance.lock`: 0 plaintext canaries, 4 `[REDACTED]` markers. An earlier draft of this probe sent a wrong body, got **422**, and would have been a false-clean result; that run is **not** evidence. **REAL host execution.**
 - Store-contract inspection: `detect_stale_workflow_steps(workflow, observed_facts)` and `adapt_workflow_to_task_plan(workflow, *, task_id, goal, target_overrides=None, parameter_overrides=None)` on `ProceduralMemoryStore` (`src/arise/core/personalization.py`) — the pre-fix route arguments matched neither signature, which is the `TypeError`/HTTP 500 defect recorded at J17/N3.
+- CI reproduction of the N7 failure: `python3 -m venv /tmp/ci_venv && /tmp/ci_venv/bin/pip install -e ".[dev]"` -> `playwright/vosk/keyring/sounddevice` all absent -> `/tmp/ci_venv/bin/python -m pytest -q` -> **1 failed, 329 passed** (the exact CI failure). After the fix the same clean venv gives **330 passed, 88 subtests**.
 - Browser discovery on this host: `.venv/bin/python` calling `discover_available_browsers()` -> `playwright_installed=true`, `chromium_installed=false`, `browsers=[]`, `isolated_adapter=null`, `isolated_adapter_reason="Playwright is installed but no Chromium browser binary was found; run \`python -m playwright install chromium\`."`
 - Direct real launch attempt on this host: `async_playwright(); p.chromium.launch()` -> `BrowserType.launch: Executable doesn't exist at ~/.cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell`. This confirms the pre-fix report (`browsers=('Chromium (Playwright)',)`, `isolated_adapter="PlaywrightBrowserProvider"`) was a false availability claim, now corrected.
 - `~/.cache/ms-playwright` on this host: directory absent (no browser binaries downloaded).
@@ -970,7 +975,7 @@ Each figure below counts checklist rows whose `Test evidence` field contains tha
 
 | Evidence class | Checklist rows carrying this class |
 |---|---:|
-| REAL | 146 |
+| REAL | 147 |
 | FAKE | 151 |
 | REPLAY | 29 |
 | SIMULATION | 77 |
@@ -979,9 +984,9 @@ Each figure below counts checklist rows whose `Test evidence` field contains tha
 
 | Status | Count |
 |---|---:|
-| TOTAL | 238 |
+| TOTAL | 239 |
 | REAL VALIDATED | 135 |
-| ENVIRONMENT BLOCKED | 45 |
+| ENVIRONMENT BLOCKED | 46 |
 | EXTERNAL CONFIGURATION REQUIRED | 58 |
 | FAILED | 0 |
 | NOT VALIDATED | 0 |

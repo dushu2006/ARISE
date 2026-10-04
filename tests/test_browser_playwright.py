@@ -392,18 +392,14 @@ class PlaywrightBrowserTests(unittest.IsolatedAsyncioTestCase):
         discovery = guarded_provider.discover_browsers()
         self.assertIn("playwright_installed", discovery)
         self.assertIn("browsers", discovery)
-        # A browser is only reported when a launchable binary exists; an installed wheel
-        # without downloaded browsers must never look like an available browser.
+        # A browser is only reported available when both the optional wheel and a launchable
+        # binary exist; an installed wheel without downloaded browsers (or the reverse) must
+        # never look like an available browser. These invariants hold on any dependency set.
+        launchable = discovery["playwright_installed"] and discovery["chromium_installed"]
         self.assertIsInstance(discovery["chromium_installed"], bool)
-        self.assertEqual(
-            "Chromium (Playwright)" in discovery["browsers"],
-            discovery["chromium_installed"],
-        )
-        self.assertEqual(
-            discovery["isolated_adapter"] == "PlaywrightBrowserProvider",
-            discovery["chromium_installed"],
-        )
-        if not discovery["chromium_installed"]:
+        self.assertEqual("Chromium (Playwright)" in discovery["browsers"], launchable)
+        self.assertEqual(discovery["isolated_adapter"] == "PlaywrightBrowserProvider", launchable)
+        if not launchable:
             self.assertTrue(discovery["isolated_adapter_reason"])
 
     def test_browser_discovery_reports_a_missing_chromium_binary_truthfully(self) -> None:
@@ -423,15 +419,31 @@ class PlaywrightBrowserTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("Chromium (Playwright)", empty["browsers"])
                 self.assertIsNone(empty["isolated_adapter"])
                 self.assertTrue(empty["isolated_adapter_reason"])
+                # A present binary in an unrelated directory must not satisfy the gate either.
+                stray = root / "firefox-1243" / "firefox-1243"
+                stray.mkdir(parents=True)
+                (stray / "chrome").write_bytes(b"#!/bin/sh\n")
+                self.assertFalse(
+                    discover_available_browsers(collector=object())["chromium_installed"]
+                )
 
                 browser = root / "chromium-1243" / "chrome-linux64"
                 browser.mkdir(parents=True)
                 (browser / "chrome").write_bytes(b"#!/bin/sh\n")
                 filled = discover_available_browsers(collector=object())
+                # The binary gate is independent of the optional wheel: a downloaded browser is
+                # always reported as installed, and only the combined state may not be.
                 self.assertTrue(filled["chromium_installed"])
-                self.assertIn("Chromium (Playwright)", filled["browsers"])
-                self.assertEqual(filled["isolated_adapter"], "PlaywrightBrowserProvider")
-                self.assertIsNone(filled["isolated_adapter_reason"])
+                if filled["playwright_installed"]:
+                    self.assertIn("Chromium (Playwright)", filled["browsers"])
+                    self.assertEqual(filled["isolated_adapter"], "PlaywrightBrowserProvider")
+                    self.assertIsNone(filled["isolated_adapter_reason"])
+                else:
+                    self.assertNotIn("Chromium (Playwright)", filled["browsers"])
+                    self.assertIsNone(filled["isolated_adapter"])
+                    self.assertIn(
+                        "Playwright package is not installed", filled["isolated_adapter_reason"]
+                    )
             finally:
                 if previous is None:
                     os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)

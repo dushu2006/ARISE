@@ -399,13 +399,25 @@ def discover_available_browsers(*, collector: Any | None = None) -> dict[str, An
             discovered_names = list(snapshot.browsers)
         except Exception:
             discovered_names = []
-    chromium_installed = playwright_installed and _playwright_chromium_installed()
-    if chromium_installed and "Chromium (Playwright)" not in discovered_names:
+    # The two halves are reported separately on purpose: a downloaded browser binary says
+    # nothing about whether the optional wheel exists, and an installed wheel says nothing
+    # about whether a browser can actually be launched. Availability requires both.
+    chromium_installed = _playwright_chromium_installed()
+    launchable = playwright_installed and chromium_installed
+    if launchable and "Chromium (Playwright)" not in discovered_names:
         discovered_names.append("Chromium (Playwright)")
-    if chromium_installed:
+    if launchable:
         reason = None
+    elif chromium_installed and not playwright_installed:
+        reason = (
+            "A Chromium browser binary is present but the optional Playwright package is not "
+            "installed; install the browser extra."
+        )
     elif not playwright_installed:
-        reason = "The optional Playwright package is not installed; install the browser extra."
+        reason = (
+            "The optional Playwright package is not installed; install the browser extra and run "
+            "`python -m playwright install chromium`."
+        )
     else:
         reason = (
             "Playwright is installed but no Chromium browser binary was found; "
@@ -415,7 +427,7 @@ def discover_available_browsers(*, collector: Any | None = None) -> dict[str, An
         "playwright_installed": playwright_installed,
         "chromium_installed": chromium_installed,
         "browsers": tuple(discovered_names),
-        "isolated_adapter": "PlaywrightBrowserProvider" if chromium_installed else None,
+        "isolated_adapter": "PlaywrightBrowserProvider" if launchable else None,
         "isolated_adapter_reason": reason,
     }
 
