@@ -9,7 +9,7 @@
 ## Phase 1 — Core runtime
 
 - [x] COMPLETE — Core runtime starts correctly (verified by `test_server.py`, `test_runtime.py`, and `arise demo`).
-- [x] COMPLETE — Task lifecycle implemented (explicit states, transitions, and optimistic versioning verified in `test_task_engine.py` and `test_sqlite.py`).
+- [x] COMPLETE — Task lifecycle implemented (explicit states, transitions, and optimistic versioning verified in `test_engine.py` and `test_sqlite.py`).
 - [x] COMPLETE — Task IDs/request IDs stable (UUIDv4 identifiers persisted across SQLite and API responses).
 - [x] COMPLETE — Idempotency implemented (principal/session-scoped request fingerprints and deletion tombstones verified).
 - [x] COMPLETE — Concurrent task handling implemented (bounded worker pool, queue backpressure, and optimistic concurrency verified).
@@ -51,7 +51,7 @@
 - [x] COMPLETE — Timeout limits implemented (per-action, per-task, and per-provider timeouts enforced).
 - [x] COMPLETE — Provider configuration implemented (explicit local/cloud opt-in and keyring secret reference validation).
 - [x] COMPLETE — Capability health is truthful (`CapabilityService` reports `available`, `degraded`, `unavailable`, `disabled`, `requires_configuration` truthfully).
-- [x] COMPLETE — Security boundary tests pass (`test_security_and_contracts.py`, `test_server.py`, and Scenario 7 prompt-injection tests pass).
+- [x] COMPLETE — Security boundary tests pass (`test_runtime.py`, `test_contracts.py`, `test_server.py`, and Scenario 7 prompt-injection tests pass).
 - [x] COMPLETE — Frontend/backend contract tests pass, including replay recovery and the typed text-interaction endpoint/response; backend integration suite and frontend production build pass.
 - [!] BLOCKED — ENVIRONMENT — Validate Tauri child-process/token/data-directory behavior and Windows ACL/lock behavior on supported Windows/WebView2.
 
@@ -93,6 +93,7 @@
 ### Browser automation and network boundaries
 - [x] COMPLETE — Playwright/CDP integration implemented (`PlaywrightBrowserProvider`, `PlaywrightActionTool`, `register_playwright_tools`, and `VerifierPort.verify` implemented and FAKE-tested; real Chromium execution remains tracked under environment blockers).
 - [x] COMPLETE — Browser discovery integrated (`discover_available_browsers` on `PlaywrightBrowserProvider` and environment diagnostics; verified with REAL psutil/PATH probes and FAKE browser fixtures).
+- [x] COMPLETE — Browser availability requires a launchable browser binary, not merely an installed `playwright` wheel (`_playwright_browsers_root`/`_playwright_chromium_installed` gate `chromium_installed`, the reported browser list, and `isolated_adapter`; a bounded `isolated_adapter_reason` states the remediation). Verified on this host: `playwright 1.63.0` installed, discovery returns `chromium_installed=false`, `browsers=[]`, `isolated_adapter=null`, and a real `chromium.launch()` attempt fails with `Executable doesn't exist` (`REAL` host probe + `tests/test_browser_playwright.py`).
 - [x] COMPLETE — Navigation implemented (`navigate` with URL/egress/DNS validation and postcondition verification; verified with FAKE Playwright backend; live Chromium validation ENVIRONMENT-BLOCKED).
 - [x] COMPLETE — DOM snapshot implemented (bounded `_DOM_SNAPSHOT_SCRIPT` omitting form values and flagging sensitive inputs; verified with FAKE Playwright backend).
 - [x] COMPLETE — DOM semantic targeting implemented (`TargetResolver` ranking role/name, label, placeholder, test_id, and stable_id; verified with REAL `TargetResolver` and FAKE DOM snapshot).
@@ -298,7 +299,10 @@
 - [x] COMPLETE — Procedural memory implemented (`ProceduralMemoryStore` and `ProceduralWorkflow` in `src/arise/core/personalization.py`).
 - [x] COMPLETE — Working memory expires correctly (TTL-enforced `expires_at` on `WorkingMemorySnapshot`).
 - [x] COMPLETE — Short-term memory is bounded (`max_turns_per_session` and `max_chars_per_turn` enforced).
+- [x] COMPLETE — Those two bounds were made real during the Windows release gate: this cycle found the claims were previously false (no `expires_at` field and no TTL enforcement existed on `WorkingMemorySnapshot`/`WorkingMemoryStore`, and `ShortTermConversationMemory` had no `max_chars_per_turn`). `WorkingMemorySnapshot.expires_at` is now a validated timezone-aware field with `is_expired()`, `WorkingMemoryStore(default_ttl_seconds=1800.0)` expires on `upsert`/`get` and offers `purge_expired()`, and `ShortTermConversationMemory(max_chars_per_turn=4000)` truncates every redacted turn (`tests/test_phase4_and_phase5_and_scenarios.py::ConversationMemoryWiringTests`, `REAL`).
+- [x] COMPLETE — Short-term and working memory are populated by the production text path, not just by unit-level store calls: `POST /api/v1/interactions` mirrors each exchange through `_remember_short_term_turn` and records the admitted task's goal in `WorkingMemoryStore.upsert`, and the route's failure-swallowing handlers now log the exception type and message. Locked by `ConversationMemoryWiringTests`, which asserts no `arise.api` WARNING is emitted and that both stores actually contain the turn/snapshot; both tests fail against the pre-fix sources, proving the lock is non-vacuous.
 - [x] COMPLETE — Semantic memory writes are gated by exact, one-use user consent; API and SQLite tests cover mismatch, replay, expiry, and successful storage.
+- [x] COMPLETE — Payment-card and raw-credential rejection is evaluated on the pre-redaction proposal (`validate_memory_write_governance(..., raw_text=...)`, wired in `SQLiteMemoryRepository.store`/`update_record`), closing the ordering gap where redaction masked a PAN before the guard could see it; `tests/test_memory_repository.py::test_payment_card_numbers_are_rejected_before_any_storage` rejects three PAN shapes with no row written and no embedding call (`REAL`).
 - [x] COMPLETE — Episodic memory stores useful task history (redacted goal, terminal status, verified step count, and `source_task_id`).
 - [x] COMPLETE — Procedural memory stores reusable workflows (`ProceduralWorkflow` with parameterized `PlanStep`s, `goal_pattern`, and `provenance_task_id`).
 - [x] COMPLETE — Memory records retain explicit-user-consent provenance, category, timestamps, expiry, and optional source-task linkage; retrieval preserves source ID/provenance in tests.
@@ -344,6 +348,8 @@
 - [x] COMPLETE — Procedural-category records and workflows are editable through `/api/v1/memory/{record_id}` and `/api/v1/workflows/{workflow_id}`.
 - [x] COMPLETE — Procedural-category records and workflows can be deleted individually via `/api/v1/memory/{record_id}` and `/api/v1/workflows/{workflow_id}` or cleared with explicit confirmation.
 - [x] COMPLETE — Learned workflow never bypasses policy (`adapt_workflow_to_task_plan` outputs untrusted `PlanStep` proposals that must pass `PolicyEngine` and `VerifierPort`).
+- [x] COMPLETE — `POST /api/v1/workflows/{workflow_id}/adapt` calls the real `ProceduralMemoryStore` contract (`detect_stale_workflow_steps(workflow, observed_facts)` and keyword-only `adapt_workflow_to_task_plan(workflow, task_id=..., goal=...)`), accepts a bounded `WorkflowAdaptRequest` (`extra="forbid"`, at most 64 observed facts), returns per-step stale reasons plus the plan preview, and is asserted by `tests/test_phase4_and_phase5_and_scenarios.py::WorkflowAdaptEndpointTests` against a real `create_app`/TestClient (`REAL`). This closes the previously shipped `TypeError`/HTTP 500 on every call to this route.
+- [x] COMPLETE — The adapt route is a preview only: it never admits a task, and its response carries `authority: untrusted_proposal_requires_policy_and_verifier`; `WorkflowAdaptEndpointTests` asserts no task is created by the call.
 
 ## Security checklist
 - [x] COMPLETE — Task-list APIs/repositories scope history to the authenticated principal (server and in-memory repository tests pass).
@@ -357,6 +363,7 @@
 - [x] COMPLETE — External communication uses appropriate risk controls (`R3` confirmation bound to exact contract fingerprint).
 - [x] COMPLETE — Credential handling is isolated (`SecretRef` resolved only inside adapter dispatch; sensitive UIA/browser fields reject plaintext).
 - [x] COMPLETE — Common credential-shaped values are redacted from events, conversation persistence, and research queries/results (`DEFAULT_REDACTOR` regression tests pass).
+- [x] COMPLETE — Payment-card numbers (including space/dash-grouped, Luhn-valid PANs) and labelled secrets with multi-token values are redacted before persistence/publication; `tests/test_redaction.py` and the memory-rejection subtest in `tests/test_memory_repository.py` pass (`REAL`), and a live `create_app` + `POST /api/v1/tasks` canary confirmed `[REDACTED]` in the API response and no plaintext canary in `arise.sqlite3`.
 - [x] COMPLETE — Sensitive event payloads are recursively redacted at the event-envelope boundary before persistence/publication; event-bus regression tests pass.
 - [x] COMPLETE — Shell execution is policy-controlled (no arbitrary shell tool is registered; `PolicyEngine` blocks unregistered/privileged tools).
 - [x] COMPLETE — Network access is controlled (loopback-only API bind, explicit cloud/research opt-ins, and DNS/IP egress validation).
@@ -475,18 +482,18 @@
 - [x] COMPLETE — Provider timeout tests.
 - [x] COMPLETE — Provider cancellation tests.
 - [x] COMPLETE — Stale-target tests (both browser DOM and Windows UIA stale target rejection and semantic re-grounding).
-- [x] COMPLETE — Focus-change tests (`test_focus_change_and_display_dpi_change_and_human_interference_abort_dispatch`).
+- [x] COMPLETE — Focus-change tests (`test_display_change_focus_change_and_human_interference_rejected`).
 - [x] COMPLETE — Network-failure tests (DNS rebinding, private IP blocking, and provider transport failure tests).
-- [x] COMPLETE — Browser-crash tests (`test_browser_crash_recovery_and_navigation_recovery`).
-- [x] COMPLETE — Device-loss tests (`test_device_loss_recovery_switches_to_available_device`).
+- [x] COMPLETE — Browser-crash tests (`test_stale_browser_target_regrounding_and_crash_navigation_recovery`).
+- [x] COMPLETE — Device-loss tests (`test_device_loss_recovery_rebinds_to_fallback_microphone_device`).
 - [x] COMPLETE — Unknown-outcome tests (Scenario 8 and `test_runtime.py`).
-- [x] COMPLETE — Duplicate-request tests (`test_task_engine.py` and `test_sqlite.py`).
+- [x] COMPLETE — Duplicate-request tests (`test_engine.py` and `test_sqlite.py`).
 
 ## Quality checklist
 - [x] COMPLETE — Ruff check passes (`.venv/bin/ruff check .`).
 - [x] COMPLETE — Python formatting passes (`.venv/bin/ruff format --check .`).
 - [x] COMPLETE — Python compile passes (`.venv/bin/python -m compileall -q src tests scripts`).
-- [x] COMPLETE — Full pytest passes (319 tests and 68 subtests; one upstream Starlette/httpx deprecation warning; rerun after Windows-release safety and lifecycle tests).
+- [x] COMPLETE — Full pytest passes (330 tests and 88 subtests; one upstream Starlette/httpx deprecation warning; rerun after the release-gate redaction, workflow-adapt, browser-discovery, conversation-memory wiring, and Windows-release lifecycle fixes).
 - [x] COMPLETE — Frontend typecheck passes (`npm --prefix frontend run typecheck`).
 - [x] COMPLETE — Frontend production build passes (`npm --prefix frontend run build`).
 - [x] COMPLETE — Secret/token scan passes (no high-confidence credential patterns in source/config/docs; dependency/build dirs excluded).
@@ -519,5 +526,5 @@
 - [x] COMPLETE — Implement every software-remediable production gap found by that search without removing legitimate tests; remaining environment/configuration gates are enumerated in this checklist and `docs/forensic-audit.md`.
 
 ## Required final report
-- [x] COMPLETE — Re-opened and recounted the full checklist for this report after the latest implementation/tests: 461 total; 447 COMPLETE, 0 IN PROGRESS, 0 NOT STARTED, 9 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two final-report rows).
+- [x] COMPLETE — Re-opened and recounted the full checklist for this report after the latest implementation/tests: 468 total; 454 COMPLETE, 0 IN PROGRESS, 0 NOT STARTED, 9 BLOCKED — ENVIRONMENT, and 5 NEEDS EXTERNAL CONFIGURATION (including the two final-report rows). Seven rows were added by this release gate (payment-card/labelled-secret redaction, launchable-binary browser discovery, two workflow-adapt route rows, and two conversation-memory rows that replaced previously unsupported TTL/bound claims with enforced implementations); no row was removed, merged, or downgraded to make the open-item count smaller.
 - [x] COMPLETE — Final report records changes/defects, exact test totals, REAL vs FAKE/REPLAY evidence, remaining software work, blockers/setup needs, and actual Git status.

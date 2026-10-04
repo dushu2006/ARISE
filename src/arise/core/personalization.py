@@ -15,7 +15,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from arise.adapters.sqlite import SQLiteDatabase
@@ -35,7 +35,7 @@ _WORD_RE = re.compile(r"[a-z0-9]{2,}")
 
 @dataclass(frozen=True, slots=True)
 class WorkingMemorySnapshot:
-    """Bounded per-task working memory state."""
+    """Bounded per-task working memory state with an optional absolute expiry."""
 
     task_id: str
     principal_id: str
@@ -44,6 +44,7 @@ class WorkingMemorySnapshot:
     observations: Mapping[str, Any] = field(default_factory=dict)
     scratchpad: tuple[str, ...] = ()
     updated_at: datetime = field(default_factory=utc_now)
+    expires_at: datetime | None = None
 
     def __post_init__(self) -> None:
         validate_safe_token(self.task_id, "working memory task_id")
@@ -52,18 +53,30 @@ class WorkingMemorySnapshot:
             raise ValueError("working memory goal must be non-empty and bounded")
         if len(self.scratchpad) > 64:
             raise ValueError("working memory scratchpad cannot exceed 64 notes")
+        if self.expires_at is not None and self.expires_at.tzinfo is None:
+            raise ValueError("working memory expires_at must be timezone-aware")
+
+    def is_expired(self, now: datetime) -> bool:
+        return self.expires_at is not None and self.expires_at <= now
 
 
 class WorkingMemoryStore:
-    """Bounded in-memory store for active task working contexts."""
+    """Bounded in-memory store for active task working contexts.
+
+    Entries are bounded twice: by LRU capacity (`max_tasks`) and by absolute expiry
+    (`default_ttl_seconds` unless a caller supplies `expires_at`). Expired snapshots are
+    dropped on read and by explicit purge, so a stale task context cannot be re-served.
+    """
 
     def __init__(
         self,
         *,
         max_tasks: int = 128,
+        default_ttl_seconds: float = 1800.0,
         redactor: SecretRedactor = DEFAULT_REDACTOR,
     ) -> None:
         self.max_tasks = max(1, max_tasks)
+        self.default_ttl_seconds = max(1.0, float(default_ttl_seconds))
         self.redactor = redactor
         self._entries: OrderedDict[str, WorkingMemorySnapshot] = OrderedDict()
 
@@ -76,8 +89,13 @@ class WorkingMemoryStore:
         current_step_id: str | None = None,
         observations: Mapping[str, Any] | None = None,
         note: str | None = None,
+        expires_at: datetime | None = None,
     ) -> WorkingMemorySnapshot:
+        now = utc_now()
         existing = self._entries.get(task_id)
+        if existing is not None and existing.is_expired(now):
+            self._entries.pop(task_id, None)
+            existing = None
         obs = dict(existing.observations) if existing is not None else {}
         if observations:
             obs.update(self.redactor.redact_object(dict(observations)))
@@ -94,7 +112,12 @@ class WorkingMemoryStore:
             else (existing.current_step_id if existing else None),
             observations=obs,
             scratchpad=tuple(notes),
-            updated_at=utc_now(),
+            updated_at=now,
+            expires_at=(
+                expires_at
+                if expires_at is not None
+                else now + timedelta(seconds=self.default_ttl_seconds)
+            ),
         )
         self._entries[task_id] = snapshot
         self._entries.move_to_end(task_id)
@@ -106,7 +129,19 @@ class WorkingMemoryStore:
         entry = self._entries.get(task_id)
         if entry is None or entry.principal_id != principal_id:
             return None
+        if entry.is_expired(utc_now()):
+            self._entries.pop(task_id, None)
+            return None
         return entry
+
+    def purge_expired(self, *, now: datetime | None = None) -> int:
+        """Drop every snapshot past its expiry and return how many were removed."""
+
+        checked = now or utc_now()
+        stale = [task_id for task_id, snap in self._entries.items() if snap.is_expired(checked)]
+        for task_id in stale:
+            self._entries.pop(task_id, None)
+        return len(stale)
 
     def clear_task(self, task_id: str, *, principal_id: str) -> bool:
         entry = self._entries.get(task_id)
@@ -124,18 +159,23 @@ class ShortTermConversationMemory:
         *,
         max_sessions: int = 64,
         max_turns_per_session: int = 24,
+        max_chars_per_turn: int = 4000,
         redactor: SecretRedactor = DEFAULT_REDACTOR,
     ) -> None:
         self.max_sessions = max(1, max_sessions)
         self.max_turns_per_session = max(1, max_turns_per_session)
+        self.max_chars_per_turn = max(1, max_chars_per_turn)
         self.redactor = redactor
         self._sessions: OrderedDict[tuple[str, str], list[ConversationTurn]] = OrderedDict()
 
     def append_turn(self, *, principal_id: str, turn: ConversationTurn) -> ConversationTurn:
         validate_safe_token(principal_id, "short-term memory principal_id")
+        text = self.redactor.redact(turn.text)
+        if len(text) > self.max_chars_per_turn:
+            text = text[: self.max_chars_per_turn]
         safe_turn = turn.model_copy(
             update={
-                "text": self.redactor.redact(turn.text),
+                "text": text,
                 "metadata": self.redactor.redact_object(turn.metadata),
             }
         )
@@ -321,7 +361,9 @@ class ProceduralMemoryStore:
         safe_name = self.redactor.redact(name).strip()
         safe_desc = self.redactor.redact(description).strip()
         safe_pattern = self.redactor.redact(goal_pattern).strip()
-        validate_memory_write_governance(f"{safe_name}: {safe_desc}")
+        validate_memory_write_governance(
+            f"{safe_name}: {safe_desc}", raw_text=f"{name}: {description}"
+        )
         now = utc_now()
         wf = ProceduralWorkflow(
             workflow_id=workflow_id or f"wf-{uuid.uuid4().hex[:12]}",
@@ -412,7 +454,10 @@ class ProceduralMemoryStore:
             version=existing.version + 1,
             updated_at=utc_now(),
         )
-        validate_memory_write_governance(f"{updated.name}: {updated.description}")
+        validate_memory_write_governance(
+            f"{updated.name}: {updated.description}",
+            raw_text=f"{name or updated.name}: {description or updated.description}",
+        )
         payload = json.dumps(updated.to_dict(), sort_keys=True, separators=(",", ":"))
         with self.database.transaction() as connection:
             connection.execute(

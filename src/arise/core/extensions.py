@@ -191,13 +191,18 @@ class MemoryGovernanceError(ValueError):
     """Raised when a proposed memory entry fails usefulness, credential, or sensitivity checks."""
 
 
-def validate_memory_write_governance(redacted_text: str) -> None:
-    """Ensure a redacted memory entry is useful and has no payment cards or credential-only text."""
+def validate_memory_write_governance(redacted_text: str, *, raw_text: str | None = None) -> None:
+    """Ensure a redacted memory entry is useful and has no payment cards or credential-only text.
+
+    `raw_text` is the pre-redaction proposal when the caller has one. Payment-card rejection
+    must consider it, because shared redaction masks a card value before this check runs.
+    """
 
     cleaned = (redacted_text or "").strip()
+    payment_scan_target = raw_text if raw_text is not None else cleaned
     if len(cleaned) < 3 or not any(ch.isalnum() for ch in cleaned):
         raise MemoryGovernanceError("memory entry is too short or non-informative to store")
-    if _PAYMENT_OR_RAW_SECRET_PATTERN.search(cleaned):
+    if _PAYMENT_OR_RAW_SECRET_PATTERN.search(payment_scan_target):
         raise MemoryGovernanceError(
             "payment card details and raw credentials cannot be stored in memory"
         )

@@ -12,13 +12,30 @@ from collections.abc import Mapping
 from typing import Any
 
 
+def _is_payment_card_digits(digits: str) -> bool:
+    """Return whether a digit run is a plausible payment card number (Luhn valid)."""
+
+    if not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for index, character in enumerate(reversed(digits)):
+        value = ord(character) - 48
+        if index % 2 == 1:
+            value *= 2
+            if value > 9:
+                value -= 9
+        total += value
+    return total % 10 == 0
+
+
 class SecretRedactor:
     """Redact common credential-shaped values without logging the originals."""
 
     _PATTERNS = (
         re.compile(
             r"(?i)(\b(?:api[_-]?key|(?:api|access|refresh|auth|id|session|bearer)?[_-]?token|"
-            r"authorization|client[_-]?secret|private[_-]?key|credential|password|passwd|secret)"
+            r"authorization|client[_-]?secret|private[_-]?key|credential|password|passwd|secret|"
+            r"credit[_ -]?card|debit[_ -]?card|card[_ -]?number|card[_ -]?no|cvv|cvc)"
             r"\b\s*[:=]\s*)([^\s,;]+)"
         ),
         re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/-]+=*"),
@@ -26,17 +43,28 @@ class SecretRedactor:
         re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
         re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     )
+    # Candidate payment-card runs (13-19 digits, optionally space/dash grouped). Only
+    # Luhn-valid runs are redacted so timestamps, identifiers, and counts survive.
+    _CARD_CANDIDATE = re.compile(r"(?<![A-Za-z0-9])[0-9](?:[ -]?[0-9]){12,18}(?![A-Za-z0-9])")
 
     def redact(self, text: str) -> str:
         if not isinstance(text, str):
             raise TypeError("redaction input must be text")
-        value = text
+        # Payment-card runs are masked first so a space-grouped PAN cannot be partially
+        # consumed by the labelled patterns and leave trailing digit groups behind.
+        value = self._CARD_CANDIDATE.sub(self._redact_card_candidate, text)
         for index, pattern in enumerate(self._PATTERNS):
             if index < 2:
                 value = pattern.sub(lambda match: match.group(1) + "[REDACTED]", value)
             else:
                 value = pattern.sub("[REDACTED]", value)
         return value
+
+    def _redact_card_candidate(self, match: re.Match[str]) -> str:
+        digits = re.sub(r"[ -]", "", match.group(0))
+        if _is_payment_card_digits(digits):
+            return "[REDACTED]"
+        return match.group(0)
 
     def redact_object(self, value: Any) -> Any:
         """Recursively redact strings before user-controlled metadata is stored."""

@@ -19,6 +19,7 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -334,6 +335,49 @@ def verify_browser_dns_binding(
     return resolved_ips
 
 
+def _playwright_browsers_root() -> Path | None:
+    """Return Playwright's browser registry directory for this host, if configured/present."""
+
+    import os
+    import sys
+
+    override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if override and override != "0":
+        return Path(override)
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        return Path(local) / "ms-playwright" if local else None
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+def _playwright_chromium_installed() -> bool:
+    """Verify a launchable Chromium browser binary exists, not just the Python package.
+
+    An installed `playwright` wheel without downloaded browsers cannot start a context, so
+    discovery must not report it as an available browser.
+    """
+
+    root = _playwright_browsers_root()
+    if root is None or not root.is_dir():
+        return False
+    browser_prefixes = ("chromium", "chromium_headless_shell")
+    try:
+        entries = [entry for entry in root.iterdir() if entry.name.startswith(browser_prefixes)]
+    except OSError:
+        return False
+    launchable_names = {"chrome", "chrome.exe", "headless_shell"}
+    for entry in sorted(entries):
+        try:
+            for candidate in entry.rglob("*"):
+                if candidate.name in launchable_names and candidate.is_file():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
 def discover_available_browsers(*, collector: Any | None = None) -> dict[str, Any]:
     """Discover installed/running browsers and isolated Playwright Chromium availability."""
 
@@ -355,12 +399,24 @@ def discover_available_browsers(*, collector: Any | None = None) -> dict[str, An
             discovered_names = list(snapshot.browsers)
         except Exception:
             discovered_names = []
-    if playwright_installed and "Chromium (Playwright)" not in discovered_names:
+    chromium_installed = playwright_installed and _playwright_chromium_installed()
+    if chromium_installed and "Chromium (Playwright)" not in discovered_names:
         discovered_names.append("Chromium (Playwright)")
+    if chromium_installed:
+        reason = None
+    elif not playwright_installed:
+        reason = "The optional Playwright package is not installed; install the browser extra."
+    else:
+        reason = (
+            "Playwright is installed but no Chromium browser binary was found; "
+            "run `python -m playwright install chromium`."
+        )
     return {
         "playwright_installed": playwright_installed,
+        "chromium_installed": chromium_installed,
         "browsers": tuple(discovered_names),
-        "isolated_adapter": "PlaywrightBrowserProvider" if playwright_installed else None,
+        "isolated_adapter": "PlaywrightBrowserProvider" if chromium_installed else None,
+        "isolated_adapter_reason": reason,
     }
 
 

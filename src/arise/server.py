@@ -122,7 +122,6 @@ from arise.core.personalization import (
     PersonalizationStore,
     ProceduralMemoryStore,
     ShortTermConversationMemory,
-    WorkingMemorySnapshot,
     WorkingMemoryStore,
 )
 from arise.core.planner import GatewayTaskPlanner
@@ -278,6 +277,17 @@ class ProceduralWorkflowUpdateRequest(BaseModel):
     goal_pattern: str | None = Field(default=None, min_length=1, max_length=2048)
     steps: tuple[dict[str, Any], ...] | None = Field(default=None, min_length=1, max_length=64)
     approved_by_user: bool | None = None
+
+
+class WorkflowAdaptRequest(BaseModel):
+    """Optional preview inputs for re-grounding a stored workflow into a fresh plan proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal: str | None = Field(default=None, min_length=1, max_length=2048)
+    observed_facts: dict[str, bool | int | float | str | None] = Field(
+        default_factory=dict, max_length=64
+    )
 
 
 class VoiceUtteranceRequest(BaseModel):
@@ -1067,6 +1077,35 @@ def _conversation_turn_id(session_id: str, request_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"arise:{session_id}:{request_id}"))
 
 
+def _remember_short_term_turn(
+    services: ServerServices,
+    *,
+    principal: str,
+    session_id: str,
+    request_id: str,
+    speaker: str,
+    text: str,
+    task_id: str | None = None,
+) -> None:
+    """Mirror one exchange into bounded in-process short-term memory.
+
+    The store redacts and truncates each turn itself, and nothing here grants execution
+    authority: retrieval is only ever injected as explicitly untrusted context.
+    """
+
+    services.short_term_memory.append_turn(
+        principal_id=principal,
+        turn=ConversationTurn(
+            turn_id=_conversation_turn_id(session_id, f"{request_id}:{speaker}"),
+            session_id=session_id,
+            speaker=speaker,
+            text=services.engine.redactor.redact(text),
+            task_id=task_id,
+            metadata={"source": "interaction"},
+        ),
+    )
+
+
 def _ensure_request_session(
     sessions: SessionRepository,
     request_body: UserRequest,
@@ -1664,22 +1703,40 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     async def adapt_procedural_workflow(
         workflow_id: str,
         principal: str = Depends(require_principal),
+        body: WorkflowAdaptRequest | None = None,
     ) -> dict[str, Any]:
+        """Re-ground a stored workflow into an untrusted plan proposal.
+
+        This endpoint never admits a task. Every returned step still has to pass
+        `TaskEngine` admission, `PolicyEngine`, `ResourceManager`, execution, and
+        the verifier, so a saved playbook can never bypass fresh grounding.
+        """
+
         workflow = services.procedural_memory.get_workflow(
             principal_id=principal, workflow_id=workflow_id
         )
         if workflow is None:
             raise HTTPException(status_code=404, detail="Workflow not found")
-        available_tools = {spec.name for spec in services.tools.list_specs()}
-        stale_indices = services.procedural_memory.detect_stale_workflow_steps(
+        request = body or WorkflowAdaptRequest()
+        observed_facts = dict(request.observed_facts)
+        stale_steps = services.procedural_memory.detect_stale_workflow_steps(
             workflow,
-            available_tools=available_tools or None,
+            observed_facts,
         )
-        plan = services.procedural_memory.adapt_workflow_to_task_plan(workflow)
+        goal = request.goal or workflow.goal_pattern or workflow.name
+        preview = services.procedural_memory.adapt_workflow_to_task_plan(
+            workflow,
+            task_id=f"preview-{workflow.workflow_id}-v{workflow.version}",
+            goal=goal,
+        )
         return {
             "workflow_id": workflow.workflow_id,
-            "stale_step_indices": list(stale_indices),
-            "plan": plan.model_dump(mode="json"),
+            "workflow_version": workflow.version,
+            "observed_facts_used": len(observed_facts),
+            "stale_steps": [
+                {"step_id": step_id, "reason": reason} for step_id, reason in stale_steps
+            ],
+            "plan": preview.model_dump(mode="json"),
             "authority": "untrusted_proposal_requires_policy_and_verifier",
         }
 
@@ -1878,23 +1935,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         redactor=services.engine.redactor,
                     )
                     if chosen_settings.memory.enabled:
-                        services.short_term_memory.append_turn(
-                            principal_id=principal,
+                        _remember_short_term_turn(
+                            services,
+                            principal=principal,
                             session_id=session.session_id,
-                            role="user",
-                            content=request_body.text,
+                            request_id=request_body.request_id,
+                            speaker="user",
+                            text=request_body.text,
                         )
                         if response.answer:
-                            services.short_term_memory.append_turn(
-                                principal_id=principal,
+                            _remember_short_term_turn(
+                                services,
+                                principal=principal,
                                 session_id=session.session_id,
-                                role="assistant",
-                                content=response.answer,
+                                request_id=request_body.request_id,
+                                speaker="assistant",
+                                text=response.answer,
                             )
-                except Exception:
+                except Exception as exc:
                     _LOG.warning(
-                        "Text interaction was not fully persisted for request %s",
+                        "Text interaction was not fully persisted for request %s (%s: %s)",
                         request_body.request_id,
+                        type(exc).__name__,
+                        exc,
                     )
             return response
 
@@ -2028,24 +2091,31 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     )
                 )
                 if chosen_settings.memory.enabled:
-                    services.short_term_memory.append_turn(
-                        principal_id=principal,
+                    _remember_short_term_turn(
+                        services,
+                        principal=principal,
                         session_id=session.session_id,
-                        role="user",
-                        content=request_body.text,
+                        request_id=request_body.request_id,
+                        speaker="user",
+                        text=request_body.text,
+                        task_id=task.task_id,
                     )
-                    services.working_memory.put(
-                        WorkingMemorySnapshot(
-                            task_id=task.task_id,
-                            principal_id=principal,
-                            session_id=session.session_id,
-                            goal=task.goal,
-                            active_step_id=None,
-                            expires_at=utc_now() + timedelta(minutes=30),
-                        )
+                    services.working_memory.upsert(
+                        task_id=task.task_id,
+                        principal_id=principal,
+                        goal=task.goal,
+                        current_step_id=None,
+                        observations={"session_id": session.session_id},
+                        expires_at=utc_now()
+                        + timedelta(seconds=services.working_memory.default_ttl_seconds),
                     )
-            except Exception:
-                _LOG.warning("Conversation turn was not persisted for task %s", task.task_id)
+            except Exception as exc:
+                _LOG.warning(
+                    "Conversation context was not persisted for task %s (%s: %s)",
+                    task.task_id,
+                    type(exc).__name__,
+                    exc,
+                )
             return TextInteractionResponse(
                 outcome="task",
                 intent=classification.kind.value,

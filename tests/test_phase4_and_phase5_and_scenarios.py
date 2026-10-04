@@ -1890,5 +1890,217 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
                 self.assertEqual(len(client.get("/api/v1/tasks", headers=headers).json()), 2)
 
 
+class WorkflowAdaptEndpointTests(unittest.TestCase):
+    """`POST /api/v1/workflows/{id}/adapt` must use the real store contract and stay untrusted."""
+
+    def _settings(self, tmp: Path) -> AppSettings:
+        return AppSettings(
+            data_dir=tmp,
+            security=SecuritySettings(environment="test", require_api_auth=False),
+        )
+
+    def test_adapt_endpoint_returns_stale_steps_and_an_untrusted_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            app = create_app(self._settings(Path(raw)))
+            with TestClient(app) as client:
+                created = client.post(
+                    "/api/v1/workflows",
+                    json={
+                        "name": "Evening summary",
+                        "description": "Summarise the open project before shutdown",
+                        "goal_pattern": "summarise the project",
+                        "steps": [
+                            {
+                                "title": "focus the editor window",
+                                "action": {
+                                    "tool_name": "uia.focus",
+                                    "risk": 1,
+                                    "preconditions": [
+                                        {
+                                            "key": "uia.window.Editor.exists",
+                                            "operator": "equals",
+                                            "expected": True,
+                                        }
+                                    ],
+                                },
+                            },
+                            {
+                                "title": "read the legacy status bar",
+                                "action": {"tool_name": "legacy.removed_tool", "risk": 1},
+                            },
+                        ],
+                        "approved_by_user": True,
+                    },
+                )
+                self.assertEqual(created.status_code, 201, created.text)
+                workflow_id = created.json()["workflow_id"]
+
+                adapted = client.post(
+                    f"/api/v1/workflows/{workflow_id}/adapt",
+                    json={
+                        "goal": "summarise the project tonight",
+                        "observed_facts": {"uia.window.Editor.exists": False},
+                    },
+                )
+                self.assertEqual(adapted.status_code, 200, adapted.text)
+                body = adapted.json()
+                self.assertEqual(body["workflow_id"], workflow_id)
+                self.assertEqual(
+                    [item["reason"] for item in body["stale_steps"]],
+                    ["Precondition 'uia.window.Editor.exists' drifted from expected value."],
+                )
+                self.assertEqual(
+                    body["authority"], "untrusted_proposal_requires_policy_and_verifier"
+                )
+                plan = body["plan"]
+                self.assertEqual(len(plan["steps"]), 2)
+                # Adapted steps keep their verification checkpoints and stay preview-only.
+                self.assertTrue(all(step["verification_checkpoint"] for step in plan["steps"]))
+                self.assertTrue(plan["task_id"].startswith("preview-"))
+                self.assertEqual(plan["planner_id"], f"procedural/{workflow_id}@v1")
+                self.assertEqual(len(client.get("/api/v1/tasks").json()), 0)
+
+                # No body still works: an empty observation set reports no drift.
+                bare = client.post(f"/api/v1/workflows/{workflow_id}/adapt")
+                self.assertEqual(bare.status_code, 200, bare.text)
+                self.assertEqual(bare.json()["stale_steps"], [])
+
+                # Unknown workflow and oversized observation sets fail closed.
+                self.assertEqual(client.post("/api/v1/workflows/nope/adapt").status_code, 404)
+                oversized = {f"fact.{index}": True for index in range(65)}
+                self.assertEqual(
+                    client.post(
+                        f"/api/v1/workflows/{workflow_id}/adapt",
+                        json={"observed_facts": oversized},
+                    ).status_code,
+                    422,
+                )
+                self.assertEqual(len(client.get("/api/v1/tasks").json()), 0)
+
+
+class ConversationMemoryWiringTests(unittest.TestCase):
+    """The production text path must actually populate bounded in-process memory.
+
+    Regression lock for the release-gate defect where `POST /api/v1/interactions` called
+    `ShortTermConversationMemory.append_turn(session_id=..., role=..., content=...)` and
+    `WorkingMemoryStore.put(WorkingMemorySnapshot(...))`. Neither signature exists, so the real
+    route raised inside a broad `except Exception` that only logged a warning, leaving short-term
+    and working memory permanently empty while every store-level unit test stayed green.
+    """
+
+    def _settings(self, tmp: Path) -> AppSettings:
+        return AppSettings(
+            data_dir=tmp,
+            security=SecuritySettings(environment="test", require_api_auth=False),
+        )
+
+    def test_question_and_command_paths_record_short_term_and_working_memory(self) -> None:
+        import logging
+
+        with tempfile.TemporaryDirectory() as raw:
+            app = create_app(self._settings(Path(raw)))
+            with TestClient(app) as client:
+                services = app.state.services
+                with self.assertNoLogs("arise.api", level=logging.WARNING):
+                    question = client.post(
+                        "/api/v1/interactions",
+                        json={
+                            "text": "what is the capital of France?",
+                            "session_id": "sess-memory-1",
+                        },
+                    )
+                self.assertEqual(question.status_code, 200, question.text)
+                turns = services.short_term_memory.recent_turns(
+                    principal_id=services.principal_id,
+                    session_id="sess-memory-1",
+                )
+                self.assertTrue(turns, "short-term memory stayed empty for a question")
+                self.assertEqual(turns[0].speaker, "user")
+                self.assertEqual(turns[0].text, "what is the capital of France?")
+
+                with self.assertNoLogs("arise.api", level=logging.WARNING):
+                    command = client.post(
+                        "/api/v1/interactions",
+                        json={"text": "open the Notepad window", "session_id": "sess-memory-2"},
+                    )
+                self.assertEqual(command.status_code, 200, command.text)
+                body = command.json()
+                self.assertEqual(body["outcome"], "task")
+                task_id = body["task"]["task_id"]
+                command_turns = services.short_term_memory.recent_turns(
+                    principal_id=services.principal_id,
+                    session_id="sess-memory-2",
+                )
+                self.assertTrue(
+                    any(turn.task_id == task_id for turn in command_turns),
+                    "the admitted task's user turn was not mirrored into short-term memory",
+                )
+                snapshot = services.working_memory.get(task_id, principal_id=services.principal_id)
+                self.assertIsNotNone(snapshot, "working memory was never populated by the route")
+                assert snapshot is not None
+                self.assertEqual(snapshot.goal, "open the Notepad window")
+                self.assertIsNotNone(snapshot.expires_at)
+                self.assertGreater(snapshot.expires_at, datetime.now(UTC))
+                self.assertEqual(snapshot.observations.get("session_id"), "sess-memory-2")
+
+    def test_working_memory_expiry_and_short_term_bounds_are_enforced(self) -> None:
+        store = WorkingMemoryStore(default_ttl_seconds=60)
+        live = store.upsert(
+            task_id="task-live", principal_id="local-user", goal="keep this context"
+        )
+        self.assertIsNotNone(live.expires_at)
+        expired = store.upsert(
+            task_id="task-expired",
+            principal_id="local-user",
+            goal="stale context",
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        self.assertTrue(expired.is_expired(datetime.now(UTC)))
+        self.assertIsNone(store.get("task-expired", principal_id="local-user"))
+        self.assertIsNotNone(store.get("task-live", principal_id="local-user"))
+        # An expired entry never inherits its observations into a fresh upsert.
+        revived = store.upsert(
+            task_id="task-expired",
+            principal_id="local-user",
+            goal="fresh context",
+            observations={"stale": True},
+        )
+        self.assertEqual(revived.observations, {"stale": True})
+        self.assertEqual(store.purge_expired(), 0)
+        past = datetime.now(UTC) + timedelta(seconds=30)
+        store.upsert(task_id="task-soon", principal_id="local-user", goal="brief", expires_at=past)
+        self.assertEqual(store.purge_expired(now=past + timedelta(seconds=1)), 1)
+        with self.assertRaises(ValueError):
+            store.upsert(
+                task_id="task-naive",
+                principal_id="local-user",
+                goal="reject naive expiry",
+                expires_at=datetime(2030, 1, 1),
+            )
+
+        bounded = ShortTermConversationMemory(max_turns_per_session=2, max_chars_per_turn=16)
+        long_turn = ConversationTurn(
+            turn_id="turn-1",
+            session_id="sess-bound",
+            speaker="user",
+            text="abcdefghijklmnopqrstuvwxyz",
+        )
+        stored = bounded.append_turn(principal_id="local-user", turn=long_turn)
+        self.assertEqual(len(stored.text), 16)
+        for index in range(3):
+            bounded.append_turn(
+                principal_id="local-user",
+                turn=ConversationTurn(
+                    turn_id=f"turn-{index + 2}",
+                    session_id="sess-bound",
+                    speaker="user",
+                    text=f"turn {index}",
+                ),
+            )
+        recent = bounded.recent_turns(principal_id="local-user", session_id="sess-bound", limit=10)
+        self.assertEqual(len(recent), 2)
+        self.assertEqual([turn.text for turn in recent], ["turn 1", "turn 2"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1098,7 +1098,7 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
         safe_text = self.redactor.redact(entry.text).strip()
         if not safe_text:
             raise ValueError("memory text was empty after redaction")
-        validate_memory_write_governance(safe_text)
+        validate_memory_write_governance(safe_text, raw_text=entry.text)
         # Consume exact-content consent before any optional embedding provider sees the text.
         # A caller with a missing, expired, replayed, or wrong-scope grant must cause no egress.
         await require_memory_write_consent(entry, self)
@@ -1251,7 +1251,7 @@ class SQLiteMemoryRepository(MemoryPort, MemoryConsentPort):
         embedding_model_id = existing.embedding_model_id
         if text is not None:
             new_text = self.redactor.redact(text).strip()
-            validate_memory_write_governance(new_text)
+            validate_memory_write_governance(new_text, raw_text=text)
             if self.embedding is not None:
                 try:
                     emb = await self.embedding.embed(new_text, correlation_id=record_id)

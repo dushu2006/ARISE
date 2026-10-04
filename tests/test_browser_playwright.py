@@ -392,6 +392,51 @@ class PlaywrightBrowserTests(unittest.IsolatedAsyncioTestCase):
         discovery = guarded_provider.discover_browsers()
         self.assertIn("playwright_installed", discovery)
         self.assertIn("browsers", discovery)
+        # A browser is only reported when a launchable binary exists; an installed wheel
+        # without downloaded browsers must never look like an available browser.
+        self.assertIsInstance(discovery["chromium_installed"], bool)
+        self.assertEqual(
+            "Chromium (Playwright)" in discovery["browsers"],
+            discovery["chromium_installed"],
+        )
+        self.assertEqual(
+            discovery["isolated_adapter"] == "PlaywrightBrowserProvider",
+            discovery["chromium_installed"],
+        )
+        if not discovery["chromium_installed"]:
+            self.assertTrue(discovery["isolated_adapter_reason"])
+
+    def test_browser_discovery_reports_a_missing_chromium_binary_truthfully(self) -> None:
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from arise.adapters.browser_playwright import discover_available_browsers
+
+        previous = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root)
+            try:
+                empty = discover_available_browsers(collector=object())
+                self.assertFalse(empty["chromium_installed"])
+                self.assertNotIn("Chromium (Playwright)", empty["browsers"])
+                self.assertIsNone(empty["isolated_adapter"])
+                self.assertTrue(empty["isolated_adapter_reason"])
+
+                browser = root / "chromium-1243" / "chrome-linux64"
+                browser.mkdir(parents=True)
+                (browser / "chrome").write_bytes(b"#!/bin/sh\n")
+                filled = discover_available_browsers(collector=object())
+                self.assertTrue(filled["chromium_installed"])
+                self.assertIn("Chromium (Playwright)", filled["browsers"])
+                self.assertEqual(filled["isolated_adapter"], "PlaywrightBrowserProvider")
+                self.assertIsNone(filled["isolated_adapter_reason"])
+            finally:
+                if previous is None:
+                    os.environ.pop("PLAYWRIGHT_BROWSERS_PATH", None)
+                else:
+                    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = previous
 
 
 class _DynamicResourceTool:
