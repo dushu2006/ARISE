@@ -19,6 +19,7 @@ from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -51,10 +52,13 @@ from arise.core.contracts import (
 )
 from arise.core.grounding import TargetResolver
 from arise.core.ports import (
+    EvidenceRecord,
     ExecutionOutcome,
     ExecutionStatus,
     ToolRegistry,
     ToolSpec,
+    VerificationResult,
+    VerificationStatus,
 )
 from arise.core.redaction import DEFAULT_REDACTOR
 from arise.core.resources import ResourceLease, ResourceLeaseLost
@@ -248,6 +252,186 @@ def validate_browser_url(url: str, *, allow_private_network: bool = False) -> st
     return url
 
 
+def validate_browser_egress_url(
+    url: str,
+    *,
+    allow_private_network: bool = False,
+    allowed_domains: Sequence[str] = (),
+) -> str:
+    """Validate browser navigation, subresource, or WebSocket egress URLs."""
+
+    if not isinstance(url, str) or not url or len(url) > 4096:
+        raise ValueError("browser egress URL must be non-empty and at most 4096 characters")
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    if scheme in {"ws", "wss"}:
+        if scheme == "ws" and not allow_private_network:
+            raise ValueError("plaintext ws:// browser egress is disabled on public networks")
+        http_equivalent = urlunsplit(
+            ("https" if scheme == "wss" else "http", parsed.netloc, parsed.path, parsed.query, "")
+        )
+        validate_browser_url(http_equivalent, allow_private_network=allow_private_network)
+    else:
+        validate_browser_url(url, allow_private_network=allow_private_network)
+
+    if allowed_domains:
+        hostname = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+        normalized_domains = tuple(
+            d.strip().lower().rstrip(".") for d in allowed_domains if d and d.strip()
+        )
+        if normalized_domains and not any(
+            hostname == domain or hostname.endswith(f".{domain}") for domain in normalized_domains
+        ):
+            raise ValueError("browser destination host is not in the configured domain allowlist")
+    return url
+
+
+def verify_browser_dns_binding(
+    url: str,
+    *,
+    allow_private_network: bool = False,
+    dns_resolver: Any | None = None,
+    pinned_hosts: dict[str, frozenset[str]] | None = None,
+) -> tuple[str, ...]:
+    """Resolve and verify that a browser hostname does not bind or rebind to private IPs."""
+
+    parsed = urlsplit(url)
+    hostname = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+    if not hostname:
+        raise ValueError("browser URL has no hostname for DNS verification")
+    try:
+        literal_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal_ip = None
+    if literal_ip is not None:
+        if not allow_private_network and not literal_ip.is_global:
+            raise ValueError("private or non-global IP literal is forbidden")
+        return (str(literal_ip),)
+
+    if dns_resolver is None:
+        import socket
+
+        infos = socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
+        resolved_ips = tuple(sorted({str(info[4][0]) for info in infos if info and info[4]}))
+    else:
+        raw_ips = dns_resolver(hostname)
+        resolved_ips = tuple(sorted({str(ip) for ip in raw_ips}))
+
+    if not resolved_ips:
+        raise ValueError("DNS resolution returned no addresses for browser host")
+
+    for ip_text in resolved_ips:
+        addr = ipaddress.ip_address(ip_text)
+        if not allow_private_network and not addr.is_global:
+            raise ValueError("DNS rebinding to a non-global/private address was blocked")
+
+    if pinned_hosts is not None:
+        previous = pinned_hosts.get(hostname)
+        current_set = frozenset(resolved_ips)
+        if previous is None:
+            pinned_hosts[hostname] = current_set
+        elif not (previous & current_set):
+            raise ValueError("DNS rebinding detected: host changed its resolved IP set mid-session")
+    return resolved_ips
+
+
+def _playwright_browsers_root() -> Path | None:
+    """Return Playwright's browser registry directory for this host, if configured/present."""
+
+    import os
+    import sys
+
+    override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if override and override != "0":
+        return Path(override)
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        return Path(local) / "ms-playwright" if local else None
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "ms-playwright"
+    return Path.home() / ".cache" / "ms-playwright"
+
+
+def _playwright_chromium_installed() -> bool:
+    """Verify a launchable Chromium browser binary exists, not just the Python package.
+
+    An installed `playwright` wheel without downloaded browsers cannot start a context, so
+    discovery must not report it as an available browser.
+    """
+
+    root = _playwright_browsers_root()
+    if root is None or not root.is_dir():
+        return False
+    browser_prefixes = ("chromium", "chromium_headless_shell")
+    try:
+        entries = [entry for entry in root.iterdir() if entry.name.startswith(browser_prefixes)]
+    except OSError:
+        return False
+    launchable_names = {"chrome", "chrome.exe", "headless_shell"}
+    for entry in sorted(entries):
+        try:
+            for candidate in entry.rglob("*"):
+                if candidate.name in launchable_names and candidate.is_file():
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def discover_available_browsers(*, collector: Any | None = None) -> dict[str, Any]:
+    """Discover installed/running browsers and isolated Playwright Chromium availability."""
+
+    import importlib.util
+
+    playwright_installed = importlib.util.find_spec("playwright") is not None
+    discovered_names: list[str] = []
+    if collector is not None:
+        try:
+            snapshot = collector.collect()
+            discovered_names = list(snapshot.browsers)
+        except Exception:
+            discovered_names = []
+    else:
+        try:
+            from arise.adapters.diagnostics import EnvironmentDiagnosticsCollector
+
+            snapshot = EnvironmentDiagnosticsCollector().collect()
+            discovered_names = list(snapshot.browsers)
+        except Exception:
+            discovered_names = []
+    # The two halves are reported separately on purpose: a downloaded browser binary says
+    # nothing about whether the optional wheel exists, and an installed wheel says nothing
+    # about whether a browser can actually be launched. Availability requires both.
+    chromium_installed = _playwright_chromium_installed()
+    launchable = playwright_installed and chromium_installed
+    if launchable and "Chromium (Playwright)" not in discovered_names:
+        discovered_names.append("Chromium (Playwright)")
+    if launchable:
+        reason = None
+    elif chromium_installed and not playwright_installed:
+        reason = (
+            "A Chromium browser binary is present but the optional Playwright package is not "
+            "installed; install the browser extra."
+        )
+    elif not playwright_installed:
+        reason = (
+            "The optional Playwright package is not installed; install the browser extra and run "
+            "`python -m playwright install chromium`."
+        )
+    else:
+        reason = (
+            "Playwright is installed but no Chromium browser binary was found; "
+            "run `python -m playwright install chromium`."
+        )
+    return {
+        "playwright_installed": playwright_installed,
+        "chromium_installed": chromium_installed,
+        "browsers": tuple(discovered_names),
+        "isolated_adapter": "PlaywrightBrowserProvider" if launchable else None,
+        "isolated_adapter_reason": reason,
+    }
+
+
 def redact_browser_url(url: str) -> str:
     """Produce a display-safe URL; query, fragment, credentials, and opaque paths go."""
 
@@ -300,6 +484,9 @@ class PlaywrightBrowserProvider:
         max_pages: int = 8,
         max_dom_elements: int = _MAX_DOM_ELEMENTS,
         allow_private_network: bool = False,
+        allowed_domains: Sequence[str] = (),
+        dns_resolver: Any | None = None,
+        allow_stale_regrounding: bool = False,
         secret_provider: SecretProvider | None = None,
     ) -> None:
         validate_safe_token(profile_id, "browser profile_id")
@@ -318,6 +505,11 @@ class PlaywrightBrowserProvider:
         self.max_pages = max_pages
         self.max_dom_elements = max_dom_elements
         self.allow_private_network = allow_private_network
+        self.allowed_domains = tuple(
+            d.strip().lower() for d in allowed_domains if isinstance(d, str) and d.strip()
+        )
+        self.dns_resolver = dns_resolver
+        self.allow_stale_regrounding = allow_stale_regrounding
         self.secret_provider = secret_provider
         self._resolver = TargetResolver()
         self._playwright: Any = None
@@ -327,6 +519,27 @@ class PlaywrightBrowserProvider:
         self._page_ids: dict[int, str] = {}
         self._default_page_id: str | None = None
         self._observations: OrderedDict[str, _PageObservation] = OrderedDict()
+        self._pinned_hosts: dict[str, frozenset[str]] = {}
+        self._reground_count = 0
+        self._crash_recovery_count = 0
+        self._navigation_recovery_count = 0
+
+    @property
+    def reground_count(self) -> int:
+        return self._reground_count
+
+    @property
+    def crash_recovery_count(self) -> int:
+        return self._crash_recovery_count
+
+    @property
+    def navigation_recovery_count(self) -> int:
+        return self._navigation_recovery_count
+
+    def discover_browsers(self, *, collector: Any | None = None) -> dict[str, Any]:
+        """Return discovered host browsers and isolated Playwright status."""
+
+        return discover_available_browsers(collector=collector)
 
     @property
     def started(self) -> bool:
@@ -398,7 +611,7 @@ class PlaywrightBrowserProvider:
             )
 
     async def _guard_route(self, route: Any, request: Any) -> None:
-        """Block unsupported schemes and common private-host requests, including redirects."""
+        """Block unsupported schemes, WebSockets/subrequests to private hosts, and DNS rebinding."""
 
         request_url = str(request.url)
         try:
@@ -410,11 +623,127 @@ class PlaywrightBrowserProvider:
             await route.continue_()
             return
         try:
-            validate_browser_url(request_url, allow_private_network=self.allow_private_network)
+            validate_browser_egress_url(
+                request_url,
+                allow_private_network=self.allow_private_network,
+                allowed_domains=self.allowed_domains,
+            )
+            if self.dns_resolver is not None:
+                verify_browser_dns_binding(
+                    request_url,
+                    allow_private_network=self.allow_private_network,
+                    dns_resolver=self.dns_resolver,
+                    pinned_hosts=self._pinned_hosts,
+                )
         except ValueError:
             await route.abort("blockedbyclient")
             return
         await route.continue_()
+
+    async def reground_stale_target(self, candidate: TargetCandidate) -> TargetCandidate:
+        """Re-observe a browser page and re-resolve a stale semantic target safely."""
+
+        identity = candidate.descriptor.identity
+        page_id = identity.page_id
+        if identity.platform != "browser" or page_id is None:
+            raise ComputerAdapterError(
+                ComputerFailureCode.INVALID_TARGET,
+                "Browser stale-target re-resolution requires a browser page target.",
+                source=PerceptionSource.BROWSER_DOM,
+            )
+        self._sync_pages()
+        page = self._page(page_id)
+        new_observation_id = uuid.uuid4().hex
+        candidates, _state_hash, _title, _safe_url, _url_hash = await self._capture_page(
+            page, page_id, new_observation_id, remember=True
+        )
+        exact = [
+            item
+            for item in candidates
+            if item.descriptor.identity.fingerprint == identity.fingerprint
+            and item.descriptor.visible
+            and item.descriptor.enabled
+        ]
+        if len(exact) == 1:
+            self._reground_count += 1
+            return exact[0]
+        if len(exact) > 1:
+            raise ComputerAdapterError(
+                ComputerFailureCode.TARGET_AMBIGUOUS,
+                "Stale browser target matches multiple DOM elements after re-observation.",
+                source=PerceptionSource.BROWSER_DOM,
+            )
+        if identity.semantic_name:
+            resolution = self._resolver.resolve(
+                TargetQuery(
+                    semantic_name=identity.semantic_name,
+                    role=identity.role,
+                    page_id=page_id,
+                    allowed_sources=(PerceptionSource.BROWSER_DOM,),
+                ),
+                candidates,
+            )
+            if resolution.status is ResolutionStatus.RESOLVED and resolution.selected is not None:
+                self._reground_count += 1
+                return resolution.selected
+            if resolution.status is ResolutionStatus.AMBIGUOUS:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.TARGET_AMBIGUOUS,
+                    "Stale browser target is ambiguous after DOM mutation.",
+                    source=PerceptionSource.BROWSER_DOM,
+                )
+        raise ComputerAdapterError(
+            ComputerFailureCode.TARGET_STALE,
+            "The stale browser target could not be uniquely re-resolved on the current page.",
+            source=PerceptionSource.BROWSER_DOM,
+        )
+
+    async def recover_after_crash(self, *, replacement_context: Any | None = None) -> str:
+        """Clean up crashed page/context state and restore an isolated browser page."""
+
+        self._observations.clear()
+        self._pages.clear()
+        self._page_ids.clear()
+        self._default_page_id = None
+        if replacement_context is not None:
+            self._context = replacement_context
+            self._sync_pages()
+            if self._default_page_id is None and hasattr(replacement_context, "new_page"):
+                page = await replacement_context.new_page()
+                self._default_page_id = self._register_page(page)
+        elif self._context is not None and hasattr(self._context, "new_page"):
+            self._sync_pages()
+            if not self._pages:
+                page = await self._context.new_page()
+                self._default_page_id = self._register_page(page)
+        else:
+            await self.close()
+            await self.start()
+        if self._default_page_id is None:
+            raise ComputerAdapterError(
+                ComputerFailureCode.ADAPTER_UNAVAILABLE,
+                "Browser crash recovery could not open a replacement page.",
+                source=PerceptionSource.BROWSER_DOM,
+            )
+        self._crash_recovery_count += 1
+        return self._default_page_id
+
+    async def recover_navigation(
+        self, page_id: str, *, fallback_url: str = "https://example.com/"
+    ) -> BrowserTabRecord:
+        """Invalidate stale page observations after a failed navigation and restore a safe URL."""
+
+        for obs_id, record in tuple(self._observations.items()):
+            if record.page_id == page_id:
+                self._observations.pop(obs_id, None)
+        tab = await self.navigate(
+            page_id,
+            fallback_url,
+            timeout_seconds=self.default_timeout_seconds,
+            expected_observation=None,
+        )
+        self._navigation_recovery_count += 1
+        return tab
 
     def _register_page(self, page: Any) -> str:
         page_key = id(page)
@@ -622,6 +951,50 @@ class PlaywrightBrowserProvider:
         except Exception:
             return False
         return current_hash == record.state_hash
+
+    async def verify(
+        self,
+        action: ActionContract,
+        pre_observation: ObservationLease | None = None,
+        post_observation: ObservationLease | None = None,
+        outcome: ExecutionOutcome | None = None,
+    ) -> VerificationResult:
+        del pre_observation
+        if outcome is not None and outcome.status is ExecutionStatus.UNKNOWN:
+            return VerificationResult(
+                status=VerificationStatus.UNKNOWN,
+                level=0,
+                summary="Browser execution outcome is unknown; postconditions cannot be verified.",
+                evidence=(),
+            )
+        observation = post_observation or await self.observe(action)
+        failed = [
+            condition.key
+            for condition in action.postconditions
+            if not condition.evaluate(observation.facts)
+        ]
+        evidence = (
+            EvidenceRecord(
+                source=observation.source.value,
+                observation_id=observation.lease_id,
+                state_hash=observation.state_hash,
+                statement=f"Browser DOM snapshot verified ({observation.state_hash[:12]}).",
+                captured_at=observation.created_at,
+            ),
+        )
+        if failed:
+            return VerificationResult(
+                status=VerificationStatus.FAILED,
+                level=2,
+                summary=f"Browser postconditions failed: {', '.join(failed)}",
+                evidence=evidence,
+            )
+        return VerificationResult(
+            status=VerificationStatus.PASSED,
+            level=2,
+            summary="All browser postconditions verified against fresh DOM observation.",
+            evidence=evidence,
+        )
 
     def candidates_for_observation(
         self, observation: ObservationLease
@@ -981,11 +1354,26 @@ class PlaywrightBrowserProvider:
             remember=False,
         )
         if current_hash != record.state_hash:
-            raise ComputerAdapterError(
-                ComputerFailureCode.TARGET_STALE,
-                "The browser DOM changed after target observation; reobserve before dispatch.",
-                source=PerceptionSource.BROWSER_DOM,
-            )
+            if not self.allow_stale_regrounding:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.TARGET_STALE,
+                    "The browser DOM changed after target observation; reobserve before dispatch.",
+                    source=PerceptionSource.BROWSER_DOM,
+                )
+            matching_stale = [
+                item
+                for item in current
+                if item.descriptor.identity.fingerprint == identity.fingerprint
+                and item.descriptor.visible
+                and item.descriptor.enabled
+            ]
+            if len(matching_stale) != 1:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.TARGET_STALE,
+                    "The browser DOM changed and the target could not be uniquely re-resolved.",
+                    source=PerceptionSource.BROWSER_DOM,
+                )
+            self._reground_count += 1
         matching = [
             item for item in current if item.descriptor.identity.fingerprint == identity.fingerprint
         ]
@@ -1529,7 +1917,10 @@ def register_playwright_tools(
 __all__ = [
     "PlaywrightActionTool",
     "PlaywrightBrowserProvider",
+    "discover_available_browsers",
     "redact_browser_url",
     "register_playwright_tools",
+    "validate_browser_egress_url",
     "validate_browser_url",
+    "verify_browser_dns_binding",
 ]

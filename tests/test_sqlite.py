@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -42,6 +44,44 @@ class SQLiteAdapterTests(unittest.TestCase):
                 )
                 self.assertEqual(connection.execute("PRAGMA synchronous").fetchone()[0], 1)
             database.close()
+
+    def test_committed_wal_transaction_recovers_after_writer_process_exits_abruptly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "wal-recovery.sqlite3"
+            database = SQLiteDatabase(path)
+            with database.locked() as connection:
+                connection.execute("CREATE TABLE wal_crash_probe(value TEXT NOT NULL)")
+            database.close()
+
+            child_code = "\n".join(
+                (
+                    "import os, sqlite3, sys",
+                    "connection = sqlite3.connect(sys.argv[1], isolation_level=None)",
+                    "connection.execute('PRAGMA journal_mode=WAL')",
+                    "connection.execute('BEGIN IMMEDIATE')",
+                    "connection.execute(\"INSERT INTO wal_crash_probe VALUES ('committed')\")",
+                    "connection.execute('COMMIT')",
+                    "os._exit(73)",
+                )
+            )
+            child = subprocess.run(
+                [sys.executable, "-c", child_code, str(path)],
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(child.returncode, 73)
+
+            recovered = SQLiteDatabase(path)
+            with recovered.locked() as connection:
+                self.assertEqual(
+                    connection.execute("SELECT value FROM wal_crash_probe").fetchone()[0],
+                    "committed",
+                )
+                self.assertEqual(
+                    connection.execute("PRAGMA journal_mode").fetchone()[0].casefold(), "wal"
+                )
+                self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
+            recovered.close()
 
     def test_online_backup_is_atomic_private_and_refuses_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

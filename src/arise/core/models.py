@@ -218,11 +218,72 @@ class ActionProposal(ContractModel):
         )
 
 
+class StepRetryPolicy(ContractModel):
+    max_attempts: int = Field(default=1, ge=1, le=5)
+    backoff_seconds: float = Field(default=0.0, ge=0.0, le=30.0)
+    retry_on_blocked: bool = False
+
+
+class StepFallbackPolicy(ContractModel):
+    strategy: Literal["none", "fallback_action", "reground", "abort"] = "none"
+    fallback_action: ActionProposal | None = None
+    reason: str = Field(default="", max_length=512)
+
+
 class PlanStep(ContractModel):
     step_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     title: str = Field(min_length=1, max_length=256)
+    description: str = Field(default="", max_length=1024)
     action: ActionProposal
     depends_on: tuple[str, ...] = ()
+    condition: ConditionModel | None = None
+    skip_when_condition_false: bool = True
+    parallel_safe: bool = False
+    verification_checkpoint: bool = True
+    retry_policy: StepRetryPolicy = Field(default_factory=StepRetryPolicy)
+    fallback_policy: StepFallbackPolicy = Field(default_factory=StepFallbackPolicy)
+
+    @model_validator(mode="after")
+    def populate_default_description(self) -> PlanStep:
+        if not self.description.strip():
+            object.__setattr__(self, "description", self.title)
+        return self
+
+    @property
+    def tool_name(self) -> str:
+        return self.action.tool_name
+
+    @property
+    def target(self) -> TargetModel | None:
+        return self.action.target
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return self.action.parameters
+
+    @property
+    def preconditions(self) -> tuple[ConditionModel, ...]:
+        return self.action.preconditions
+
+    @property
+    def expected_postconditions(self) -> tuple[ConditionModel, ...]:
+        return self.action.postconditions
+
+    @property
+    def verification_method(self) -> str:
+        return self.action.verification_strategy
+
+    @property
+    def risk_level(self) -> RiskLevel:
+        return self.action.risk
+
+    @property
+    def required_resources(self) -> tuple[str, ...]:
+        return self.action.required_resources
+
+    @property
+    def timeout(self) -> float:
+        return self.action.timeout_seconds
 
 
 class TaskPlan(ContractModel):

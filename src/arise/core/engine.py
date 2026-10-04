@@ -17,6 +17,7 @@ from datetime import timedelta
 from arise.core.contracts import (
     ActionContract,
     AuthorizationContext,
+    Idempotency,
     RiskLevel,
     TrustLevel,
     canonical_json,
@@ -39,10 +40,12 @@ from arise.core.runtime import ActionRunResult, AgentRuntime
 from arise.core.tasks import (
     ActionStep,
     DuplicateActionError,
+    StepStatus,
     TaskNotFoundError,
     TaskRecord,
     TaskRepository,
     TaskStatus,
+    VerificationStatus,
 )
 
 
@@ -746,7 +749,9 @@ class TaskEngine:
         approval: ApprovalGrant | None = None,
     ) -> None:
         loop = asyncio.get_running_loop()
-        for index in range(start_index, len(ordered)):
+        completed_step_ids: set[str] = {ordered[i][0].step_id for i in range(start_index)}
+        index = start_index
+        while index < len(ordered):
             step, action = ordered[index]
             final_action = index == len(ordered) - 1
             deadline = self._deadlines.setdefault(
@@ -756,22 +761,53 @@ class TaskEngine:
             if remaining <= 0:
                 self._fail_before_dispatch(task_id, "Task execution exceeded its deadline.")
                 return
-            try:
-                async with asyncio.timeout(remaining):
-                    result: ActionRunResult = await self.runtime.execute_action(
-                        action,
-                        approval=approval if index == start_index else None,
-                        final_action=final_action,
-                        resource_wait_timeout=self.config.resource_wait_timeout_seconds,
+
+            # Evaluate step-level condition if specified
+            if step.condition is not None:
+                cond_met = await self._evaluate_step_condition(step, action)
+                if not cond_met:
+                    if step.skip_when_condition_false:
+                        self._skip_conditional_step(
+                            task_id, step, action, final_action=final_action
+                        )
+                        completed_step_ids.add(step.step_id)
+                        index += 1
+                        continue
+                    self._fail_before_dispatch(
+                        task_id,
+                        f"Step '{step.title}' condition was not satisfied.",
                     )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._handle_action_exception(
-                    task_id,
-                    action,
-                    f"Action orchestration failed ({type(exc).__name__}).",
-                )
+                    return
+
+            # Check if a batch of parallel-safe steps can run concurrently
+            if (
+                step.parallel_safe
+                and approval is None
+                and step.condition is None
+                and index + 1 < len(ordered)
+            ):
+                batch = self._collect_parallel_batch(ordered, index, completed_step_ids)
+                if len(batch) > 1:
+                    batch_ok = await self._execute_parallel_batch(
+                        task_id, batch, ordered_len=len(ordered), start_idx=index, deadline=deadline
+                    )
+                    if not batch_ok:
+                        self._deadlines.pop(task_id, None)
+                        return
+                    for b_step, _b_action in batch:
+                        completed_step_ids.add(b_step.step_id)
+                    index += len(batch)
+                    continue
+
+            result = await self._execute_step_with_retry_and_fallback(
+                task_id,
+                step,
+                action,
+                approval=approval if index == start_index else None,
+                final_action=final_action,
+                deadline=deadline,
+            )
+            if result is None:
                 return
             if result.policy_decision.kind is PolicyDecisionKind.CONFIRM:
                 self._register_confirmation(task_id, action, result)
@@ -784,10 +820,306 @@ class TaskEngine:
                 }
                 and result.step_status.value == "succeeded"
             ):
+                completed_step_ids.add(step.step_id)
+                index += 1
                 continue
             self._deadlines.pop(task_id, None)
             return
         self._deadlines.pop(task_id, None)
+
+    async def _evaluate_step_condition(self, step: PlanStep, action: ActionContract) -> bool:
+        if step.condition is None:
+            return True
+        try:
+            obs = await self.runtime.environment.observe(action)
+            return step.condition.to_domain().evaluate(obs.facts)
+        except Exception:
+            return False
+
+    def _skip_conditional_step(
+        self,
+        task_id: str,
+        step: PlanStep,
+        action: ActionContract,
+        *,
+        final_action: bool,
+    ) -> None:
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+        recorded_step = task.find_step(action.action_id)
+        if recorded_step is not None:
+            recorded_step.status = StepStatus.SUCCEEDED
+            recorded_step.verification_status = VerificationStatus.PASSED
+            recorded_step.status_reason = "Skipped because step condition evaluated to false."
+            recorded_step.finished_at = utc_now()
+        if final_action:
+            if task.status is not TaskStatus.RUNNING:
+                task.transition_to(TaskStatus.RUNNING, reason="Evaluating conditional final step.")
+            task.transition_to(
+                TaskStatus.VERIFYING, reason="Verifying conditional plan completion."
+            )
+            task.transition_to(
+                TaskStatus.COMPLETED,
+                reason="All required plan steps completed or were conditionally skipped.",
+                verification_passed=True,
+            )
+        elif task.status not in {TaskStatus.PARTIALLY_COMPLETED, TaskStatus.COMPLETED}:
+            if task.status is TaskStatus.READY:
+                task.transition_to(TaskStatus.RUNNING, reason="Conditional step evaluated.")
+            task.transition_to(
+                TaskStatus.PARTIALLY_COMPLETED,
+                reason="Conditional step was skipped cleanly.",
+            )
+        task = self.tasks.save(task)
+        self._emit(
+            "STEP_CONDITION_SKIPPED",
+            task,
+            {"step_id": step.step_id, "action_id": action.action_id},
+        )
+
+    def _collect_parallel_batch(
+        self,
+        ordered: list[tuple[PlanStep, ActionContract]],
+        start_index: int,
+        completed_step_ids: set[str],
+    ) -> list[tuple[PlanStep, ActionContract]]:
+        batch: list[tuple[PlanStep, ActionContract]] = []
+        used_resources: set[str] = set()
+        batch_step_ids: set[str] = set()
+        for idx in range(start_index, len(ordered)):
+            step, action = ordered[idx]
+            if not step.parallel_safe or step.condition is not None:
+                break
+            tool = self._get_tool(action.tool_name)
+            if tool is None:
+                break
+            eff_risk = RiskLevel(max(int(action.risk), int(tool.spec.minimum_risk)))
+            if eff_risk > RiskLevel.R1:
+                break
+            # Cannot depend on a step inside the current parallel batch or an uncompleted step
+            if set(step.depends_on) & batch_step_ids or not (
+                set(step.depends_on) <= completed_step_ids
+            ):
+                break
+            step_resources = set(action.required_resources) | set(tool.spec.required_resources)
+            if used_resources & step_resources:
+                break
+            used_resources |= step_resources
+            batch_step_ids.add(step.step_id)
+            batch.append((step, action))
+        return batch
+
+    async def _execute_parallel_batch(
+        self,
+        task_id: str,
+        batch: list[tuple[PlanStep, ActionContract]],
+        *,
+        ordered_len: int,
+        start_idx: int,
+        deadline: float,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            self._fail_before_dispatch(task_id, "Task execution exceeded its deadline.")
+            return False
+
+        async def _run_one(offset: int, pair: tuple[PlanStep, ActionContract]) -> ActionRunResult:
+            _step, act = pair
+            is_last = (start_idx + offset) == (ordered_len - 1)
+            return await self.runtime.execute_action(
+                act,
+                approval=None,
+                final_action=is_last,
+                resource_wait_timeout=self.config.resource_wait_timeout_seconds,
+            )
+
+        try:
+            async with asyncio.timeout(remaining):
+                results = await asyncio.gather(*(_run_one(i, pair) for i, pair in enumerate(batch)))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._handle_action_exception(
+                task_id,
+                batch[0][1],
+                f"Parallel batch execution failed ({type(exc).__name__}).",
+            )
+            return False
+        return all(
+            res.step_status.value == "succeeded"
+            and res.task_status in {TaskStatus.COMPLETED, TaskStatus.PARTIALLY_COMPLETED}
+            for res in results
+        )
+
+    async def _execute_step_with_retry_and_fallback(
+        self,
+        task_id: str,
+        step: PlanStep,
+        action: ActionContract,
+        *,
+        approval: ApprovalGrant | None,
+        final_action: bool,
+        deadline: float,
+    ) -> ActionRunResult | None:
+        loop = asyncio.get_running_loop()
+        max_attempts = max(1, step.retry_policy.max_attempts)
+        result: ActionRunResult | None = None
+        for attempt in range(1, max_attempts + 1):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._fail_before_dispatch(task_id, "Task execution exceeded its deadline.")
+                return None
+            if attempt > 1:
+                if step.retry_policy.backoff_seconds > 0:
+                    await asyncio.sleep(min(step.retry_policy.backoff_seconds, remaining))
+            try:
+                async with asyncio.timeout(max(0.001, deadline - loop.time())):
+                    result = await self.runtime.execute_action(
+                        action,
+                        approval=approval if attempt == 1 else None,
+                        final_action=final_action,
+                        resource_wait_timeout=self.config.resource_wait_timeout_seconds,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._handle_action_exception(
+                    task_id,
+                    action,
+                    f"Action orchestration failed ({type(exc).__name__}).",
+                )
+                return None
+
+            if result.policy_decision.kind is PolicyDecisionKind.CONFIRM:
+                return result
+            if result.step_status.value == "succeeded":
+                return result
+            # Never retry an UNKNOWN outcome
+            if result.task_status is TaskStatus.UNKNOWN or result.step_status.value == "unknown":
+                return result
+            can_retry = (
+                attempt < max_attempts
+                and action.idempotency is Idempotency.IDEMPOTENT
+                and (
+                    result.step_status.value == "failed"
+                    or (
+                        result.step_status.value == "blocked" and step.retry_policy.retry_on_blocked
+                    )
+                )
+            )
+            if not can_retry:
+                break
+            task = self.tasks.get(task_id)
+            if task is not None:
+                recorded = task.find_step(action.action_id)
+                if recorded is not None and recorded.status in {
+                    StepStatus.FAILED,
+                    StepStatus.BLOCKED,
+                }:
+                    recorded.status = StepStatus.PLANNED
+                    recorded.started_at = None
+                    recorded.finished_at = None
+                    recorded.verification_status = None
+                    if task.status is TaskStatus.FAILED:
+                        task.transition_to(
+                            TaskStatus.RECOVERING,
+                            reason=(
+                                f"Retrying idempotent step '{step.step_id}' "
+                                f"(attempt {attempt + 1})."
+                            ),
+                        )
+                    elif task.status is TaskStatus.BLOCKED:
+                        task.transition_to(
+                            TaskStatus.READY,
+                            reason=(
+                                f"Retrying blocked step '{step.step_id}' (attempt {attempt + 1})."
+                            ),
+                        )
+                    task = self.tasks.save(task)
+                    self._emit(
+                        "STEP_RETRY_SCHEDULED",
+                        task,
+                        {
+                            "step_id": step.step_id,
+                            "action_id": action.action_id,
+                            "attempt": attempt + 1,
+                        },
+                    )
+
+        # Check per-step fallback action if primary action failed or was blocked (never UNKNOWN)
+        if (
+            result is not None
+            and result.task_status in {TaskStatus.FAILED, TaskStatus.BLOCKED}
+            and result.step_status.value in {"failed", "blocked"}
+            and step.fallback_policy.strategy == "fallback_action"
+            and step.fallback_policy.fallback_action is not None
+        ):
+            task = self.tasks.get(task_id)
+            if task is not None and task.authorization is not None:
+                fb_proposal = step.fallback_policy.fallback_action
+                fb_action = fb_proposal.to_domain(
+                    task_id=task.task_id, authority=task.authorization
+                )
+                fb_tool = self._get_tool(fb_action.tool_name)
+                if fb_tool is not None:
+                    fb_action = replace(
+                        fb_action,
+                        idempotency=fb_tool.spec.idempotency,
+                        required_resources=tuple(
+                            sorted(
+                                set(fb_action.required_resources)
+                                | set(fb_tool.spec.required_resources)
+                            )
+                        ),
+                    )
+                    fingerprint = self.policy.contract_fingerprint(fb_action, fb_tool.spec)
+                    risk = RiskLevel(max(int(fb_action.risk), int(fb_tool.spec.minimum_risk)))
+                else:
+                    fingerprint = fb_action.approval_fingerprint(fb_action.risk, "unavailable")
+                    risk = fb_action.risk
+                if task.find_step(fb_action.action_id) is None:
+                    task.add_step(
+                        ActionStep(
+                            action_id=fb_action.action_id,
+                            contract_fingerprint=fingerprint,
+                            tool_name=fb_action.tool_name,
+                            risk=risk,
+                        )
+                    )
+                task.status = TaskStatus.READY
+                task = self.tasks.save(task)
+                self._actions[(task_id, fb_action.action_id)] = fb_action
+                self._emit(
+                    "STEP_FALLBACK_EXECUTED",
+                    task,
+                    {
+                        "step_id": step.step_id,
+                        "primary_action_id": action.action_id,
+                        "fallback_action_id": fb_action.action_id,
+                    },
+                )
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    try:
+                        async with asyncio.timeout(remaining):
+                            return await self.runtime.execute_action(
+                                fb_action,
+                                approval=None,
+                                final_action=final_action,
+                                resource_wait_timeout=self.config.resource_wait_timeout_seconds,
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self._handle_action_exception(
+                            task_id,
+                            fb_action,
+                            f"Fallback action orchestration failed ({type(exc).__name__}).",
+                        )
+                        return None
+        return result
 
     def _handle_action_exception(
         self,

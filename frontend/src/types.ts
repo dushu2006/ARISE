@@ -8,6 +8,34 @@ export interface MemoryRecord {
   created_at: string;
   expires_at: string;
   source_task_id: string | null;
+  confidence?: number;
+  sensitivity?: 'public' | 'internal' | 'personal' | 'restricted';
+  expiration_policy?: 'session' | 'ttl' | 'pinned';
+}
+
+export interface PersonalizationProfile {
+  principal_id: string;
+  preferred_browser: string | null;
+  preferred_apps: Record<string, string>;
+  preferred_response_style: 'concise' | 'balanced' | 'detailed';
+  preferred_tts_voice: string | null;
+  preferred_tts_speed: number;
+  approved_workflows: string[];
+  updated_at: string;
+}
+
+export interface ProceduralWorkflowSummary {
+  workflow_id: string;
+  principal_id: string;
+  name: string;
+  description: string;
+  goal_pattern: string;
+  approved_by_user: boolean;
+  execution_count: number;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  last_verified_at: string | null;
 }
 
 export interface MemoryWriteDraft {

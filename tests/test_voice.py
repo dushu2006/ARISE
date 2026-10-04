@@ -1112,6 +1112,109 @@ class AudioHubTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await hub.close()
 
+    async def test_immediate_local_acknowledgement_and_tts_streaming_without_cloud_round_trip(
+        self,
+    ) -> None:
+        class FakeSynthesizer:
+            def __init__(self) -> None:
+                self.synthesized_texts: list[str] = []
+
+            async def synthesize(
+                self,
+                text: str,
+                *,
+                locale: str | None = None,
+                correlation_id: str,
+            ) -> AsyncIterator[AudioChunk]:
+                del locale, correlation_id
+                self.synthesized_texts.append(text)
+                yield audio(101, b"\x01\x02" * 160)
+                yield audio(102, b"\x03\x04" * 160)
+
+        synthesizer = FakeSynthesizer()
+        microphone = FakeMicrophone()
+        playback = FakePlayback()
+        event_sink = FakeVoiceEventSink()
+        hub = AudioHub(
+            microphone=microphone,
+            vad=FakeVAD(),
+            wake_word_detector=FakeWakeWord(),
+            provider=None,
+            playback=playback,
+            speech_synthesizer=synthesizer,
+            event_sink=event_sink,
+        )
+        await hub.start()
+        try:
+            ack = await hub.acknowledge_locally("Open Chrome and search NVIDIA", speak=True)
+            self.assertEqual(ack, "ARISE accepted the task and is working on it.")
+            self.assertEqual(synthesizer.synthesized_texts, [ack])
+            self.assertEqual([c.sequence for c in playback.played], [101, 102])
+            self.assertIn("local_acknowledgement_latency_ms", hub.snapshot().telemetry)
+            self.assertTrue(
+                any(e.kind is VoiceEventKind.LOCAL_ACKNOWLEDGED for e in event_sink.events)
+            )
+            # Unverified claim cannot be spoken via speak_text
+            unverified_chunks = await hub.speak_text("I have opened Chrome and completed the task.")
+            self.assertEqual(unverified_chunks, 0)
+            self.assertEqual([c.sequence for c in playback.played], [101, 102])
+        finally:
+            await hub.close()
+
+    async def test_device_loss_recovery_rebinds_to_fallback_microphone_device(self) -> None:
+        from arise.core.voice import MicrophoneUnavailable
+
+        class FlakyHotSwapMicrophone(FakeMicrophone):
+            def __init__(self) -> None:
+                super().__init__((AudioDevice("usb-mic-1", "USB Mic", True),))
+                self.capture_attempts = 0
+
+            async def list_devices(self) -> Sequence[AudioDevice]:
+                if self.capture_attempts >= 1:
+                    return (AudioDevice("builtin-mic-2", "Built-in Array", True),)
+                return self.devices
+
+            async def capture(self, device_id: str) -> AsyncIterator[AudioChunk]:
+                self.capture_attempts += 1
+                if self.capture_attempts == 1:
+                    assert device_id == "usb-mic-1"
+                    yield audio(1, b"\x01\x00" * 160)
+                    raise MicrophoneUnavailable("USB device unplugged")
+                assert device_id == "builtin-mic-2"
+                while True:
+                    chunk = await self.queue.get()
+                    if chunk is None:
+                        return
+                    yield chunk
+
+        microphone = FlakyHotSwapMicrophone()
+        playback = FakePlayback()
+        event_sink = FakeVoiceEventSink()
+        hub = AudioHub(
+            microphone=microphone,
+            vad=FakeVAD(),
+            wake_word_detector=FakeWakeWord(),
+            provider=FakeProvider(),
+            playback=playback,
+            config=VoiceConfig(
+                microphone_device_id="usb-mic-1",
+                max_device_recovery_attempts=2,
+                device_recovery_backoff_seconds=0.0,
+            ),
+            event_sink=event_sink,
+        )
+        await hub.start()
+        try:
+            await self.wait_for(lambda: microphone.capture_attempts >= 2)
+            self.assertEqual(hub._device_id, "builtin-mic-2")
+            self.assertEqual(hub.snapshot().microphone_status, MicrophoneStatus.AVAILABLE)
+            self.assertIn("device_loss_recovery_ms", hub.snapshot().telemetry)
+            self.assertTrue(
+                any(e.kind is VoiceEventKind.DEVICE_RECOVERED for e in event_sink.events)
+            )
+        finally:
+            await hub.close()
+
 
 if __name__ == "__main__":
     unittest.main()

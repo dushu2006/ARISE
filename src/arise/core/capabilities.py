@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from arise.core.model_gateway import ModelRouter
 from arise.core.models import (
@@ -31,6 +31,9 @@ class CapabilityService:
         research_enabled: bool = False,
         research_secret_configured: bool = False,
         embeddings_enabled: bool = False,
+        perception_enabled: bool = False,
+        browser_availability: Callable[[], Mapping[str, object]] | None = None,
+        desktop_host_supported: bool | Callable[[], bool] | None = None,
     ) -> None:
         self.router = router
         self.tools = tools
@@ -44,6 +47,9 @@ class CapabilityService:
         self.research_enabled = research_enabled
         self.research_secret_configured = research_secret_configured
         self.embeddings_enabled = embeddings_enabled
+        self.perception_enabled = perception_enabled
+        self._browser_availability = browser_availability
+        self._desktop_host_supported = desktop_host_supported
         self._database_probe = (
             database_available if callable(database_available) else lambda: database_available
         )
@@ -100,21 +106,42 @@ class CapabilityService:
                     else ("No eligible model provider is configured.",)
                 ),
             ),
-            self._unavailable(
-                "desktop.ui_automation",
-                "No live Windows UI Automation adapter is included or registered.",
-                requirements=("Windows UI Automation/accessibility adapter",),
+            (
+                self._desktop_capability()
+                if any(spec.name.startswith("uia.") for spec in self.tools.list_specs())
+                else self._unavailable(
+                    "desktop.ui_automation",
+                    "No live Windows UI Automation adapter is included or registered.",
+                    requirements=("Windows UI Automation/accessibility adapter",),
+                )
             ),
-            self._unavailable(
-                "browser.dom",
-                "The optional Playwright adapter is experimental, not API-registered, "
-                "and not validated against a real browser.",
-                requirements=("Browser adapter with scoped profiles and permissions",),
+            (
+                self._browser_capability()
+                if any(spec.name.startswith("browser.") for spec in self.tools.list_specs())
+                else self._unavailable(
+                    "browser.dom",
+                    "The optional Playwright adapter is experimental, not API-registered, "
+                    "and not validated against a real browser.",
+                    requirements=("Browser adapter with scoped profiles and permissions",),
+                )
             ),
-            self._unavailable(
-                "vision.ocr",
-                "No screenshot, OCR, or visual grounding adapter is included in Phase 1.",
-                requirements=("Redacted capture and grounded visual adapter",),
+            (
+                Capability(
+                    name="vision.ocr",
+                    version="1.0",
+                    status=CapabilityStatus.AVAILABLE,
+                    availability="available",
+                    health=HealthStatus.HEALTHY,
+                    requirements=("Redacted capture and grounded visual adapter",),
+                    adapter="adapters.perception.PerceptionHierarchyPipeline",
+                    limitations=(),
+                )
+                if self.perception_enabled
+                else self._unavailable(
+                    "vision.ocr",
+                    "No screenshot, OCR, or visual grounding adapter is included in Phase 1.",
+                    requirements=("Redacted capture and grounded visual adapter",),
+                )
             ),
             *self._voice_capabilities(),
             self._memory_capability(database_available),
@@ -376,6 +403,109 @@ class CapabilityService:
         if any(provider.status is CapabilityStatus.AVAILABLE for provider in providers):
             return CapabilityStatus.AVAILABLE
         return CapabilityStatus.DEGRADED
+
+    def _desktop_capability(self) -> Capability:
+        """Registration is not host support: UIA tools only work on a Windows desktop host.
+
+        The adapter itself fails closed at execution time; this keeps the reported inventory
+        honest as well, so a non-Windows host never advertises live UI Automation.
+        """
+
+        requirements = ("Windows UI Automation/accessibility adapter",)
+        probe = self._desktop_host_supported
+        supported: bool | None = None
+        if probe is not None:
+            try:
+                supported = bool(probe() if callable(probe) else probe)
+            except Exception:
+                supported = False
+        if supported:
+            return Capability(
+                name="desktop.ui_automation",
+                version="1.0",
+                status=CapabilityStatus.AVAILABLE,
+                availability="available",
+                health=HealthStatus.HEALTHY,
+                requirements=requirements,
+                adapter="adapters.windows_uia.WindowsUiaProvider",
+                limitations=("Not validated against a live Windows desktop in this environment.",),
+            )
+        reason = (
+            "The UIA adapter is registered, but this process is not running on a supported "
+            "Windows desktop host."
+            if supported is False
+            else "The UIA adapter is registered, but no host-support check is configured, so "
+            "live Windows automation cannot be reported as available."
+        )
+        return Capability(
+            name="desktop.ui_automation",
+            version="1.0",
+            status=CapabilityStatus.REQUIRES_CONFIGURATION,
+            availability="requires_configuration",
+            health=HealthStatus.UNAVAILABLE,
+            requirements=requirements,
+            adapter="adapters.windows_uia.WindowsUiaProvider",
+            limitations=(reason,),
+        )
+
+    def _browser_capability(self) -> Capability:
+        """Report browser.dom only when a launchable browser actually exists.
+
+        Registration proves configuration, not capability: the Playwright wheel can be
+        installed with no Chromium binary, and `provider.start()` would then fail. When an
+        availability probe is supplied, its per-condition result gates the status.
+        """
+
+        requirements = ("Browser adapter with scoped profiles and permissions",)
+        if self._browser_availability is None:
+            return Capability(
+                name="browser.dom",
+                version="1.0",
+                status=CapabilityStatus.DEGRADED,
+                availability="degraded",
+                health=HealthStatus.DEGRADED,
+                requirements=requirements,
+                adapter="adapters.browser_playwright.PlaywrightBrowserProvider",
+                limitations=("No browser availability probe is configured for this process.",),
+            )
+        try:
+            report = dict(self._browser_availability())
+        except Exception as exc:
+            return Capability(
+                name="browser.dom",
+                version="1.0",
+                status=CapabilityStatus.UNAVAILABLE,
+                availability="unavailable",
+                health=HealthStatus.UNAVAILABLE,
+                requirements=requirements,
+                adapter="adapters.browser_playwright.PlaywrightBrowserProvider",
+                limitations=(f"Browser availability probe failed: {type(exc).__name__}.",),
+            )
+        if report.get("playwright_installed") and report.get("chromium_installed"):
+            return Capability(
+                name="browser.dom",
+                version="1.0",
+                status=CapabilityStatus.AVAILABLE,
+                availability="available",
+                health=HealthStatus.HEALTHY,
+                requirements=requirements,
+                adapter="adapters.browser_playwright.PlaywrightBrowserProvider",
+                limitations=("Not validated against a real browser on this host.",),
+            )
+        reason = str(
+            report.get("isolated_adapter_reason")
+            or "No launchable browser is available for the Playwright adapter."
+        )
+        return Capability(
+            name="browser.dom",
+            version="1.0",
+            status=CapabilityStatus.REQUIRES_CONFIGURATION,
+            availability="requires_configuration",
+            health=HealthStatus.UNAVAILABLE,
+            requirements=requirements,
+            adapter="adapters.browser_playwright.PlaywrightBrowserProvider",
+            limitations=(reason,),
+        )
 
     @staticmethod
     def _unavailable(

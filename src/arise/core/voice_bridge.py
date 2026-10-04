@@ -11,7 +11,7 @@ import asyncio
 import re
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
 from arise.core.contracts import thaw_json
@@ -100,12 +100,124 @@ class TaskEngineVoiceAdapter:
 class VoiceConversationBridge:
     """Validates a tiny provider tool vocabulary and returns runtime-derived task status."""
 
-    def __init__(self, tasks: VoiceTaskPort) -> None:
+    def __init__(
+        self,
+        tasks: VoiceTaskPort,
+        *,
+        informational_responder: Callable[[str, str, str], Awaitable[str | None]] | None = None,
+    ) -> None:
         self.tasks = tasks
+        self.informational_responder = informational_responder
         self._intent_classifier = IntentClassifier()
         self._session_tasks: OrderedDict[str, OrderedDict[str, None]] = OrderedDict()
         self._task_session: OrderedDict[str, str] = OrderedDict()
         self._task_owner: dict[str, str] = {}
+
+    def immediate_acknowledgement(self, user_text: str) -> str:
+        """Return a deterministic local acknowledgement without requiring a cloud round-trip."""
+
+        cleaned = (user_text or "").strip()
+        if not cleaned:
+            return "ARISE is listening."
+        classification = self._intent_classifier.classify(cleaned)
+        if classification.kind is IntentKind.CANCELLATION:
+            return "ARISE received your cancellation request."
+        if classification.kind is IntentKind.CLARIFICATION:
+            return "Could you clarify what you would like ARISE to do?"
+        if classification.may_require_runtime_task and classification.confidence >= 0.75:
+            return "ARISE accepted the task and is working on it."
+        return "ARISE heard your request."
+
+    async def process_utterance(
+        self,
+        user_text: str,
+        *,
+        principal_id: str,
+        session_id: str,
+        locale: str = "en",
+    ) -> dict[str, Any]:
+        """Route a transcribed spoken utterance through IntentClassifier without bypassing policy.
+
+        - Commands and multi-step tasks submit through ``VoiceTaskPort`` (``TaskEngine``).
+        - Questions and casual conversation return an informational answer without task admission.
+        - Ambiguous utterances request clarification without task admission.
+        """
+
+        cleaned = (user_text or "").strip()
+        if not cleaned or len(cleaned) > 16_384:
+            return self._ask_user({"question": "Could you repeat what you would like ARISE to do?"})
+        classification = self._intent_classifier.classify(cleaned)
+        if classification.kind is IntentKind.CANCELLATION:
+            latest_id = self._latest_task_id(session_id, principal_id=principal_id)
+            if latest_id is None:
+                return {
+                    "status": "not_found",
+                    "intent": classification.kind.value,
+                    "verified": False,
+                    "summary": "There is no active voice task in this session to cancel.",
+                    "spoken_response": "There is no active voice task in this session to cancel.",
+                }
+            return await self._cancel_task(
+                {"task_id": latest_id},
+                principal_id=principal_id,
+                session_id=session_id,
+                user_text=cleaned,
+            )
+        if classification.kind is IntentKind.STATUS_REQUEST:
+            return await self._get_status({}, principal_id=principal_id, session_id=session_id)
+        if classification.kind is IntentKind.CLARIFICATION:
+            return self._ask_user(
+                {"question": "What would you like ARISE to know or do? No task was created."}
+            )
+        if classification.may_require_runtime_task:
+            if classification.confidence < 0.75:
+                return self._ask_user(
+                    {
+                        "question": (
+                            "I am not sure whether you want an action. "
+                            "Please rephrase as a direct command or question; no task was created."
+                        )
+                    }
+                )
+            call = LiveToolCall(
+                call_id=str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"arise-voice-utterance:{session_id}:{cleaned}",
+                    )
+                ),
+                name="execute_task",
+                arguments={"text": cleaned},
+            )
+            result = await self._execute_task(
+                call,
+                {"text": cleaned},
+                principal_id=principal_id,
+                session_id=session_id,
+                locale=locale,
+                user_text=cleaned,
+            )
+            result["intent"] = classification.kind.value
+            return result
+        answer: str | None = None
+        if self.informational_responder is not None:
+            try:
+                answer = await self.informational_responder(cleaned, session_id, locale)
+            except Exception:
+                answer = None
+        spoken = (
+            answer.strip()
+            if isinstance(answer, str) and answer.strip()
+            else "No informational model is configured; no task was created."
+        )
+        return {
+            "status": "answered",
+            "intent": classification.kind.value,
+            "verified": False,
+            "task_id": None,
+            "summary": spoken,
+            "spoken_response": spoken,
+        }
 
     async def handle_tool_call(
         self,
@@ -218,7 +330,8 @@ class VoiceConversationBridge:
             "task_id": task.task_id,
             "state": task.status.value,
             "verified": False,
-            "acknowledgement": "ARISE accepted the task and is working on it.",
+            "acknowledgement": self.immediate_acknowledgement(canonical_text),
+            "local_acknowledgement": True,
         }
 
     def _ask_user(self, arguments: Mapping[str, Any]) -> dict[str, Any]:

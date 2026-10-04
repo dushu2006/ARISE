@@ -1197,6 +1197,81 @@ class KokoroSpeechSynthesis(SpeechSynthesisPort):
         return {"tts_active_streams": self._syntheses}
 
 
+class LazyKokoroSpeechSynthesis(SpeechSynthesisPort):
+    """Lazily load Kokoro ONNX model and voices on first synthesis or explicit load()."""
+
+    def __init__(
+        self,
+        *,
+        model_path: Path,
+        voices_path: Path,
+        default_voice_id: str = "af_heart",
+        default_locale: str = "en-us",
+        kokoro_factory: Callable[[str, str], Any] | None = None,
+    ) -> None:
+        self.model_path = Path(model_path).expanduser()
+        self.voices_path = Path(voices_path).expanduser()
+        self.default_voice_id = default_voice_id
+        self.default_locale = default_locale
+        self._kokoro_factory = kokoro_factory
+        self._delegate: KokoroSpeechSynthesis | None = None
+        self._load_lock = asyncio.Lock()
+
+    async def load(self) -> KokoroSpeechSynthesis:
+        async with self._load_lock:
+            if self._delegate is not None:
+                return self._delegate
+            if not self.model_path.is_file() or not self.voices_path.is_file():
+                raise LocalAudioAdapterFailure(
+                    "Kokoro model or voices file was not found",
+                    error_code="KOKORO_MODEL_OR_VOICE_FILE_NOT_FOUND",
+                )
+            factory = self._kokoro_factory
+            if factory is None:
+                try:
+                    from kokoro_onnx import Kokoro
+                except ImportError:
+                    raise LocalAudioAdapterFailure(
+                        "install the optional voice-local extra for local TTS",
+                        error_code="KOKORO_DEPENDENCY_NOT_INSTALLED",
+                    ) from None
+                factory = Kokoro
+            try:
+                kokoro = await asyncio.to_thread(
+                    factory, str(self.model_path), str(self.voices_path)
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise LocalAudioAdapterFailure(
+                    "Kokoro local model initialization failed",
+                    error_code="KOKORO_MODEL_LOAD_FAILED",
+                ) from None
+            self._delegate = KokoroSpeechSynthesis(
+                kokoro,
+                default_voice_id=self.default_voice_id,
+                default_locale=self.default_locale,
+            )
+            return self._delegate
+
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        locale: str | None = None,
+        voice_id: str | None = None,
+        correlation_id: str,
+    ) -> AsyncIterator[AudioChunk]:
+        delegate = await self.load()
+        async for chunk in delegate.synthesize(
+            text,
+            locale=locale,
+            voice_id=voice_id,
+            correlation_id=correlation_id,
+        ):
+            yield chunk
+
+
 class SoundDeviceAudioPlayback:
     """Interruptible PortAudio output with device discovery and sample-rate fallback."""
 

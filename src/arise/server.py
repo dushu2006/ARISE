@@ -42,10 +42,21 @@ from arise.adapters.brave_research import (
     BraveWebResearchAdapter,
     ResearchProviderUnavailable,
 )
+from arise.adapters.browser_playwright import (
+    PlaywrightBrowserProvider,
+    register_playwright_tools,
+)
 from arise.adapters.diagnostics import EnvironmentDiscovery
 from arise.adapters.gemini_live import GeminiLiveProvider
 from arise.adapters.openai_compatible import OpenAICompatibleProvider
 from arise.adapters.openai_embeddings import OpenAICompatibleEmbeddingAdapter
+from arise.adapters.perception import (
+    CoordinateFallbackSafetyGate,
+    OcrPerceptionAdapter,
+    PerceptionHierarchyPipeline,
+    ScreenCaptureAdapter,
+    VisionGroundingAdapter,
+)
 from arise.adapters.secrets import (
     CompositeSecretProvider,
     EnvironmentSecretProvider,
@@ -59,9 +70,15 @@ from arise.adapters.sqlite import (
     SQLiteTaskRepository,
 )
 from arise.adapters.unavailable import UnavailableEnvironment
+from arise.adapters.windows_uia import (
+    Win32UiaBackend,
+    WindowsUiaProvider,
+    register_windows_uia_tools,
+)
 from arise.config.settings import AppSettings, get_settings, validate_api_token
 from arise.core.capabilities import CapabilityService
-from arise.core.contracts import utc_now
+from arise.core.computer import Rect
+from arise.core.contracts import ActionContract, ObservationLease, utc_now
 from arise.core.engine import (
     TaskEngine,
     TaskEngineConfig,
@@ -75,6 +92,7 @@ from arise.core.events import EventEnvelope, EventSeverity
 from arise.core.extensions import (
     ContextQuery,
     MemoryConsentError,
+    MemoryDisabledError,
     MemoryEntry,
     MemoryKind,
     MemoryRecord,
@@ -98,6 +116,13 @@ from arise.core.models import (
     TaskSnapshot,
     UserRequest,
     VoiceStatusSnapshot,
+)
+from arise.core.personalization import (
+    LocalDeterministicEmbeddingAdapter,
+    PersonalizationStore,
+    ProceduralMemoryStore,
+    ShortTermConversationMemory,
+    WorkingMemoryStore,
 )
 from arise.core.planner import GatewayTaskPlanner
 from arise.core.policy import PolicyEngine
@@ -181,6 +206,9 @@ class MemoryContentRequest(BaseModel):
     kind: MemoryKind = MemoryKind.SEMANTIC
     expires_at: datetime
     source_task_id: str | None = Field(default=None, max_length=128)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    sensitivity: Literal["public", "internal", "personal", "restricted"] = "internal"
+    expiration_policy: Literal["session", "ttl", "pinned"] = "ttl"
 
     @field_validator("text")
     @classmethod
@@ -203,6 +231,78 @@ class MemoryConsentRequest(MemoryContentRequest):
 
 class MemoryWriteRequest(MemoryContentRequest):
     consent_reference: str = Field(min_length=32, max_length=128)
+
+
+class MemoryUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str | None = Field(default=None, min_length=1, max_length=16_384)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    sensitivity: Literal["public", "internal", "personal", "restricted"] | None = None
+    expires_at: datetime | None = None
+
+
+class MemorySettingsToggleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+
+
+class PersonalizationUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preferred_browser: str | None = Field(default=None, max_length=64)
+    preferred_apps: dict[str, str] | None = None
+    preferred_response_style: Literal["concise", "balanced", "detailed"] | None = None
+    preferred_tts_voice: str | None = Field(default=None, max_length=128)
+    preferred_tts_speed: float | None = Field(default=None, ge=0.5, le=2.0)
+    approved_workflows: tuple[str, ...] | None = None
+
+
+class ProceduralWorkflowCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=256)
+    description: str = Field(min_length=1, max_length=2048)
+    goal_pattern: str = Field(min_length=1, max_length=2048)
+    steps: tuple[dict[str, Any], ...] = Field(min_length=1, max_length=64)
+    provenance_task_id: str | None = Field(default=None, max_length=128)
+    approved_by_user: bool = False
+
+
+class ProceduralWorkflowUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    description: str | None = Field(default=None, min_length=1, max_length=2048)
+    goal_pattern: str | None = Field(default=None, min_length=1, max_length=2048)
+    steps: tuple[dict[str, Any], ...] | None = Field(default=None, min_length=1, max_length=64)
+    approved_by_user: bool | None = None
+
+
+class WorkflowAdaptRequest(BaseModel):
+    """Optional preview inputs for re-grounding a stored workflow into a fresh plan proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    goal: str | None = Field(default=None, min_length=1, max_length=2048)
+    observed_facts: dict[str, bool | int | float | str | None] = Field(
+        default_factory=dict, max_length=64
+    )
+
+
+class VoiceUtteranceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=16_384)
+    speak_response: bool = True
+
+
+class PerceptionResolveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1, max_length=1024)
+    risk_level: int = Field(default=0, ge=0, le=4)
+    capture_screen_if_needed: bool = False
 
 
 class MemoryClearRequest(BaseModel):
@@ -250,6 +350,9 @@ class MemoryRecordResponse(BaseModel):
     created_at: datetime
     expires_at: datetime
     source_task_id: str | None
+    confidence: float = 1.0
+    sensitivity: str = "internal"
+    expiration_policy: str = "ttl"
 
     @classmethod
     def from_record(cls, record: MemoryRecord) -> MemoryRecordResponse:
@@ -261,6 +364,9 @@ class MemoryRecordResponse(BaseModel):
             created_at=record.created_at,
             expires_at=record.expires_at,
             source_task_id=record.source_task_id,
+            confidence=record.confidence,
+            sensitivity=record.sensitivity,
+            expiration_policy=record.expiration_policy,
         )
 
 
@@ -271,6 +377,10 @@ class ServerServices:
     tasks: SQLiteTaskRepository
     sessions: SessionRepository
     memory: SQLiteMemoryRepository
+    personalization: PersonalizationStore
+    procedural_memory: ProceduralMemoryStore
+    working_memory: WorkingMemoryStore
+    short_term_memory: ShortTermConversationMemory
     embeddings: OpenAICompatibleEmbeddingAdapter | None
     event_store: PublishingEventStore
     broker: EventBroker
@@ -285,7 +395,47 @@ class ServerServices:
     voice_model: Any | None
     api_token: str | None
     api_token_file: Path | None
+    uia_provider: WindowsUiaProvider | None = None
+    browser_provider: PlaywrightBrowserProvider | None = None
+    perception: PerceptionHierarchyPipeline | None = None
+    screen_capture: ScreenCaptureAdapter | None = None
     principal_id: str = "local-user"
+
+
+class CompositeEnvironment:
+    """Route environment observations and freshness checks to registered domain providers."""
+
+    def __init__(
+        self,
+        *,
+        uia: WindowsUiaProvider | None = None,
+        browser: PlaywrightBrowserProvider | None = None,
+        fallback: UnavailableEnvironment | None = None,
+    ) -> None:
+        self.uia = uia
+        self.browser = browser
+        self.fallback = fallback or UnavailableEnvironment()
+
+    async def observe(self, action: ActionContract) -> ObservationLease:
+        if action.tool_name.startswith("uia.") and self.uia is not None:
+            return await self.uia.observe(action)
+        if action.tool_name.startswith("browser.") and self.browser is not None:
+            return await self.browser.observe(action)
+        return await self.fallback.observe(action)
+
+    async def is_current(self, lease: ObservationLease) -> bool:
+        if self.uia is not None and (
+            lease.lease_id in getattr(self.uia, "_observations", {})
+            or lease.facts.get("uia_domain") == "windows"
+        ):
+            return await self.uia.is_current(lease)
+        if self.browser is not None and (
+            lease.lease_id in getattr(self.browser, "_observations", {})
+            or "page_id" in lease.facts
+            or "browser_url" in lease.facts
+        ):
+            return await self.browser.is_current(lease)
+        return await self.fallback.is_current(lease)
 
 
 def _load_or_create_token(settings: AppSettings) -> tuple[str | None, Path | None]:
@@ -400,6 +550,7 @@ def _build_voice_runtime(
     *,
     secret_provider: CompositeSecretProvider,
     engine: TaskEngine,
+    router: ModelRouter | None = None,
     event_store: PublishingEventStore,
     gemini_opted_in: bool,
     gemini_secret_configured: bool,
@@ -433,6 +584,7 @@ def _build_voice_runtime(
 
     try:
         from arise.adapters.audio_local import (
+            LazyKokoroSpeechSynthesis,
             SoundDeviceAudioPlayback,
             SoundDeviceMicrophone,
             VoskModel,
@@ -442,6 +594,63 @@ def _build_voice_runtime(
         )
 
         local_model = VoskModel(model_path, locale=settings.voice.locale)
+        speech_synthesizer = None
+        if (
+            settings.voice.kokoro_model_path is not None
+            and settings.voice.kokoro_voices_path is not None
+        ):
+            speech_synthesizer = LazyKokoroSpeechSynthesis(
+                model_path=settings.voice.kokoro_model_path,
+                voices_path=settings.voice.kokoro_voices_path,
+                default_voice_id=settings.voice.tts_voice,
+                default_locale=settings.voice.locale,
+            )
+
+        async def _answer_voice_question(
+            question_text: str, session_id: str, locale: str
+        ) -> str | None:
+            del locale
+            if router is None or not router.providers():
+                return None
+            request_id = str(uuid.uuid4())
+            req = ModelRequest(
+                request_id=request_id,
+                correlation_id=request_id,
+                session_id=session_id,
+                role=ModelRole.FAST_REASONER,
+                messages=(
+                    ModelMessage(
+                        role="system",
+                        content=(
+                            "You are ARISE's voice informational assistant. Answer the spoken "
+                            "question concisely. You have no tools and cannot perform or claim "
+                            "any desktop or browser action."
+                        ),
+                    ),
+                    ModelMessage(
+                        role="user",
+                        content=engine.redactor.redact(question_text),
+                    ),
+                ),
+                model_id=settings.model.model_id,
+                max_output_tokens=512,
+                temperature=0.2,
+                timeout_seconds=settings.model.request_timeout_seconds,
+                stream=False,
+            )
+            sel = ModelSelectionRequest(
+                role=ModelRole.FAST_REASONER,
+                task_type="voice_informational_answer",
+                complexity="low",
+                latency_budget_ms=min(
+                    600_000, max(1, int(settings.model.request_timeout_seconds * 1000))
+                ),
+                context_tokens=4096,
+                privacy="cloud_allowed" if router.allow_cloud else "local_only",
+            )
+            response = await router.complete(req, selection=sel)
+            return engine.redactor.redact(response.content)
+
         provider = GeminiLiveProvider(
             secret_provider=secret_provider,
             api_key_secret_name=settings.voice.api_key_secret_name,
@@ -472,9 +681,14 @@ def _build_voice_runtime(
                 minimum_asr_confidence=settings.voice.minimum_asr_confidence,
                 locale=settings.voice.locale,
                 microphone_device_id=settings.voice.microphone_device_id,
+                enable_local_tts_acknowledgement=settings.voice.enable_local_tts_acknowledgement,
             ),
-            conversation_bridge=VoiceConversationBridge(TaskEngineVoiceAdapter(engine)),
+            conversation_bridge=VoiceConversationBridge(
+                TaskEngineVoiceAdapter(engine),
+                informational_responder=_answer_voice_question,
+            ),
             speech_recognizer=VoskSpeechRecognizer(local_model),
+            speech_synthesizer=speech_synthesizer,
             principal_id="local-user",
             event_sink=_VoiceEventJournal(event_store),
         )
@@ -550,11 +764,65 @@ def _build_services(settings: AppSettings) -> ServerServices:
             _LOG.warning(
                 "Cloud embeddings ignored because all memory/model egress opt-ins are not set"
             )
+    embedding_port = (
+        embeddings
+        if embeddings is not None
+        else (
+            LocalDeterministicEmbeddingAdapter()
+            if settings.memory.enabled and settings.embeddings.use_local_fallback
+            else None
+        )
+    )
     memory_repository = SQLiteMemoryRepository(
         database,
         max_records_per_principal=settings.memory.max_records_per_principal,
-        embedding=embeddings,
+        embedding=embedding_port,
     )
+    personalization_store = PersonalizationStore(database)
+    procedural_store = ProceduralMemoryStore(database)
+    working_memory_store = WorkingMemoryStore()
+    short_term_memory_store = ShortTermConversationMemory()
+    unsafe_regions = tuple(Rect(*bounds) for bounds in settings.perception.unsafe_regions)
+    uia_provider: WindowsUiaProvider | None = None
+    if settings.desktop.enabled:
+        uia_provider = WindowsUiaProvider(
+            backend=Win32UiaBackend(),
+            secret_provider=secret_provider,
+            max_tree_depth=settings.desktop.max_tree_depth,
+            max_tree_nodes=settings.desktop.max_nodes,
+            allow_coordinate_fallback=settings.perception.allow_coordinate_fallback,
+            unsafe_regions=unsafe_regions,
+        )
+        register_windows_uia_tools(tools, uia_provider)
+    browser_provider: PlaywrightBrowserProvider | None = None
+    if settings.browser.enabled and settings.browser.allowed_domains:
+        browser_provider = PlaywrightBrowserProvider(
+            allowed_domains=tuple(settings.browser.allowed_domains),
+            allow_private_network=settings.browser.allow_private_network,
+            secret_provider=secret_provider,
+        )
+        register_playwright_tools(tools, browser_provider)
+    screen_capture: ScreenCaptureAdapter | None = None
+    perception: PerceptionHierarchyPipeline | None = None
+    if settings.perception.enabled:
+        screen_capture = ScreenCaptureAdapter(
+            displays_fn=uia_provider.displays if uia_provider is not None else None,
+            windows_fn=uia_provider.list_windows if uia_provider is not None else None,
+            foreground_window_fn=(
+                uia_provider.foreground_window if uia_provider is not None else None
+            ),
+        )
+        ocr_adapter = OcrPerceptionAdapter(model_router=router)
+        vision_grounding = VisionGroundingAdapter(
+            model_router=router,
+            minimum_confidence=settings.perception.minimum_vision_confidence,
+        )
+        perception = PerceptionHierarchyPipeline(
+            ocr=ocr_adapter,
+            vision=vision_grounding,
+            unsafe_regions=unsafe_regions,
+        )
+
     planner = UnavailablePlanner()
     provider: OpenAICompatibleProvider | None = None
     planner_privacy = "local_only"
@@ -612,10 +880,20 @@ def _build_services(settings: AppSettings) -> ServerServices:
             timeout_seconds=settings.model.request_timeout_seconds,
             memory=memory_repository if settings.memory.enabled else None,
             research=research,
+            personalization=personalization_store if settings.memory.enabled else None,
+            procedural_memory=procedural_store if settings.memory.enabled else None,
             allow_memory_context_to_cloud=settings.memory.allow_cloud_context,
         )
 
-    environment = UnavailableEnvironment()
+    environment = (
+        CompositeEnvironment(
+            uia=uia_provider,
+            browser=browser_provider,
+            fallback=UnavailableEnvironment(),
+        )
+        if (uia_provider is not None or browser_provider is not None)
+        else UnavailableEnvironment()
+    )
     runtime = AgentRuntime(
         tasks=task_repository,
         events=event_store,
@@ -647,6 +925,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         settings,
         secret_provider=secret_provider,
         engine=engine,
+        router=router,
         event_store=event_store,
         gemini_opted_in=gemini_opted_in,
         gemini_secret_configured=gemini_secret_configured,
@@ -665,7 +944,17 @@ def _build_services(settings: AppSettings) -> ServerServices:
         memory_enabled=settings.memory.enabled,
         research_enabled=research_opted_in,
         research_secret_configured=research_secret_configured,
-        embeddings_enabled=embeddings is not None and embeddings_secret_configured,
+        embeddings_enabled=(
+            (embeddings is not None and embeddings_secret_configured)
+            or (settings.memory.enabled and settings.embeddings.use_local_fallback)
+        ),
+        perception_enabled=perception is not None,
+        browser_availability=(
+            browser_provider.discover_browsers if browser_provider is not None else None
+        ),
+        desktop_host_supported=(
+            (lambda: sys.platform == "win32") if uia_provider is not None else None
+        ),
     )
     health = HealthService(
         app_name=settings.app_name,
@@ -683,6 +972,10 @@ def _build_services(settings: AppSettings) -> ServerServices:
         tasks=task_repository,
         sessions=session_repository,
         memory=memory_repository,
+        personalization=personalization_store,
+        procedural_memory=procedural_store,
+        working_memory=working_memory_store,
+        short_term_memory=short_term_memory_store,
         embeddings=embeddings,
         event_store=event_store,
         broker=broker,
@@ -697,6 +990,10 @@ def _build_services(settings: AppSettings) -> ServerServices:
         voice_model=voice_model,
         api_token=token,
         api_token_file=token_file,
+        uia_provider=uia_provider,
+        browser_provider=browser_provider,
+        perception=perception,
+        screen_capture=screen_capture,
     )
 
 
@@ -784,6 +1081,35 @@ class RequestSizeLimitMiddleware:
 
 def _conversation_turn_id(session_id: str, request_id: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"arise:{session_id}:{request_id}"))
+
+
+def _remember_short_term_turn(
+    services: ServerServices,
+    *,
+    principal: str,
+    session_id: str,
+    request_id: str,
+    speaker: str,
+    text: str,
+    task_id: str | None = None,
+) -> None:
+    """Mirror one exchange into bounded in-process short-term memory.
+
+    The store redacts and truncates each turn itself, and nothing here grants execution
+    authority: retrieval is only ever injected as explicitly untrusted context.
+    """
+
+    services.short_term_memory.append_turn(
+        principal_id=principal,
+        turn=ConversationTurn(
+            turn_id=_conversation_turn_id(session_id, f"{request_id}:{speaker}"),
+            session_id=session_id,
+            speaker=speaker,
+            text=services.engine.redactor.redact(text),
+            task_id=task_id,
+            metadata={"source": "interaction"},
+        ),
+    )
 
 
 def _ensure_request_session(
@@ -969,7 +1295,11 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                                 if services.embeddings is not None:
                                     await services.embeddings.close()
                             finally:
-                                services.database.close()
+                                try:
+                                    if services.browser_provider is not None:
+                                        await services.browser_provider.close()
+                                finally:
+                                    services.database.close()
 
     app = FastAPI(
         title=chosen_settings.app_name,
@@ -1111,6 +1441,19 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="Voice listening is not configured")
         return await hub.stop_listening()
 
+    @app.post("/api/v1/voice/utterance", tags=["voice"])
+    async def process_voice_utterance(
+        body: VoiceUtteranceRequest,
+        _: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        hub = services.voice_hub
+        if hub is None:
+            raise HTTPException(status_code=503, detail="Voice runtime is not configured")
+        return await hub.process_spoken_utterance(
+            body.text,
+            speak_response=body.speak_response,
+        )
+
     @app.get("/api/v1/diagnostics", response_model=DiagnosticsSnapshot, tags=["diagnostics"])
     async def diagnostics(_: str = Depends(require_principal)) -> DiagnosticsSnapshot:
         return await asyncio.to_thread(services.health.diagnostics)
@@ -1176,6 +1519,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             expires_at=body.expires_at,
             source_task_id=body.source_task_id,
             kind=body.kind,
+            confidence=body.confidence,
+            sensitivity=body.sensitivity,
+            expiration_policy=body.expiration_policy,
         )
         reference, consent_expiry = await services.memory.issue_write_consent(
             proposed,
@@ -1198,13 +1544,16 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             expires_at=body.expires_at,
             source_task_id=body.source_task_id,
             kind=body.kind,
+            confidence=body.confidence,
+            sensitivity=body.sensitivity,
+            expiration_policy=body.expiration_policy,
         )
         try:
             record_id = await services.memory.store(entry)
-        except MemoryConsentError as exc:
+        except (MemoryConsentError, MemoryDisabledError) as exc:
             raise HTTPException(
                 status_code=403,
-                detail="Memory consent is missing, expired, used, or does not match this record",
+                detail="Memory consent is missing, expired, used, or memory is disabled",
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -1214,6 +1563,249 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 status_code=404, detail="Memory record expired before it could be read"
             )
         return MemoryRecordResponse.from_record(record)
+
+    @app.patch("/api/v1/memory/{record_id}", response_model=MemoryRecordResponse)
+    async def update_memory(
+        record_id: str,
+        body: MemoryUpdateRequest,
+        principal: str = Depends(require_principal),
+    ) -> MemoryRecordResponse:
+        require_memory_enabled()
+        if body.expires_at is not None:
+            validate_memory_expiry(body.expires_at)
+        try:
+            updated = await services.memory.update_record(
+                principal_id=principal,
+                record_id=record_id,
+                text=body.text,
+                confidence=body.confidence,
+                sensitivity=body.sensitivity,
+                expires_at=body.expires_at,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Memory record not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return MemoryRecordResponse.from_record(updated)
+
+    @app.get("/api/v1/memory/settings")
+    async def get_memory_settings(
+        principal: str = Depends(require_principal),
+    ) -> dict[str, bool]:
+        require_memory_enabled()
+        return {"enabled": services.memory.is_enabled(principal_id=principal)}
+
+    @app.put("/api/v1/memory/settings")
+    async def update_memory_settings(
+        body: MemorySettingsToggleRequest,
+        principal: str = Depends(require_principal),
+    ) -> dict[str, bool]:
+        require_memory_enabled()
+        enabled = services.memory.set_enabled(principal_id=principal, enabled=body.enabled)
+        return {"enabled": enabled}
+
+    @app.get("/api/v1/personalization")
+    async def get_personalization(
+        principal: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        return services.personalization.get_profile(principal_id=principal).to_dict()
+
+    @app.put("/api/v1/personalization")
+    async def update_personalization(
+        body: PersonalizationUpdateRequest,
+        principal: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        try:
+            updated = services.personalization.update_profile(
+                principal_id=principal,
+                preferred_browser=body.preferred_browser,
+                preferred_apps=body.preferred_apps,
+                preferred_response_style=body.preferred_response_style,
+                preferred_tts_voice=body.preferred_tts_voice,
+                preferred_tts_speed=body.preferred_tts_speed,
+                approved_workflows=body.approved_workflows,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return updated.to_dict()
+
+    @app.delete("/api/v1/personalization")
+    async def reset_personalization(
+        principal: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        return services.personalization.reset_profile(principal_id=principal).to_dict()
+
+    @app.get("/api/v1/workflows")
+    async def list_procedural_workflows(
+        principal: str = Depends(require_principal),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        workflows = services.procedural_memory.list_workflows(principal_id=principal, limit=limit)
+        return {"workflows": [wf.to_dict() for wf in workflows]}
+
+    @app.post("/api/v1/workflows", status_code=201)
+    async def create_procedural_workflow(
+        body: ProceduralWorkflowCreateRequest,
+        principal: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        from arise.core.models import PlanStep
+
+        try:
+            parsed_steps = tuple(PlanStep.model_validate(step) for step in body.steps)
+            wf = services.procedural_memory.save_workflow(
+                principal_id=principal,
+                name=body.name,
+                description=body.description,
+                goal_pattern=body.goal_pattern,
+                steps=parsed_steps,
+                provenance_task_id=body.provenance_task_id,
+                approved_by_user=body.approved_by_user,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return wf.to_dict()
+
+    @app.patch("/api/v1/workflows/{workflow_id}")
+    async def update_procedural_workflow(
+        workflow_id: str,
+        body: ProceduralWorkflowUpdateRequest,
+        principal: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        from arise.core.models import PlanStep
+
+        try:
+            parsed_steps = (
+                tuple(PlanStep.model_validate(step) for step in body.steps)
+                if body.steps is not None
+                else None
+            )
+            wf = services.procedural_memory.update_workflow(
+                principal_id=principal,
+                workflow_id=workflow_id,
+                name=body.name,
+                description=body.description,
+                goal_pattern=body.goal_pattern,
+                steps=parsed_steps,
+                approved_by_user=body.approved_by_user,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Workflow not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return wf.to_dict()
+
+    @app.delete("/api/v1/workflows/{workflow_id}")
+    async def delete_procedural_workflow(
+        workflow_id: str,
+        principal: str = Depends(require_principal),
+    ) -> dict[str, bool]:
+        if not services.procedural_memory.delete_workflow(
+            principal_id=principal, workflow_id=workflow_id
+        ):
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        return {"deleted": True}
+
+    @app.post("/api/v1/workflows/{workflow_id}/adapt")
+    async def adapt_procedural_workflow(
+        workflow_id: str,
+        principal: str = Depends(require_principal),
+        body: WorkflowAdaptRequest | None = None,
+    ) -> dict[str, Any]:
+        """Re-ground a stored workflow into an untrusted plan proposal.
+
+        This endpoint never admits a task. Every returned step still has to pass
+        `TaskEngine` admission, `PolicyEngine`, `ResourceManager`, execution, and
+        the verifier, so a saved playbook can never bypass fresh grounding.
+        """
+
+        workflow = services.procedural_memory.get_workflow(
+            principal_id=principal, workflow_id=workflow_id
+        )
+        if workflow is None:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        request = body or WorkflowAdaptRequest()
+        observed_facts = dict(request.observed_facts)
+        stale_steps = services.procedural_memory.detect_stale_workflow_steps(
+            workflow,
+            observed_facts,
+        )
+        goal = request.goal or workflow.goal_pattern or workflow.name
+        preview = services.procedural_memory.adapt_workflow_to_task_plan(
+            workflow,
+            task_id=f"preview-{workflow.workflow_id}-v{workflow.version}",
+            goal=goal,
+        )
+        return {
+            "workflow_id": workflow.workflow_id,
+            "workflow_version": workflow.version,
+            "observed_facts_used": len(observed_facts),
+            "stale_steps": [
+                {"step_id": step_id, "reason": reason} for step_id, reason in stale_steps
+            ],
+            "plan": preview.model_dump(mode="json"),
+            "authority": "untrusted_proposal_requires_policy_and_verifier",
+        }
+
+    @app.post("/api/v1/perception/resolve")
+    async def resolve_perception_target(
+        body: PerceptionResolveRequest,
+        _: str = Depends(require_principal),
+    ) -> dict[str, Any]:
+        from arise.core.computer import TargetQuery
+
+        if services.perception is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Perception hierarchy is not enabled by configuration",
+            )
+        unsafe_regions = tuple(
+            Rect(*bounds) for bounds in chosen_settings.perception.unsafe_regions
+        )
+        structural_candidates = []
+        if services.browser_provider is not None:
+            page_id = services.browser_provider.default_page_id
+            if page_id is not None:
+                try:
+                    structural_candidates.extend(await services.browser_provider.inspect(page_id))
+                except Exception:
+                    pass
+        if services.uia_provider is not None:
+            try:
+                foreground = await services.uia_provider.foreground_window()
+                if foreground is not None:
+                    structural_candidates.extend(
+                        await services.uia_provider.inspect(foreground.window_id)
+                    )
+            except Exception:
+                pass
+        image = None
+        if body.capture_screen_if_needed and services.screen_capture is not None:
+            try:
+                image = await services.screen_capture.capture_desktop()
+            except Exception:
+                image = None
+        resolution = await services.perception.resolve_hierarchical(
+            TargetQuery(
+                semantic_name=body.query,
+                allow_coordinate_fallback=chosen_settings.perception.allow_coordinate_fallback,
+            ),
+            structural_candidates=tuple(structural_candidates),
+            screenshot=image,
+            coordinate_safety=CoordinateFallbackSafetyGate(
+                allow_coordinate_fallback=chosen_settings.perception.allow_coordinate_fallback,
+                unsafe_regions=unsafe_regions,
+            ),
+        )
+        return {
+            "status": resolution.status.value,
+            "reason": resolution.reason,
+            "target": (
+                resolution.selected.descriptor.identity.to_dict()
+                if resolution.selected is not None
+                else None
+            ),
+            "authority": "untrusted_grounding_requires_policy_and_verifier",
+        }
 
     @app.get("/api/v1/memory", response_model=tuple[MemoryRecordResponse, ...])
     async def list_memories(
@@ -1348,10 +1940,30 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         response,
                         redactor=services.engine.redactor,
                     )
-                except Exception:
+                    if chosen_settings.memory.enabled:
+                        _remember_short_term_turn(
+                            services,
+                            principal=principal,
+                            session_id=session.session_id,
+                            request_id=request_body.request_id,
+                            speaker="user",
+                            text=request_body.text,
+                        )
+                        if response.answer:
+                            _remember_short_term_turn(
+                                services,
+                                principal=principal,
+                                session_id=session.session_id,
+                                request_id=request_body.request_id,
+                                speaker="assistant",
+                                text=response.answer,
+                            )
+                except Exception as exc:
                     _LOG.warning(
-                        "Text interaction was not fully persisted for request %s",
+                        "Text interaction was not fully persisted for request %s (%s: %s)",
                         request_body.request_id,
+                        type(exc).__name__,
+                        exc,
                     )
             return response
 
@@ -1484,8 +2096,32 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         metadata={"source": RequestSource.TEXT.value},
                     )
                 )
-            except Exception:
-                _LOG.warning("Conversation turn was not persisted for task %s", task.task_id)
+                if chosen_settings.memory.enabled:
+                    _remember_short_term_turn(
+                        services,
+                        principal=principal,
+                        session_id=session.session_id,
+                        request_id=request_body.request_id,
+                        speaker="user",
+                        text=request_body.text,
+                        task_id=task.task_id,
+                    )
+                    services.working_memory.upsert(
+                        task_id=task.task_id,
+                        principal_id=principal,
+                        goal=task.goal,
+                        current_step_id=None,
+                        observations={"session_id": session.session_id},
+                        expires_at=utc_now()
+                        + timedelta(seconds=services.working_memory.default_ttl_seconds),
+                    )
+            except Exception as exc:
+                _LOG.warning(
+                    "Conversation context was not persisted for task %s (%s: %s)",
+                    task.task_id,
+                    type(exc).__name__,
+                    exc,
+                )
             return TextInteractionResponse(
                 outcome="task",
                 intent=classification.kind.value,

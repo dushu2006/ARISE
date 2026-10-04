@@ -369,6 +369,65 @@ def _domain_allowed(hostname: str, domains: tuple[str, ...]) -> bool:
     return any(host == domain or host.endswith(f".{domain}") for domain in domains)
 
 
+_WORD_TOKEN = re.compile(r"[a-z0-9]{2,}")
+_NUMERIC_FACT = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(%|percent|gb|mb|ghz|ms|usd|dollars|years|days)?\b"
+)
+_NEGATION_WORDS = frozenset(
+    {"not", "never", "no", "false", "disabled", "unsupported", "deprecated"}
+)
+
+
+def _compute_relevance(query: str, title: str, text: str, *, rank_index: int, total: int) -> float:
+    rank_score = max(0.0, min(1.0, 1.0 - rank_index / max(1, total)))
+    query_terms = set(_WORD_TOKEN.findall(query.lower()))
+    if not query_terms:
+        return rank_score
+    doc_terms = set(_WORD_TOKEN.findall(f"{title} {text}".lower()))
+    overlap = len(query_terms & doc_terms) / len(query_terms)
+    return round(max(0.0, min(1.0, 0.6 * rank_score + 0.4 * overlap)), 4)
+
+
+def detect_conflicting_sources(
+    contexts: Sequence[RetrievedContext],
+) -> tuple[RetrievedContext, ...]:
+    """Identify numeric or negation-polarity disagreements across retrieved sources."""
+
+    if len(contexts) < 2:
+        return tuple(contexts)
+    extracted: list[tuple[set[str], set[tuple[str, str]], bool]] = []
+    for ctx in contexts:
+        lower = ctx.text.lower()
+        words = set(_WORD_TOKEN.findall(lower))
+        numbers = {(m.group(1), m.group(2) or "") for m in _NUMERIC_FACT.finditer(lower)}
+        has_negation = bool(words & _NEGATION_WORDS)
+        extracted.append((words, numbers, has_negation))
+
+    updated: list[RetrievedContext] = []
+    for i, ctx in enumerate(contexts):
+        words_i, nums_i, neg_i = extracted[i]
+        conflicts: list[str] = []
+        for j, other in enumerate(contexts):
+            if i == j or other.source_id == ctx.source_id:
+                continue
+            words_j, nums_j, neg_j = extracted[j]
+            shared_topic = len(words_i & words_j) >= 2
+            if not shared_topic:
+                continue
+            # Numeric conflict on shared unit or general numeric claim
+            numeric_conflict = bool(nums_i and nums_j and nums_i != nums_j)
+            polarity_conflict = neg_i != neg_j
+            if numeric_conflict or polarity_conflict:
+                conflicts.append(other.source_id)
+        if conflicts:
+            from dataclasses import replace
+
+            updated.append(replace(ctx, conflicts_with=tuple(dict.fromkeys(conflicts))))
+        else:
+            updated.append(ctx)
+    return tuple(updated)
+
+
 class BraveWebResearchAdapter(WebResearchPort):
     """Brave Search API client with bounded, provenance-preserving source extraction."""
 
@@ -492,7 +551,14 @@ class BraveWebResearchAdapter(WebResearchPort):
                 text = snippet
             if not text.strip():
                 continue
+            relevance = _compute_relevance(query.query, title, text, rank_index=index, total=count)
+            if relevance < query.min_relevance:
+                continue
+            published_at = self._bounded_text(hit.get("page_age") or hit.get("age"), 128) or None
+            citation = f"[{len(contexts) + 1}] {title} ({source_url})"[:1024]
             provenance = f"Brave Search · {title} · {host}"
+            if published_at:
+                provenance = f"{provenance} · {published_at}"
             contexts.append(
                 RetrievedContext(
                     source=ContextSource.WEB_RESEARCH,
@@ -500,10 +566,13 @@ class BraveWebResearchAdapter(WebResearchPort):
                     text=text[:MAX_CONTEXT_TEXT_CHARS],
                     provenance=provenance[:2048],
                     retrieved_at=datetime.now(UTC),
-                    relevance=max(0.0, min(1.0, 1.0 - index / max(1, count))),
+                    relevance=relevance,
+                    title=title,
+                    published_at=published_at,
+                    citation=citation,
                 )
             )
-        return tuple(contexts)
+        return detect_conflicting_sources(contexts)
 
     @staticmethod
     def _bounded_text(value: object, maximum: int) -> str:

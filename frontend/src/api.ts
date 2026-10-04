@@ -6,6 +6,8 @@ import type {
   MemoryRecord,
   MemorySearchResult,
   MemoryWriteDraft,
+  PersonalizationProfile,
+  ProceduralWorkflowSummary,
   Session,
   TaskDetail,
   TaskHistoryClearResult,
@@ -122,6 +124,44 @@ export class AriseApi {
       body: JSON.stringify({ confirm: true }),
     });
     return result.deleted;
+  }
+
+  async getMemorySettings(): Promise<{ enabled: boolean }> {
+    return this.get<{ enabled: boolean }>('/memory/settings');
+  }
+
+  async updateMemorySettings(enabled: boolean): Promise<{ enabled: boolean }> {
+    return this.fetchJson<{ enabled: boolean }>(`${API_PREFIX}/memory/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    });
+  }
+
+  async getPersonalization(): Promise<PersonalizationProfile> {
+    return this.get<PersonalizationProfile>('/personalization');
+  }
+
+  async updatePersonalization(
+    patch: Partial<Omit<PersonalizationProfile, 'principal_id' | 'updated_at'>>,
+  ): Promise<PersonalizationProfile> {
+    return this.fetchJson<PersonalizationProfile>(`${API_PREFIX}/personalization`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+  }
+
+  async listWorkflows(): Promise<ProceduralWorkflowSummary[]> {
+    const res = await this.get<{ workflows: ProceduralWorkflowSummary[] }>('/workflows');
+    return res.workflows;
+  }
+
+  async deleteWorkflow(workflowId: string): Promise<void> {
+    await this.fetchJson<{ deleted: boolean }>(
+      `${API_PREFIX}/workflows/${encodeURIComponent(workflowId)}`,
+      { method: 'DELETE' },
+    );
   }
 
   async listTasks(): Promise<TaskSnapshot[]> {

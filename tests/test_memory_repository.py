@@ -11,6 +11,7 @@ from arise.core.extensions import (
     EmbeddingResult,
     MemoryConsentError,
     MemoryEntry,
+    MemoryGovernanceError,
     MemoryKind,
 )
 
@@ -61,6 +62,21 @@ class SQLiteMemoryRepositoryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreater(expiry, self.now)
         return replace(entry, consent_reference=reference)
+
+    async def test_payment_card_numbers_are_rejected_before_any_storage(self) -> None:
+        """Redaction masks a PAN, so governance must still reject the pre-redaction proposal."""
+
+        for text in (
+            "my card is 4111111111111111",
+            "credit card: 4111 1111 1111 1111",
+            "card_number=4532015112830366",
+        ):
+            with self.subTest(text=text):
+                proposal = self.entry(text=text)
+                scoped = await self.grant(proposal)
+                with self.assertRaises(MemoryGovernanceError):
+                    await self.repository.store(scoped)
+                self.assertEqual(len(self.repository.list_records(principal_id="user-a")), 0)
 
     async def test_write_is_persistent_principal_scoped_and_redacted(self) -> None:
         proposal = self.entry(
