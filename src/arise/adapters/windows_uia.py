@@ -387,12 +387,21 @@ class Win32UiaBackend:
         maximized = bool(user32.IsZoomed(hwnd))
         process_id = int(pid.value) if int(pid.value) > 0 else None
         app_name = "windows-app"
+        owner_executable: str | None = None
         if process_id is not None:
             try:
-                raw_name = psutil.Process(process_id).name()
+                owner_process = psutil.Process(process_id)
+                raw_name = owner_process.name()
                 cleaned = "".join(ch for ch in raw_name if ch.isalnum() or ch in {"-", "_", "."})
                 if cleaned:
                     app_name = cleaned[:128]
+                # The owner's executable path is observed here, on the HWND's PID,
+                # so an application launch can prove window ownership by executable
+                # identity instead of a process name. Access failures stay None and
+                # therefore cannot be treated as a match.
+                raw_executable = owner_process.exe()
+                if raw_executable:
+                    owner_executable = str(raw_executable)[:4096]
             except Exception:
                 app_name = "windows-app"
         return WindowRecord(
@@ -405,6 +414,7 @@ class Win32UiaBackend:
             maximized=maximized,
             foreground=(hwnd == fg_hwnd),
             bounds=bounds,
+            executable_path=owner_executable,
         )
 
     async def list_windows(self, *, include_hidden: bool = False) -> Sequence[WindowRecord]:

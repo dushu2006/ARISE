@@ -111,7 +111,7 @@ All rows below are **REAL PRODUCTION PATH by source/composition inspection**, an
 
 | Tool | Minimum risk | Registered implementation / provider | Native dependency / dispatch | Verification and limitations |
 | --- | --- | --- | --- | --- |
-| `system.app_launch` | R1 | `AppLaunchTool` / `WindowsAppLaunchProvider` | `Win32AppLaunchBackend`, resolver, `Popen(shell=False)`, psutil, shared Win32 window backend | Fresh exact-executable process + visible window + declared conditions; real launch unverified |
+| `system.app_launch` | R1 | `AppLaunchTool` / `WindowsAppLaunchProvider` | `Win32AppLaunchBackend`, resolver, `Popen(shell=False)`, psutil, shared Win32 window backend | Bounded pre-dispatch baseline plus fresh executable-verified new/activated window evidence, then declared conditions; see section 8; real launch unverified |
 | `uia.invoke` | R2 | `WindowsUiaActionTool` / `WindowsUiaProvider` | `Win32UiaBackend.invoke_node`, `BM_CLICK`; existing explicitly opted-in coordinate fallback | Fresh observed postconditions; HWND controls only |
 | `uia.click` | R3 | Same tool/provider, click operation | Same invoke backend, grounded candidate required | R3 confirmation unchanged; click return does not prove keyboard focus |
 | `uia.fill` | R2 | Same tool/provider, fill operation | `set_node_value`, `WM_SETTEXT` | Fresh observed non-sensitive value conditions; HWND controls only |
@@ -167,3 +167,152 @@ Validation in Arena:
 Still unresolved/unverified: the exact historical Test 2 object/field; actual Windows 11/Python 3.14 behavior; actual Chrome path/PIDs/windows; omnibox accessibility; focus/click/type effects; secret-entry native behavior; packaged executable handoffs. The new diagnostic is intended to make the next Windows run specific rather than falsely successful.
 
 No commit or push was performed.
+
+## 8. Chromium-style app launch: window-owner association (follow-up, 2026-10-04)
+
+### Evidence boundary
+
+This follow-up was developed on **Linux, Python 3.11.2** in Arena with explicitly fake
+backends. **No real Windows run was performed for this change**, and nothing here is a
+claim of Windows verification. The Window/Chrome behavior below is source-traced and
+reproduced against the fake backends; the user's laptop remains the integration
+environment.
+
+### Reported observation
+
+With a configured NVIDIA provider the planner accepted `Open Chrome` on attempt 1, the task
+was created, `system.app_launch` dispatched, and the task ended `UNKNOWN`:
+
+```
+The tool failed after dispatch (WINDOW_NOT_FOUND); the external effect is unknown.
+```
+
+### Root cause (reproduced with fake backends on the previous revision)
+
+1. **Association was anchored on the spawned PID.** `launch_process()` returns the
+   `subprocess.Popen` PID. A Chromium launcher can exit immediately after handing the
+   request to an already running browser process, and the visible top-level window can be
+   owned by a *different* process of the same installation. The previous loop either adopted
+   an arbitrary same-executable PID as the "launched process" or timed out, so a
+   pre-existing Chrome process/window could be mistaken for — or block — this launch.
+2. **No pre-dispatch baseline existed.** Nothing recorded which application processes and
+   visible windows already existed, so the code could not tell a pre-existing Chrome window
+   from one produced by this dispatch.
+3. **Window ownership had no per-window executable identity.** `Win32UiaBackend` recorded
+   only the owner PID and the process *name* on each `WindowRecord`; `WindowRecord.executable_path`
+   was always `None`. The only executable-identity check available was a second lookup keyed
+   by PID.
+4. **`focus_window` failures escaped the launch path.** Both the reuse branch and the spawn
+   branch called `focus_window` and let its `WINDOW_NOT_FOUND` (raised when
+   `SetForegroundWindow` does not actually change the foreground window) propagate. That
+   exception is exactly what `AgentRuntime` reports as
+   `tool failed after dispatch (WINDOW_NOT_FOUND)`. On a background sidecar this is the
+   normal Windows outcome for an unfocused Chrome window, so a *successful* hand-off was
+   reported as an unknown external effect.
+5. **The reuse branch trusted the focus implementation's own return record** instead of an
+   independent fresh observation.
+
+### Implemented association algorithm (`WindowsAppLaunchProvider`)
+
+1. **Resolve** the executable as before (unchanged hierarchy; `shell=False` unchanged).
+2. **Baseline before dispatch** (`_snapshot_desktop`): one bounded read-only snapshot of all
+   processes (PID → observed executable path) and all *visible top-level* windows. Process
+   count is capped at 4096; the visible-window inventory is capped at 128, at which point the
+   native backend truncates its own enumeration, so the launch fails closed with
+   `ENVIRONMENT_CHANGED` rather than risk treating a pre-existing window as new. The
+   application-scoped baseline is derived with the *normalized observed executable path*
+   (`ntpath.normcase(ntpath.normpath(path))`); unknown identities never match.
+3. **Idempotent reuse first.** A pre-existing window is reusable only if its owner identity is
+   exe-verified and its selection is deterministic (foreground → restored → larger → lowest
+   window id). The focus attempt is always issued and its failure is recorded, never
+   swallowed; reuse is accepted only when a *fresh* snapshot (not the focus return value)
+   shows that window visible, restored and foreground. Otherwise the provider does not
+   pretend the launch happened — it dispatches the executable, which is the platform-supported
+   way for Chrome's single-instance logic to activate its own browser process/window.
+4. **Dispatch** the resolved executable with `shell=False` and the existing executable
+   resolution; record `dispatched_process_id` for diagnosis only.
+5. **Poll for dispatch-explained windows** (`_poll_window_evidence`), each cycle building a
+   fresh process+window snapshot and classifying every visible, non-minimized window whose
+   owner identity is executable-verified:
+   - `new_window` — the window id did not exist in the bounded baseline;
+   - `activated_existing_window` — a pre-existing application window is foreground *now* and
+     was not foreground (or was minimized) in the baseline.
+   Unchanged pre-existing windows (and any window whose owner executable cannot be observed,
+   or whose window-record and process-snapshot identities conflict) are never evidence. The
+   selected window must be observed twice consecutively; simultaneous candidates are ordered
+   deterministically (new before activated, foreground, larger area, lowest window id).
+6. **Confirm by fresh observation** (`_confirm_window_evidence`): focus the selected window,
+   then re-snapshot. The focus call's return record is never evidence; a focus failure is
+   recorded in the bounded diagnostic (`focus_failed`, `focus_error`) and cannot be turned
+   into a foreground claim. A newly created window must still be visible, restored and
+   exe-verified; an activated pre-existing window must additionally still be foreground.
+   Windows that fail confirmation are excluded and polling continues until the bounded
+   deadline, after which the launch fails closed (`ACTION_UNKNOWN_OUTCOME`), as does an early
+   exit that leaves no identifiable application process (`ACTION_UNKNOWN_OUTCOME`) or an empty
+   poll window (`TIMEOUT`).
+7. **Return the observed window owner.** `RunningApplication.process_id` is the PID that owns
+   the verified window (which may differ from the launcher PID); `window_ids` is the confirmed
+   window. `verify()` re-observes and still requires an executable-verified application process
+   *and* a visible, non-minimized application window plus every declared postcondition.
+
+`Win32UiaBackend._window_record_from_hwnd` now records the HWND owner's observed executable
+path (`psutil.Process(pid).exe()`, bounded, `None` on access failure) on the window record.
+`WindowsUiaProvider.list_windows()` continues to expose sanitized records with
+`executable_path=None`, so the exe path stays inside the adapter layer.
+
+### Unchanged safety model
+
+Risk levels, `PolicyEngine`, planner contracts, postconditions, confirmation behavior, UIA
+tools and their gates, `shell=False`, and executable resolution are untouched. Verification
+was not weakened to process-only success: a running Chrome process without a visible window
+still fails verification, and a same-name executable at a different path is still rejected.
+Alternate backends that do not declare `requires_visible_window` keep their historical
+process-only behavior.
+
+### Regression tests (fake backends, deterministic)
+
+Added/updated in `tests/test_production_desktop_path.py` with a Chromium-like
+`MultiProcessLaunchBackend` (launcher PID ≠ window owner PID, launcher hand-off, focus
+outcomes, foreground transitions):
+
+| Scenario | Expectation |
+| --- | --- |
+| Launcher exits after hand-off; browser process owns the new window | success anchored on the browser-window PID |
+| Launcher stays alive; a child process of the same executable owns the window | success; owner PID ≠ dispatched PID |
+| Window owner has the same process name but a different executable path | fail closed |
+| Visible window appears with no observable owner identity | fail closed (`ACTION_UNKNOWN_OUTCOME`) |
+| Window-record and process-snapshot owner identities conflict | fail closed (`TIMEOUT`) |
+| Pre-existing Chrome window plus an unrelated foreground window | fail closed; the pre-existing window is not evidence and is not focused |
+| Pre-existing visible Chrome window, focus confirmed fresh | reuse, no dispatch (idempotent) |
+| Focus reports success but foreground never changes; hand-off then activates the window | success only as `activated_existing_window` from a fresh observation |
+| Process running, no visible window | launch `TIMEOUT`; `verify()` `FAILED` (process-only success rejected) |
+| Focus raises while a new window exists | success on the new-window evidence; `focus_failed` recorded, `focus_verified` false |
+| Reuse focus raises and no fresh evidence appears | fail closed |
+| Window disappears before confirmation | fail closed (`TIMEOUT`) |
+| Several new windows | deterministic selection (foreground, larger) |
+
+Running the new test module against the previous source tree produces 13 failures: 10 of the
+13 scenarios above, the updated `test_reuse_focus_failure_is_not_swallowed`, and both
+parametrized variants of the runtime regression. Those include the exact user-visible
+signature — the reuse path raises `ComputerAdapterError(WINDOW_NOT_FOUND)` out of
+`launch_application`, and the runtime reports `StepStatus.UNKNOWN`
+(`The tool failed after dispatch (WINDOW_NOT_FOUND)`) — and the opposite defect, where the
+focus implementation's own return record is accepted as a false success without any dispatch.
+Three scenarios pass on both revisions by design because they are fail-closed guard tests: the
+impostor executable, the window with no observable owner, and the running process with no
+visible window. Suite totals for this change are recorded in the report; `ruff check`,
+`compileall`, `arise demo`, and `git diff --check` pass, and pre-existing `ruff format` drift
+in unrelated alias/tool regions was preserved.
+
+### Still required on the user's Windows machine
+
+```
+python scripts/live_nvidia_planner_check.py --diagnostics --request "Open Chrome"
+```
+
+The diagnostic now also prints the bounded baseline counts, `window_evidence`
+(`new_window` / `activated_existing_window`), `window_owner_process_id`, `focus_failed` /
+`focus_error` (confirmation attempt), `reuse_focus_error` (unconfirmed reuse activation), and
+`focus_verified` — none of which is verification evidence by itself. Real Windows
+verification of Chrome cold starts, hand-off to an existing browser process, foreground
+restoration, and multi-process window ownership is **not claimed here**.

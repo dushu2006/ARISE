@@ -1,7 +1,9 @@
 """Composition inspection and FAKE-backend regressions, not live Windows evidence."""
 
 import json
+from collections.abc import Callable, Sequence
 from dataclasses import replace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +18,7 @@ from arise.adapters.windows_app_launch import (
     Win32AppLaunchBackend,
     WindowsAppLaunchProvider,
     WindowsApplicationResolver,
+    register_app_launch_tools,
 )
 from arise.adapters.windows_uia import (
     Win32UiaBackend,
@@ -23,7 +26,12 @@ from arise.adapters.windows_uia import (
     register_windows_uia_tools,
 )
 from arise.config.settings import AppSettings, DatabaseSettings, DesktopSettings, SecuritySettings
-from arise.core.computer import ComputerFailureCode, WindowRecord
+from arise.core.computer import (
+    ComputerFailureCode,
+    PerceptionSource,
+    Rect,
+    WindowRecord,
+)
 from arise.core.computer_ports import ComputerAdapterError
 from arise.core.contracts import (
     ActionContract,
@@ -126,8 +134,458 @@ async def test_reuse_focus_failure_is_not_swallowed():
         raise ComputerAdapterError(ComputerFailureCode.WINDOW_NOT_FOUND, "Window disappeared.")
 
     backend.focus_window = fail
+    # The failed activation is recorded, the executable is dispatched as a fallback,
+    # and the launch still fails closed because no fresh window evidence appears.
     with pytest.raises(ComputerAdapterError):
-        await provider.launch_application("chrome")
+        await provider.launch_application("chrome", timeout_seconds=2)
+    assert (
+        provider.launch_diagnostic["reuse_focus_error"]
+        == ComputerFailureCode.WINDOW_NOT_FOUND.value
+    )
+    assert provider.launch_diagnostic["mode"] != "reuse"
+
+
+# ---------------------------------------------------------------------------------
+# Chromium-style multi-process association: the launcher PID is not the window owner.
+# These are FAKE-backend regressions; they are not Windows verification evidence.
+# ---------------------------------------------------------------------------------
+
+CHROME_EXE = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+
+class MultiProcessLaunchBackend:
+    """Deterministic Chromium-like backend where the window owner is not the launcher.
+
+    ``launch_process`` models Chrome's launcher semantics: the spawned process is not
+    automatically the browser-window owner, and an already running browser process can
+    handle the request. Tests install ``on_launch`` to model the resulting desktop
+    mutation deterministically instead of depending on real Windows behavior.
+    """
+
+    requires_visible_window = True
+
+    def __init__(self, *, keep_launcher_alive: bool = False) -> None:
+        self.keep_launcher_alive = keep_launcher_alive
+        self.processes: list[dict[str, Any]] = []
+        self.windows: list[WindowRecord] = []
+        self.launched_paths: list[str] = []
+        self.focus_calls: list[str] = []
+        self.focus_error: Exception | None = None
+        self.focus_reports_success_without_change = False
+        self.on_launch: Callable[[int], None] | None = None
+        self._next_pid = 5000
+
+    def add_process(self, pid: int, executable_path: str, *, name: str = "chrome.exe") -> int:
+        self.processes.append({"pid": pid, "name": name, "exe": executable_path})
+        return pid
+
+    def add_window(
+        self,
+        window_id: str,
+        process_id: int,
+        *,
+        executable_path: str | None = CHROME_EXE,
+        foreground: bool = False,
+        minimized: bool = False,
+    ) -> WindowRecord:
+        record = WindowRecord(
+            window_id=window_id,
+            process_id=process_id,
+            title="Chrome",
+            application="chrome.exe",
+            visible=True,
+            minimized=minimized,
+            maximized=False,
+            foreground=foreground,
+            bounds=Rect(0.0, 0.0, 1280.0, 800.0),
+            executable_path=executable_path,
+        )
+        self.windows.append(record)
+        return record
+
+    def set_foreground(self, window_id: str) -> None:
+        self.windows = [
+            replace(window, foreground=window.window_id == window_id) for window in self.windows
+        ]
+
+    async def list_running_processes(self) -> Sequence[dict[str, Any]]:
+        return [dict(process) for process in self.processes]
+
+    async def launch_process(self, executable_path: str) -> int:
+        self.launched_paths.append(executable_path)
+        launcher_pid = self._next_pid
+        self._next_pid += 1
+        if self.keep_launcher_alive:
+            self.add_process(launcher_pid, executable_path)
+        if self.on_launch is not None:
+            self.on_launch(launcher_pid)
+        return launcher_pid
+
+    async def is_process_alive(self, pid: int) -> bool:
+        return any(int(process["pid"]) == pid for process in self.processes)
+
+    async def list_windows(self) -> Sequence[WindowRecord]:
+        return list(self.windows)
+
+    async def focus_window(self, window_id: str) -> WindowRecord:
+        self.focus_calls.append(window_id)
+        if self.focus_error is not None:
+            raise self.focus_error
+        target = next((window for window in self.windows if window.window_id == window_id), None)
+        if target is None:
+            raise ComputerAdapterError(
+                ComputerFailureCode.WINDOW_NOT_FOUND,
+                "Requested window does not exist.",
+                source=PerceptionSource.UI_AUTOMATION,
+            )
+        if not self.focus_reports_success_without_change:
+            self.set_foreground(window_id)
+        return replace(target, foreground=True)
+
+
+def multi_process_fixture(*, keep_launcher_alive: bool = False, allow_reuse: bool = True):
+    backend = MultiProcessLaunchBackend(keep_launcher_alive=keep_launcher_alive)
+    resolver = WindowsApplicationResolver()
+    resolver.register_alias(
+        "chrome",
+        ResolvedApplication(
+            name="Google Chrome",
+            executable_path=CHROME_EXE,
+            process_names=("chrome.exe",),
+            allow_reuse=allow_reuse,
+        ),
+    )
+    provider = WindowsAppLaunchProvider(backend=backend, resolver=resolver)
+    action = ActionContract(
+        task_id="launch-multiprocess",
+        target=None,
+        tool_name="system.app_launch",
+        risk=RiskLevel.R1,
+        authority=authority(),
+        parameters={"application": "chrome"},
+    )
+    return backend, provider, action
+
+
+@pytest.mark.asyncio
+async def test_launcher_pid_is_associated_with_the_browser_window_owner():
+    backend, provider, _ = multi_process_fixture()
+    browser_pid = backend.add_process(7001, CHROME_EXE)
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        # Chrome's launcher hands the request off and exits; the browser process
+        # (different PID, same installed executable) owns the new top-level window.
+        backend.add_window("hwnd-browser", browser_pid)
+
+    backend.on_launch = on_launch
+    app = await provider.launch_application("chrome")
+
+    assert backend.launched_paths == [CHROME_EXE]
+    assert app.process_id == browser_pid
+    assert app.window_ids == ("hwnd-browser",)
+    diagnostic = provider.launch_diagnostic
+    assert diagnostic["mode"] == "spawn"
+    assert diagnostic["dispatched_process_id"] == 5000
+    assert diagnostic["window_owner_process_id"] == browser_pid
+    assert diagnostic["window_evidence"] == "new_window"
+    assert backend.focus_calls == ["hwnd-browser"]
+
+
+@pytest.mark.asyncio
+async def test_child_process_window_owner_is_resolved_by_executable_identity():
+    backend, provider, _ = multi_process_fixture(keep_launcher_alive=True)
+
+    def on_launch(launcher_pid: int) -> None:
+        child_pid = backend.add_process(launcher_pid + 1, CHROME_EXE)
+        backend.add_window("hwnd-child-owned", child_pid)
+
+    backend.on_launch = on_launch
+    app = await provider.launch_application("chrome")
+
+    assert app.process_id == 5001
+    assert app.process_id != provider.launch_diagnostic["dispatched_process_id"]
+    assert app.window_ids == ("hwnd-child-owned",)
+
+
+@pytest.mark.asyncio
+async def test_same_name_window_owner_with_a_different_executable_is_rejected():
+    backend, provider, _ = multi_process_fixture()
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        impostor_pid = backend.add_process(7002, r"C:\Impostor\chrome.exe")
+        backend.add_window("hwnd-impostor", impostor_pid, executable_path=r"C:\Impostor\chrome.exe")
+
+    backend.on_launch = on_launch
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+
+    # No executable-verified application process or window remains: fail closed.
+    assert failure.value.code is ComputerFailureCode.ACTION_UNKNOWN_OUTCOME
+    assert backend.focus_calls == []
+
+
+@pytest.mark.asyncio
+async def test_window_without_an_observed_owner_identity_fails_closed():
+    backend, provider, _ = multi_process_fixture()
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        # A visible window appears, but nothing observed proves which application owns it.
+        backend.add_window("hwnd-unidentified", 7003, executable_path=None)
+
+    backend.on_launch = on_launch
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+
+    assert failure.value.code is ComputerFailureCode.ACTION_UNKNOWN_OUTCOME
+    assert backend.focus_calls == []
+
+
+@pytest.mark.asyncio
+async def test_conflicting_window_owner_identity_is_rejected():
+    backend, provider, _ = multi_process_fixture()
+    browser_pid = backend.add_process(7004, CHROME_EXE)
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        # The window record and the process snapshot disagree about the owner executable.
+        backend.add_window("hwnd-conflict", browser_pid, executable_path=r"C:\Other\chrome.exe")
+
+    backend.on_launch = on_launch
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+
+    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert backend.focus_calls == []
+
+
+@pytest.mark.asyncio
+async def test_preexisting_application_window_is_not_evidence_of_a_new_launch():
+    backend, provider, _ = multi_process_fixture(allow_reuse=False)
+    browser_pid = backend.add_process(7100, CHROME_EXE)
+    backend.add_window("hwnd-existing-chrome", browser_pid)
+    other_pid = backend.add_process(7200, r"C:\Other\other.exe", name="other.exe")
+    backend.add_window(
+        "hwnd-other", other_pid, executable_path=r"C:\Other\other.exe", foreground=True
+    )
+
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+
+    # A pre-existing Chrome process/window and an unrelated foreground window prove nothing.
+    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert backend.launched_paths == [CHROME_EXE]
+    assert "hwnd-existing-chrome" not in backend.focus_calls
+
+
+@pytest.mark.asyncio
+async def test_existing_visible_window_reuse_is_idempotent_and_freshly_confirmed():
+    backend, provider, _ = multi_process_fixture()
+    browser_pid = backend.add_process(7100, CHROME_EXE)
+    backend.add_window("hwnd-existing-chrome", browser_pid)
+
+    app = await provider.launch_application("chrome")
+
+    assert backend.launched_paths == []
+    assert backend.focus_calls == ["hwnd-existing-chrome"]
+    assert app.process_id == browser_pid
+    assert app.window_ids == ("hwnd-existing-chrome",)
+    diagnostic = provider.launch_diagnostic
+    assert diagnostic["mode"] == "reuse"
+    assert diagnostic["focus_verified"] is True
+
+
+@pytest.mark.asyncio
+async def test_existing_window_activation_is_verified_by_fresh_observation():
+    backend, provider, _ = multi_process_fixture()
+    browser_pid = backend.add_process(7100, CHROME_EXE)
+    backend.add_window("hwnd-existing-chrome", browser_pid)
+    # The focus call reports success but Windows never changes the foreground window.
+    backend.focus_reports_success_without_change = True
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        # The dispatched launcher reached the existing browser process, which then
+        # activated its own pre-existing window (a fresh foreground transition).
+        backend.set_foreground("hwnd-existing-chrome")
+
+    backend.on_launch = on_launch
+    app = await provider.launch_application("chrome")
+
+    assert backend.launched_paths == [CHROME_EXE]
+    assert app.process_id == browser_pid
+    assert app.window_ids == ("hwnd-existing-chrome",)
+    diagnostic = provider.launch_diagnostic
+    assert diagnostic["mode"] == "spawn"
+    assert diagnostic["window_evidence"] == "activated_existing_window"
+    assert diagnostic["window_owner_process_id"] == browser_pid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("focus_mode", ["raises", "claims_success_without_change"])
+async def test_runtime_completes_open_chrome_when_chrome_reuses_its_browser_process(focus_mode):
+    """Regression for the reported task-level failure.
+
+    A background sidecar cannot change the foreground window, so the native focus call
+    either raises WINDOW_NOT_FOUND or returns a record Windows did not honor. The
+    previous provider propagated the first form as UNKNOWN
+    ("The tool failed after dispatch (WINDOW_NOT_FOUND)") and accepted the second form
+    as a false success without any activation. With a bounded baseline and a fresh
+    observation the hand-off activation is verified and the action completes.
+    """
+    backend, provider, _ = multi_process_fixture()
+    browser_pid = backend.add_process(7100, CHROME_EXE)
+    backend.add_window("hwnd-existing-chrome", browser_pid)
+    if focus_mode == "raises":
+        backend.focus_error = ComputerAdapterError(
+            ComputerFailureCode.WINDOW_NOT_FOUND,
+            "Foreground change refused.",
+            source=PerceptionSource.UI_AUTOMATION,
+        )
+    else:
+        backend.focus_reports_success_without_change = True
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        # The dispatched launcher reached the existing browser process, which activated
+        # its own pre-existing window (a fresh, independently observed transition).
+        backend.set_foreground("hwnd-existing-chrome")
+
+    backend.on_launch = on_launch
+
+    tasks = InMemoryTaskRepository()
+    task = TaskRecord.planned("Open Chrome", authorization=authority())
+    tasks.save(task)
+    tools = ToolRegistry()
+    register_app_launch_tools(tools, provider)
+    policy = PolicyEngine()
+    environment = CompositeEnvironment(app_launch=provider)
+    runtime = AgentRuntime(
+        tasks=tasks,
+        events=InMemoryEventStore(),
+        tools=tools,
+        policy=policy,
+        environment=environment,
+        resources=ResourceManager(),
+        verifier=CompositeVerifier(environment, app_launch=provider),
+    )
+    action = ActionContract(
+        task_id=task.task_id,
+        target=TargetIdentity(platform="windows", application="Chrome"),
+        tool_name="system.app_launch",
+        risk=RiskLevel.R1,
+        authority=task.authorization,
+        parameters={"application": "Chrome"},
+    )
+
+    result = await runtime.execute_action(action, final_action=True)
+
+    assert result.step_status is StepStatus.SUCCEEDED
+    assert result.verification.status is VerificationStatus.PASSED
+    assert result.task_status is TaskStatus.COMPLETED
+    assert backend.launched_paths == [CHROME_EXE]
+
+
+@pytest.mark.asyncio
+async def test_no_visible_window_fails_launch_and_rejects_process_only_success():
+    backend, provider, action = multi_process_fixture(keep_launcher_alive=True)
+
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert backend.launched_paths == [CHROME_EXE]
+
+    observation = await provider.observe(action)
+    assert observation.facts["process.running"] is True
+    assert observation.facts["window.open"] is False
+    verification = await provider.verify(action)
+    assert verification.status is VerificationStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_focus_failure_does_not_hide_a_newly_created_window():
+    backend, provider, _ = multi_process_fixture(keep_launcher_alive=True)
+    backend.focus_error = ComputerAdapterError(
+        ComputerFailureCode.WINDOW_NOT_FOUND,
+        "Foreground change refused.",
+        source=PerceptionSource.UI_AUTOMATION,
+    )
+
+    def on_launch(launcher_pid: int) -> None:
+        # The launch itself created a new visible window; only the focus attempt failed.
+        backend.add_window("hwnd-new-browser", launcher_pid)
+
+    backend.on_launch = on_launch
+    app = await provider.launch_application("chrome")
+
+    assert app.window_ids == ("hwnd-new-browser",)
+    diagnostic = provider.launch_diagnostic
+    # The failure is surfaced; no foreground claim is made on its behalf.
+    assert diagnostic["focus_failed"] is True
+    assert diagnostic["focus_error"] == ComputerFailureCode.WINDOW_NOT_FOUND.value
+    assert diagnostic["focus_verified"] is False
+
+
+@pytest.mark.asyncio
+async def test_reuse_focus_failure_without_fresh_evidence_fails_closed():
+    backend, provider, _ = multi_process_fixture(keep_launcher_alive=True)
+    browser_pid = backend.add_process(7100, CHROME_EXE)
+    backend.add_window("hwnd-existing-chrome", browser_pid)
+    backend.focus_error = ComputerAdapterError(
+        ComputerFailureCode.WINDOW_NOT_FOUND,
+        "Foreground change refused.",
+        source=PerceptionSource.UI_AUTOMATION,
+    )
+
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+
+    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert provider.launch_diagnostic["mode"] == "spawn"
+    assert (
+        provider.launch_diagnostic["reuse_focus_error"]
+        == ComputerFailureCode.WINDOW_NOT_FOUND.value
+    )
+
+
+@pytest.mark.asyncio
+async def test_window_that_disappears_before_confirmation_fails_closed():
+    backend, provider, _ = multi_process_fixture(keep_launcher_alive=True)
+
+    def on_launch(launcher_pid: int) -> None:
+        backend.add_window("hwnd-transient", launcher_pid)
+
+    async def focus_then_close(window_id: str) -> WindowRecord:
+        del window_id
+        backend.windows = []
+        raise ComputerAdapterError(ComputerFailureCode.WINDOW_NOT_FOUND, "Window closed.")
+
+    backend.on_launch = on_launch
+    backend.focus_window = focus_then_close  # type: ignore[method-assign]
+    with pytest.raises(ComputerAdapterError) as failure:
+        await provider.launch_application("chrome", timeout_seconds=2)
+
+    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert provider.launch_diagnostic["confirmation_failed"] is True
+
+
+@pytest.mark.asyncio
+async def test_window_selection_is_deterministic_when_several_windows_appear():
+    backend, provider, _ = multi_process_fixture(keep_launcher_alive=True)
+    browser_pid = backend.add_process(7005, CHROME_EXE)
+
+    def on_launch(launcher_pid: int) -> None:
+        del launcher_pid
+        backend.add_window("hwnd-small-helper", browser_pid, foreground=False)
+        backend.add_window("hwnd-large-foreground", browser_pid, foreground=True)
+
+    backend.on_launch = on_launch
+    app = await provider.launch_application("chrome")
+
+    assert app.window_ids == ("hwnd-large-foreground",)
+    assert backend.focus_calls == ["hwnd-large-foreground"]
 
 
 def test_production_composition_selects_shared_native_backend(tmp_path):
