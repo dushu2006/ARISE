@@ -1711,6 +1711,16 @@ class PlaywrightActionTool:
         "select": (RiskLevel.R2, Idempotency.UNKNOWN, "changes a browser select value"),
         "navigate": (RiskLevel.R2, Idempotency.UNKNOWN, "navigates an isolated browser page"),
     }
+    # Trusted parameter keys per operation, mirrored from validate_parameters.
+    _PARAMETERS = {
+        "click": (),
+        "fill": ("text",),
+        "fill_secret": ("text",),
+        "press": ("key",),
+        "scroll": (),
+        "select": ("value",),
+        "navigate": ("url",),
+    }
 
     def __init__(self, provider: PlaywrightBrowserProvider, operation: str) -> None:
         if operation not in self._POLICY:
@@ -1728,6 +1738,8 @@ class PlaywrightActionTool:
             declared_side_effects=(effect,),
             idempotency=idempotency,
             max_result_bytes=4096,
+            parameter_names=self._PARAMETERS[operation],
+            target_scope="browser.page_id",
         )
 
     @property

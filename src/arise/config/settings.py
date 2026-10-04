@@ -126,6 +126,12 @@ class ModelSettings(BaseModel):
     request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     max_concurrent_requests: int = Field(default=4, ge=1, le=128)
     allow_cloud: bool = False
+    # Ask OpenAI-compatible endpoints for a JSON-object response format when the
+    # planner requests it. Endpoints that reject the field degrade automatically
+    # to plain text responses; planning validation is unchanged either way.
+    json_object_responses: bool = True
+    # Bounded corrective retries for malformed or schema-invalid planner output.
+    planner_max_attempts: int = Field(default=2, ge=1, le=2)
 
     @field_validator("api_key_secret_name")
     @classmethod

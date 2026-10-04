@@ -110,6 +110,7 @@ from arise.core.models import (
     ModelRequest,
     ModelRole,
     ModelSelectionRequest,
+    PlannerDiagnostic,
     RequestSource,
     Session,
     TaskDetail,
@@ -861,6 +862,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
                 max_concurrent_requests=settings.model.max_concurrent_requests,
                 timeout_seconds=settings.model.request_timeout_seconds,
                 connect_timeout_seconds=settings.model.connect_timeout_seconds,
+                supports_json_object_responses=settings.model.json_object_responses,
             )
             router.register(provider)
             planner_privacy = "cloud_allowed" if not local else "local_only"
@@ -898,6 +900,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
             model_id=settings.model.model_id,
             privacy=planner_privacy,
             timeout_seconds=settings.model.request_timeout_seconds,
+            max_attempts=settings.model.planner_max_attempts,
             memory=memory_repository if settings.memory.enabled else None,
             research=research,
             personalization=personalization_store if settings.memory.enabled else None,
@@ -1477,6 +1480,24 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     @app.get("/api/v1/diagnostics", response_model=DiagnosticsSnapshot, tags=["diagnostics"])
     async def diagnostics(_: str = Depends(require_principal)) -> DiagnosticsSnapshot:
         return await asyncio.to_thread(services.health.diagnostics)
+
+    @app.get(
+        "/api/v1/diagnostics/planner",
+        response_model=PlannerDiagnostic,
+        tags=["diagnostics"],
+    )
+    async def planner_diagnostics(_: str = Depends(require_principal)) -> PlannerDiagnostic:
+        """Return the sanitized outcome of the most recent plan negotiation.
+
+        Only bounded schema categories, field paths, rule types, and byte counts
+        are exposed; model output and prompt content are never included.
+        """
+
+        planner = services.engine.planner
+        snapshot = getattr(planner, "last_diagnostic", None)
+        if not callable(snapshot):
+            return PlannerDiagnostic()
+        return snapshot()
 
     @app.post("/api/v1/sessions", response_model=Session, status_code=status.HTTP_201_CREATED)
     async def create_session(

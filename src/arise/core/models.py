@@ -443,6 +443,10 @@ class ModelRequest(ContractModel):
     timeout_seconds: float = Field(default=60, gt=0, le=3600)
     stream: bool = True
     required_modalities: frozenset[str] = frozenset({"text"})
+    # Provider-neutral expectation about the assistant message envelope. A
+    # provider that supports JSON-mode responses should honor it; providers that
+    # do not are never required to, and the planner still validates strictly.
+    response_format: Literal["text", "json_object"] = "text"
 
 
 class ModelResponse(ContractModel):
@@ -482,6 +486,28 @@ class ModelSelection(ContractModel):
     model_id: str
     reason: str
     fallbacks: tuple[tuple[str, str], ...] = ()
+
+
+class PlannerDiagnostic(ContractModel):
+    """Sanitized operator snapshot of the most recent plan negotiation.
+
+    Only bounded schema categories, field paths, rule types, and byte counts are
+    recorded. Model output, prompt text, and credentials are never included.
+    """
+
+    task_id: str | None = Field(default=None, max_length=128)
+    accepted: bool = False
+    category: str = Field(default="none", min_length=1, max_length=64)
+    detail: str = Field(default="", max_length=400)
+    attempts: int = Field(default=0, ge=0, le=8)
+    attempt_categories: tuple[str, ...] = Field(default=(), max_length=8)
+    response_bytes: int = Field(default=0, ge=0)
+    transport_normalization: Literal["none", "code_fence_unwrapped"] = "none"
+    provider_id: str = Field(default="", max_length=128)
+    model_id: str = Field(default="", max_length=256)
+    contract_version: str = Field(default="planner-contract-2", max_length=64)
+    context_sources: tuple[str, ...] = Field(default=(), max_length=8)
+    occurred_at: datetime = Field(default_factory=_utc_now)
 
 
 class ErrorInfoModel(ContractModel):

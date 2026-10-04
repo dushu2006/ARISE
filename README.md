@@ -148,10 +148,12 @@ A local loopback endpoint can run without an API key. For remote providers, use 
 
 With default settings the server has no planner provider or desktop/browser action tools. When explicitly enabled and configured, the server registers UIA/browser executors and reports capability state through `/api/v1/capabilities`; missing providers or host capabilities are reported truthfully, and no completion is fabricated. Registration is not physical Windows validation.
 
+The planner asks the configured model for exactly one JSON object and then validates it with the strict typed TaskPlan contract; nothing about the model output is repaired, and unknown keys, invalid enums, dangling dependencies, or empty step lists without a clarification remain rejected. Registered tool metadata (accepted parameter keys, target scope, minimum risk, idempotency) is included in the prompt together with a minimal, contract-valid example built from a real registered tool. At most one bounded corrective retry is attempted for malformed or schema-invalid planner output (`ARISE__MODEL__PLANNER_MAX_ATTEMPTS`, 1–2). When the endpoint accepts it, the planner also requests an OpenAI-compatible `response_format={"type":"json_object"}`; endpoints that reject the field degrade once to plain text automatically (`ARISE__MODEL__JSON_OBJECT_RESPONSES=false` disables the request). Rejections are reported with a sanitized category such as `InvalidPlan:schema_invalid` in the task status reason and audited through a `PLAN_REJECTED` event; `GET /api/v1/diagnostics/planner` returns the bounded, sanitized last-negotiation snapshot (no prompts, model text, or credentials). `scripts/live_nvidia_planner_check.py` submits a real request through `/api/v1/interactions` for the configured provider and prints that sanitized diagnostic.
+
 ## Main routes
 
 - `GET /healthz` — minimal health/readiness snapshot.
-- `GET /api/v1/health`, `/api/v1/diagnostics`, `/api/v1/capabilities` — authenticated system and capability status.
+- `GET /api/v1/health`, `/api/v1/diagnostics`, `/api/v1/diagnostics/planner`, `/api/v1/capabilities` — authenticated system, planner-negotiation, and capability status.
 - `POST /api/v1/sessions`, `GET /api/v1/sessions` — local session persistence.
 - `POST /api/v1/tasks`, `GET /api/v1/tasks`, `GET /api/v1/tasks/{id}` — task lifecycle and inspection.
 - `POST /api/v1/tasks/{id}/respond`, `/cancel`, `/approve` — explicit task controls.

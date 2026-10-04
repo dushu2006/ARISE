@@ -49,6 +49,11 @@ class ToolSpec:
     declared_side_effects: tuple[str, ...] = ()
     idempotency: Idempotency = Idempotency.UNKNOWN
     max_result_bytes: int = 65_536
+    # Exact accepted `action.parameters` keys. Trusted adapter metadata used to
+    # describe the tool to a planner; it never authorizes a parameter by itself.
+    parameter_names: tuple[str, ...] = ()
+    # Required target scope, e.g. "windows.window_id" or "browser.page_id".
+    target_scope: str | None = None
 
     def __post_init__(self) -> None:
         validate_safe_token(self.name, "tool name")
@@ -64,9 +69,15 @@ class ToolSpec:
         resources = tuple(sorted(set(self.required_resources)))
         for resource in resources:
             validate_safe_token(resource, "tool resource name")
+        parameter_names = tuple(sorted(set(self.parameter_names)))
+        for parameter_name in parameter_names:
+            validate_safe_token(parameter_name, "tool parameter name")
+        if self.target_scope is not None:
+            validate_safe_token(self.target_scope, "tool target scope")
         object.__setattr__(self, "required_capabilities", frozenset(self.required_capabilities))
         object.__setattr__(self, "required_resources", resources)
         object.__setattr__(self, "declared_side_effects", tuple(self.declared_side_effects))
+        object.__setattr__(self, "parameter_names", parameter_names)
 
 
 @dataclass(frozen=True, slots=True)

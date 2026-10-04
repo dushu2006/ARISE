@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -23,6 +24,14 @@ from arise.core.models import (
 )
 
 MAX_MODEL_RESPONSE_BYTES = 2 * 1024 * 1024
+
+_LOG = logging.getLogger(__name__)
+
+# OpenAI-compatible endpoints reject unsupported body fields with a client
+# error. When JSON-mode was added by this adapter, that single rejection
+# degrades the provider to plain text responses instead of failing the request.
+_JSON_MODE_REJECTION_STATUSES = frozenset({400, 404, 415, 422})
+_JSON_RESPONSE_FORMAT = {"type": "json_object"}
 
 
 class OpenAICompatibleProvider:
@@ -51,6 +60,7 @@ class OpenAICompatibleProvider:
         timeout_seconds: float = 120.0,
         connect_timeout_seconds: float = 10.0,
         supports_streaming: bool = False,
+        supports_json_object_responses: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         parsed = urlparse(base_url)
@@ -71,6 +81,7 @@ class OpenAICompatibleProvider:
         self.is_cloud = is_cloud
         self.max_concurrent_requests = max_concurrent_requests
         self.supports_streaming = supports_streaming
+        self.supports_json_object_responses = supports_json_object_responses
         self.base_url = base_url.rstrip("/")
         self.api_key_secret_name = api_key_secret_name
         self.provider_options = validate_provider_options(provider_options)
@@ -120,6 +131,13 @@ class OpenAICompatibleProvider:
             "stream": False,
         }
         payload.update(self.provider_options)
+        json_mode_applied = (
+            request.response_format == "json_object"
+            and self.supports_json_object_responses
+            and "response_format" not in payload
+        )
+        if json_mode_applied:
+            payload["response_format"] = dict(_JSON_RESPONSE_FORMAT)
         headers = {"Content-Type": "application/json"}
         try:
             api_key = self.secret_provider.get_secret(self.api_key_secret_name)
@@ -140,22 +158,28 @@ class OpenAICompatibleProvider:
                 min(request.timeout_seconds, self.timeout_seconds),
                 connect=min(request.timeout_seconds, self.connect_timeout_seconds),
             )
-            async with self._client.stream(
-                "POST",
-                self._chat_completions_url(),
-                headers=headers,
-                json=payload,
-                timeout=response_timeout,
-            ) as response:
-                response.raise_for_status()
-                declared_length = response.headers.get("content-length")
-                if declared_length is not None and int(declared_length) > MAX_MODEL_RESPONSE_BYTES:
-                    raise ValueError("model provider response exceeded the size limit")
-                response_body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    if len(response_body) + len(chunk) > MAX_MODEL_RESPONSE_BYTES:
-                        raise ValueError("model provider response exceeded the size limit")
-                    response_body.extend(chunk)
+            try:
+                response_body = await self._post_chat(
+                    payload, headers=headers, timeout=response_timeout
+                )
+            except httpx.HTTPStatusError as exc:
+                if not json_mode_applied or (
+                    exc.response.status_code not in _JSON_MODE_REJECTION_STATUSES
+                ):
+                    raise
+                # The endpoint does not accept response_format. Degrade once, for
+                # this provider instance, instead of failing the request. Nothing
+                # about the response body or credentials is logged.
+                _LOG.warning(
+                    "Model endpoint rejected the JSON response format for provider %s; "
+                    "continuing without structured output",
+                    self.provider_id,
+                )
+                self.supports_json_object_responses = False
+                payload.pop("response_format", None)
+                response_body = await self._post_chat(
+                    payload, headers=headers, timeout=response_timeout
+                )
             body = json.loads(response_body)
             choices = body.get("choices") if isinstance(body, Mapping) else None
             if not isinstance(choices, list) or not choices:
@@ -223,6 +247,12 @@ class OpenAICompatibleProvider:
             "stream": True,
         }
         payload.update(self.provider_options)
+        if (
+            request.response_format == "json_object"
+            and self.supports_json_object_responses
+            and "response_format" not in payload
+        ):
+            payload["response_format"] = dict(_JSON_RESPONSE_FORMAT)
         headers = {"Content-Type": "application/json"}
         try:
             api_key = self.secret_provider.get_secret(self.api_key_secret_name)
@@ -296,6 +326,33 @@ class OpenAICompatibleProvider:
                 operation="stream",
                 retryable=isinstance(exc, httpx.HTTPError),
             ) from exc
+
+    async def _post_chat(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        headers: Mapping[str, str],
+        timeout: httpx.Timeout,
+    ) -> bytes:
+        """POST one chat-completions request and return its bounded response body."""
+
+        async with self._client.stream(
+            "POST",
+            self._chat_completions_url(),
+            headers=dict(headers),
+            json=dict(payload),
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            declared_length = response.headers.get("content-length")
+            if declared_length is not None and int(declared_length) > MAX_MODEL_RESPONSE_BYTES:
+                raise ValueError("model provider response exceeded the size limit")
+            response_body = bytearray()
+            async for chunk in response.aiter_bytes():
+                if len(response_body) + len(chunk) > MAX_MODEL_RESPONSE_BYTES:
+                    raise ValueError("model provider response exceeded the size limit")
+                response_body.extend(chunk)
+        return bytes(response_body)
 
     async def close(self) -> None:
         if self._owns_client:

@@ -32,7 +32,12 @@ from arise.core.models import (
     TaskPlan,
     UserRequest,
 )
-from arise.core.planning import InvalidPlan, PlannerUnavailable, TaskPlanner
+from arise.core.planning import (
+    InvalidPlan,
+    PlanFailureCategory,
+    PlannerUnavailable,
+    TaskPlanner,
+)
 from arise.core.policy import ApprovalGrant, PolicyDecisionKind, PolicyEngine
 from arise.core.ports import ToolNotFoundError, ToolRegistry
 from arise.core.redaction import DEFAULT_REDACTOR, SecretRedactor
@@ -593,7 +598,10 @@ class TaskEngine:
                 self.planner.create_plan(request, task), timeout=remaining
             )
             if not isinstance(plan, TaskPlan):
-                raise InvalidPlan("planner returned an untyped plan")
+                raise InvalidPlan(
+                    "planner returned an untyped plan",
+                    category=PlanFailureCategory.UNTYPED_PLAN,
+                )
             if plan.needs_clarification:
                 task = self.tasks.get(task_id) or task
                 task.transition_to(
@@ -677,9 +685,7 @@ class TaskEngine:
         except TimeoutError:
             self._fail_before_dispatch(task_id, "Planning exceeded its task deadline.")
         except (InvalidPlan, DuplicateActionError, ValueError) as exc:
-            self._fail_before_dispatch(
-                task_id, f"The generated plan was rejected ({type(exc).__name__})."
-            )
+            self._fail_rejected_plan(task_id, exc)
         except Exception as exc:
             # Do not leak provider exception bodies, URLs, prompts, or credentials.
             self._fail_before_dispatch(task_id, f"Task planning failed ({type(exc).__name__}).")
@@ -688,19 +694,36 @@ class TaskEngine:
         self, plan: TaskPlan, task: TaskRecord
     ) -> list[tuple[PlanStep, ActionContract]]:
         if plan.task_id != task.task_id:
-            raise InvalidPlan("planner returned a plan for a different task")
+            raise InvalidPlan(
+                "planner returned a plan for a different task",
+                category=PlanFailureCategory.TASK_MISMATCH,
+                detail=f"plan_task_id={plan.task_id}",
+            )
         if plan.goal != task.goal:
-            raise InvalidPlan("planner returned a plan for a different goal")
+            raise InvalidPlan(
+                "planner returned a plan for a different goal",
+                category=PlanFailureCategory.GOAL_MISMATCH,
+            )
         if len(plan.steps) > self.config.max_plan_steps:
-            raise InvalidPlan("plan exceeds the configured step limit")
+            raise InvalidPlan(
+                "plan exceeds the configured step limit",
+                category=PlanFailureCategory.STEP_LIMIT_EXCEEDED,
+                detail=f"steps={len(plan.steps)} limit={self.config.max_plan_steps}",
+            )
         if task.authorization is None:
-            raise InvalidPlan("task has no trusted user authority")
+            raise InvalidPlan(
+                "task has no trusted user authority",
+                category=PlanFailureCategory.MISSING_AUTHORITY,
+            )
         ordered_steps = self._topological_order(plan.steps)
         bound: list[tuple[PlanStep, ActionContract]] = []
         seen_actions: set[str] = set()
         for step in ordered_steps:
             if step.action.action_id in seen_actions:
-                raise InvalidPlan("plan reuses an action identifier")
+                raise InvalidPlan(
+                    "plan reuses an action identifier",
+                    category=PlanFailureCategory.DUPLICATE_ACTION_ID,
+                )
             seen_actions.add(step.action.action_id)
             action = step.action.to_domain(task_id=task.task_id, authority=task.authorization)
             tool = self._get_tool(action.tool_name)
@@ -721,18 +744,30 @@ class TaskEngine:
     def _topological_order(steps: tuple[PlanStep, ...]) -> list[PlanStep]:
         by_id = {step.step_id: step for step in steps}
         if len(by_id) != len(steps):
-            raise InvalidPlan("plan contains duplicate step IDs")
+            raise InvalidPlan(
+                "plan contains duplicate step IDs",
+                category=PlanFailureCategory.DUPLICATE_STEP_ID,
+            )
         for step in steps:
             if step.step_id in step.depends_on:
-                raise InvalidPlan("a plan step cannot depend on itself")
+                raise InvalidPlan(
+                    "a plan step cannot depend on itself",
+                    category=PlanFailureCategory.STEP_SELF_DEPENDENCY,
+                )
             if set(step.depends_on) - set(by_id):
-                raise InvalidPlan("plan references a missing dependency")
+                raise InvalidPlan(
+                    "plan references a missing dependency",
+                    category=PlanFailureCategory.UNKNOWN_DEPENDENCY,
+                )
         remaining = {step.step_id: set(step.depends_on) for step in steps}
         ordered: list[PlanStep] = []
         while remaining:
             ready = [step_id for step_id, dependencies in remaining.items() if not dependencies]
             if not ready:
-                raise InvalidPlan("plan dependency graph contains a cycle")
+                raise InvalidPlan(
+                    "plan dependency graph contains a cycle",
+                    category=PlanFailureCategory.DEPENDENCY_CYCLE,
+                )
             for step_id in ready:
                 ordered.append(by_id[step_id])
                 remaining.pop(step_id)
@@ -1252,7 +1287,37 @@ class TaskEngine:
         except ToolNotFoundError:
             return None
 
-    def _fail_before_dispatch(self, task_id: str, reason: str) -> None:
+    def _fail_rejected_plan(self, task_id: str, exc: Exception) -> None:
+        """Fail a task for a rejected plan and record sanitized diagnostics.
+
+        The user-facing reason stays short and never contains model output; the
+        audited ``PLAN_REJECTED`` event carries the bounded failure category and
+        sanitized schema field paths so operators can see which contract rule
+        rejected the proposal.
+        """
+
+        category = getattr(exc, "category", None)
+        category_value = category.value if isinstance(category, PlanFailureCategory) else None
+        detail = getattr(exc, "detail", "")
+        attempts = getattr(exc, "attempts", None)
+        code = f"{type(exc).__name__}:{category_value}" if category_value else type(exc).__name__
+        self._fail_before_dispatch(
+            task_id,
+            f"The generated plan was rejected ({code}).",
+            diagnostics={
+                "category": category_value or type(exc).__name__,
+                "detail": self.redactor.redact(detail)[:512] if isinstance(detail, str) else "",
+                "attempts": attempts if isinstance(attempts, int) and attempts >= 1 else None,
+            },
+        )
+
+    def _fail_before_dispatch(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        diagnostics: Mapping[str, object] | None = None,
+    ) -> None:
         self._deadlines.pop(task_id, None)
         self._paused_deadlines.pop(task_id, None)
         task = self.tasks.get(task_id)
@@ -1265,6 +1330,10 @@ class TaskEngine:
             return
         task.transition_to(TaskStatus.FAILED, reason=reason)
         task = self.tasks.save(task)
+        if diagnostics:
+            payload: dict[str, object] = {"reason": reason}
+            payload.update({key: value for key, value in diagnostics.items() if value is not None})
+            self._emit("PLAN_REJECTED", task, payload, EventSeverity.WARNING)
         self._emit("TASK_FAILED", task, {"reason": reason}, EventSeverity.ERROR)
 
     async def _recover_incomplete(self) -> None:

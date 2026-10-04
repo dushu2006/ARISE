@@ -241,6 +241,7 @@ class SimulatedComputerTool:
             required_resources=("simulator.desktop", "simulator.pointer", "simulator.keyboard"),
             declared_side_effects=("mutates isolated simulator state only",),
             idempotency=Idempotency.UNKNOWN,
+            parameter_names=("operation",),
         )
 
     @property
