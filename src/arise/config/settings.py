@@ -7,7 +7,7 @@ import math
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import (
     AnyHttpUrl,
@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from arise.core.model_options import validate_provider_options
 
 
 def validate_api_token(value: str) -> str:
@@ -113,12 +115,13 @@ class DatabaseSettings(BaseModel):
 
 
 class ModelSettings(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     provider_id: str | None = None
     base_url: AnyHttpUrl | None = None
     model_id: str | None = None
     api_key_secret_name: str = "NVIDIA_API_KEY"
+    provider_options: dict[str, Any] = Field(default_factory=dict)
     connect_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
     request_timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     max_concurrent_requests: int = Field(default=4, ge=1, le=128)
@@ -130,6 +133,11 @@ class ModelSettings(BaseModel):
         if not name or not name.replace("_", "").isalnum():
             raise ValueError("secret name must be an environment/keyring identifier")
         return name
+
+    @field_validator("provider_options")
+    @classmethod
+    def validate_model_provider_options(cls, options: dict[str, Any]) -> dict[str, Any]:
+        return validate_provider_options(options)
 
     @model_validator(mode="after")
     def validate_provider_configuration(self) -> ModelSettings:

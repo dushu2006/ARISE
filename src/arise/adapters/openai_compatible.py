@@ -6,12 +6,14 @@ import ipaddress
 import json
 import time
 from collections.abc import AsyncIterator, Mapping
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
 from arise.adapters.secrets import SecretProvider, SecretUnavailable
 from arise.core.errors import ProviderUnavailableError
+from arise.core.model_options import validate_provider_options
 from arise.core.models import (
     ModelMessage,
     ModelRequest,
@@ -44,6 +46,7 @@ class OpenAICompatibleProvider:
         api_key_secret_name: str,
         secret_provider: SecretProvider,
         is_cloud: bool,
+        provider_options: Mapping[str, Any] | None = None,
         max_concurrent_requests: int = 4,
         timeout_seconds: float = 120.0,
         connect_timeout_seconds: float = 10.0,
@@ -70,6 +73,7 @@ class OpenAICompatibleProvider:
         self.supports_streaming = supports_streaming
         self.base_url = base_url.rstrip("/")
         self.api_key_secret_name = api_key_secret_name
+        self.provider_options = validate_provider_options(provider_options)
         self.secret_provider = secret_provider
         self.timeout_seconds = timeout_seconds
         self.connect_timeout_seconds = connect_timeout_seconds
@@ -115,6 +119,7 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
             "stream": False,
         }
+        payload.update(self.provider_options)
         headers = {"Content-Type": "application/json"}
         try:
             api_key = self.secret_provider.get_secret(self.api_key_secret_name)
@@ -217,6 +222,7 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
             "stream": True,
         }
+        payload.update(self.provider_options)
         headers = {"Content-Type": "application/json"}
         try:
             api_key = self.secret_provider.get_secret(self.api_key_secret_name)
