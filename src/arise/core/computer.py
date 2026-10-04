@@ -86,6 +86,11 @@ class ComputerFailureCode(StrEnum):
     TARGET_STALE = "TARGET_STALE"
     WINDOW_NOT_FOUND = "WINDOW_NOT_FOUND"
     APPLICATION_NOT_FOUND = "APPLICATION_NOT_FOUND"
+    APPLICATION_AMBIGUOUS = "APPLICATION_AMBIGUOUS"
+    ACTIVATION_FAILED = "ACTIVATION_FAILED"
+    OWNERSHIP_VERIFICATION_FAILED = "OWNERSHIP_VERIFICATION_FAILED"
+    UIA_NOT_AVAILABLE = "UIA_NOT_AVAILABLE"
+    ACTION_VERIFICATION_FAILED = "ACTION_VERIFICATION_FAILED"
     BROWSER_NOT_FOUND = "BROWSER_NOT_FOUND"
     ELEMENT_NOT_INTERACTABLE = "ELEMENT_NOT_INTERACTABLE"
     PERMISSION_DENIED = "PERMISSION_DENIED"
@@ -578,14 +583,37 @@ class RunningApplication:
     name: str
     executable_path: str | None = None
     window_ids: tuple[str, ...] = ()
+    package_family_name: str | None = None
 
     def __post_init__(self) -> None:
         if self.process_id <= 0 or not self.name.strip():
             raise ValueError("running application identity is invalid")
         if self.executable_path is not None and len(self.executable_path) > 4096:
             raise ValueError("executable path exceeds the size limit")
+        if self.package_family_name is not None and len(self.package_family_name) > 256:
+            raise ValueError("package family name exceeds the size limit")
         if len(self.window_ids) > 256:
             raise ValueError("application window count exceeds the limit")
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledApplication:
+    """Safe catalog summary for an installed app; contains no launch path."""
+
+    identity: str
+    name: str
+    source: str
+    activation_method: str
+
+    def __post_init__(self) -> None:
+        if not self.identity or len(self.identity) > 128:
+            raise ValueError("installed application identity must be bounded")
+        if not self.name.strip() or len(self.name) > 256:
+            raise ValueError("installed application name must be bounded")
+        if not self.source or len(self.source) > 64:
+            raise ValueError("installed application source must be bounded")
+        if not self.activation_method or len(self.activation_method) > 64:
+            raise ValueError("installed application activation method must be bounded")
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,6 +629,8 @@ class WindowRecord:
     bounds: Rect | None = None
     class_name: str | None = None
     executable_path: str | None = None
+    package_family_name: str | None = None
+    aumid: str | None = None
 
     def __post_init__(self) -> None:
         if not self.window_id.strip() or len(self.window_id) > 256:
@@ -609,6 +639,12 @@ class WindowRecord:
             raise ValueError("window process_id must be positive")
         if len(self.title) > 2048:
             raise ValueError("window title exceeds the size limit")
+        if self.executable_path is not None and len(self.executable_path) > 4096:
+            raise ValueError("window executable path exceeds the size limit")
+        if self.package_family_name is not None and len(self.package_family_name) > 256:
+            raise ValueError("window package family name exceeds the size limit")
+        if self.aumid is not None and len(self.aumid) > 512:
+            raise ValueError("window AUMID exceeds the size limit")
 
 
 @dataclass(frozen=True, slots=True)

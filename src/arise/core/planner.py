@@ -37,7 +37,7 @@ from arise.core.ports import ToolRegistry
 from arise.core.tasks import TaskRecord
 
 # Identifies the prompt/response contract revision for audit records.
-PLANNER_CONTRACT_VERSION = "planner-contract-4"
+PLANNER_CONTRACT_VERSION = "planner-contract-5"
 
 MAX_PLANNER_ATTEMPTS = 2
 

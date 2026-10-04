@@ -436,8 +436,7 @@ class CompositeEnvironment:
 
     async def observe(self, action: ActionContract) -> ObservationLease:
         if (
-            action.tool_name == "system.app_launch"
-            or action.tool_name.startswith("system.")
+            action.tool_name == "system.app_launch" or action.tool_name.startswith("system.")
         ) and self.app_launch is not None:
             return await self.app_launch.observe(action)
         if action.tool_name.startswith("uia.") and self.uia is not None:
@@ -485,8 +484,7 @@ class CompositeVerifier:
 
     async def verify(self, action: ActionContract) -> VerificationResult:
         if (
-            action.tool_name == "system.app_launch"
-            or action.tool_name.startswith("system.")
+            action.tool_name == "system.app_launch" or action.tool_name.startswith("system.")
         ) and self.app_launch is not None:
             return await self.app_launch.verify(action)
         if action.tool_name.startswith("uia.") and self.uia is not None:
@@ -865,9 +863,11 @@ def _build_services(settings: AppSettings) -> ServerServices:
     app_launch_provider: WindowsAppLaunchProvider | None = None
     if settings.desktop.enabled:
         uia_backend = Win32UiaBackend()
+        application_resolver = WindowsApplicationResolver()
         uia_provider = WindowsUiaProvider(
             backend=uia_backend,
             secret_provider=secret_provider,
+            application_resolver=application_resolver,
             max_tree_depth=settings.desktop.max_tree_depth,
             max_tree_nodes=settings.desktop.max_nodes,
             allow_coordinate_fallback=settings.perception.allow_coordinate_fallback,
@@ -877,7 +877,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         app_launch_backend = Win32AppLaunchBackend(uia_backend=uia_backend)
         app_launch_provider = WindowsAppLaunchProvider(
             backend=app_launch_backend,
-            resolver=WindowsApplicationResolver(),
+            resolver=application_resolver,
         )
         register_app_launch_tools(tools, app_launch_provider)
     browser_provider: PlaywrightBrowserProvider | None = None
@@ -983,9 +983,8 @@ def _build_services(settings: AppSettings) -> ServerServices:
         grants: set[str] = set()
         if settings.desktop.enabled or uia_provider is not None:
             grants.add("desktop.ui_automation")
-        if (
-            app_launch_provider is not None
-            or (settings.desktop.enabled and sys.platform == "win32")
+        if app_launch_provider is not None or (
+            settings.desktop.enabled and sys.platform == "win32"
         ):
             grants.add("desktop.launch")
         if browser_provider is not None:
@@ -993,9 +992,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         return frozenset(grants)
 
     has_active_provider = (
-        uia_provider is not None
-        or browser_provider is not None
-        or app_launch_provider is not None
+        uia_provider is not None or browser_provider is not None or app_launch_provider is not None
     )
     environment = (
         CompositeEnvironment(
@@ -2151,7 +2148,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 if task.session_id == session.session_id
                 and (
                     services.engine.is_active(task.task_id)
-                    or task.status not in {
+                    or task.status
+                    not in {
                         TaskStatus.COMPLETED,
                         TaskStatus.FAILED,
                         TaskStatus.CANCELLED,

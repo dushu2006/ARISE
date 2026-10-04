@@ -17,6 +17,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -28,8 +29,19 @@ from typing import Any, Protocol
 
 import psutil
 
+from arise.adapters.windows_app_discovery import (
+    ActivationMethod,
+    ApplicationDescriptor,
+    WindowsApplicationCatalog,
+    activate_packaged_application,
+    normalize_application_name,
+    normalized_executable_key,
+    package_family_name_for_pid,
+    shell_execute_shortcut,
+)
 from arise.core.computer import (
     ComputerFailureCode,
+    InstalledApplication,
     PerceptionSource,
     RunningApplication,
     WindowRecord,
@@ -233,9 +245,7 @@ KNOWN_ALIASES: dict[str, KnownAppAlias] = {
         name="PowerShell",
         executables=("powershell.exe", "pwsh.exe", "powershell"),
         process_names=("powershell.exe", "pwsh.exe", "powershell"),
-        standard_windows_paths=(
-            r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe",),
     ),
     "pwsh": KnownAppAlias(
         name="PowerShell",
@@ -250,25 +260,19 @@ KNOWN_ALIASES: dict[str, KnownAppAlias] = {
         name="PowerShell",
         executables=("powershell.exe", "pwsh.exe"),
         process_names=("powershell.exe", "pwsh.exe"),
-        standard_windows_paths=(
-            r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe",),
     ),
     "terminal": KnownAppAlias(
         name="Windows Terminal",
         executables=("wt.exe", "WindowsTerminal.exe", "wt"),
         process_names=("WindowsTerminal.exe", "wt.exe", "wt"),
-        standard_windows_paths=(
-            r"%LocalAppData%\Microsoft\WindowsApps\wt.exe",
-        ),
+        standard_windows_paths=(r"%LocalAppData%\Microsoft\WindowsApps\wt.exe",),
     ),
     "windows terminal": KnownAppAlias(
         name="Windows Terminal",
         executables=("wt.exe", "WindowsTerminal.exe", "wt"),
         process_names=("WindowsTerminal.exe", "wt.exe", "wt"),
-        standard_windows_paths=(
-            r"%LocalAppData%\Microsoft\WindowsApps\wt.exe",
-        ),
+        standard_windows_paths=(r"%LocalAppData%\Microsoft\WindowsApps\wt.exe",),
     ),
     "edge": KnownAppAlias(
         name="Microsoft Edge",
@@ -301,17 +305,13 @@ KNOWN_ALIASES: dict[str, KnownAppAlias] = {
         name="File Explorer",
         executables=("explorer.exe", "explorer"),
         process_names=("explorer.exe",),
-        standard_windows_paths=(
-            r"%SystemRoot%\explorer.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\explorer.exe",),
     ),
     "file explorer": KnownAppAlias(
         name="File Explorer",
         executables=("explorer.exe", "explorer"),
         process_names=("explorer.exe",),
-        standard_windows_paths=(
-            r"%SystemRoot%\explorer.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\explorer.exe",),
     ),
     "paint": KnownAppAlias(
         name="Paint",
@@ -326,50 +326,70 @@ KNOWN_ALIASES: dict[str, KnownAppAlias] = {
         name="Paint",
         executables=("mspaint.exe", "mspaint"),
         process_names=("mspaint.exe", "mspaint"),
-        standard_windows_paths=(
-            r"%SystemRoot%\System32\mspaint.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\System32\mspaint.exe",),
     ),
     "cmd": KnownAppAlias(
         name="Command Prompt",
         executables=("cmd.exe", "cmd"),
         process_names=("cmd.exe", "cmd"),
-        standard_windows_paths=(
-            r"%SystemRoot%\System32\cmd.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\System32\cmd.exe",),
     ),
     "command prompt": KnownAppAlias(
         name="Command Prompt",
         executables=("cmd.exe", "cmd"),
         process_names=("cmd.exe", "cmd"),
-        standard_windows_paths=(
-            r"%SystemRoot%\System32\cmd.exe",
-        ),
+        standard_windows_paths=(r"%SystemRoot%\System32\cmd.exe",),
     ),
 }
 
 
-@dataclass(frozen=True, slots=True)
-class ResolvedApplication:
-    """Deterministic, verified executable identity resolved on the host."""
+# Backwards-compatible import name; the record is now the normalized descriptor.
+ResolvedApplication = ApplicationDescriptor
 
-    name: str
-    executable_path: str
-    process_names: tuple[str, ...]
-    allow_reuse: bool = True
+
+@dataclass(frozen=True, slots=True)
+class _RankedApplication:
+    descriptor: ApplicationDescriptor
+    score: int
+    matched_by: str
 
 
 class WindowsApplicationResolver:
-    """Safe, multi-tiered application resolution preventing command injection."""
+    """Resolve app names from a bounded catalog before optional alias/path fallbacks."""
 
-    def __init__(self, *, custom_aliases: Mapping[str, ResolvedApplication] | None = None) -> None:
-        self._custom_aliases: dict[str, ResolvedApplication] = dict(custom_aliases or {})
+    def __init__(
+        self,
+        *,
+        custom_aliases: Mapping[str, ApplicationDescriptor] | None = None,
+        catalog: WindowsApplicationCatalog | Any | None = None,
+        cache_ttl_seconds: float = 30.0,
+    ) -> None:
+        if not 0.0 <= cache_ttl_seconds <= 300.0:
+            raise ValueError("application catalog cache TTL must be between 0 and 300 seconds")
+        self._custom_aliases: dict[str, ApplicationDescriptor] = {}
+        for alias_name, descriptor in (custom_aliases or {}).items():
+            self.register_alias(alias_name, descriptor)
+        self._catalog = catalog or WindowsApplicationCatalog()
+        self._cache_ttl_seconds = cache_ttl_seconds
+        self._catalog_cache: tuple[ApplicationDescriptor, ...] = ()
+        self._catalog_cached_at = 0.0
+        self._catalog_lock = threading.RLock()
+        self._last_diagnostic: dict[str, Any] = {}
 
-    def register_alias(self, alias_name: str, resolved: ResolvedApplication) -> None:
-        self._custom_aliases[alias_name.strip().casefold()] = resolved
+    @property
+    def last_diagnostic(self) -> dict[str, Any]:
+        result = dict(self._last_diagnostic)
+        result["candidates"] = [dict(item) for item in self._last_diagnostic.get("candidates", ())]
+        return result
+
+    def register_alias(self, alias_name: str, resolved: ApplicationDescriptor) -> None:
+        clean_alias = self.validate_name(alias_name)
+        if not isinstance(resolved, ApplicationDescriptor):
+            raise TypeError("application aliases must point to an ApplicationDescriptor")
+        self._custom_aliases[normalize_application_name(clean_alias)] = resolved
 
     def validate_name(self, app_name: str) -> str:
-        """Strictly validate an untrusted application name proposal."""
+        """Validate a semantic name; paths and command-line/shell syntax are rejected."""
         if not isinstance(app_name, str):
             raise ValueError("application name must be a string")
         stripped = app_name.strip()
@@ -377,210 +397,303 @@ class WindowsApplicationResolver:
             raise ValueError("application name cannot be blank")
         if len(stripped) > 128:
             raise ValueError("application name exceeds maximum length of 128 characters")
-        if any(char in _FORBIDDEN_CHARACTERS for char in stripped):
-            raise ValueError("application name contains forbidden shell characters")
-        if ".." in stripped or "/../" in stripped or "\\..\\" in stripped:
+        if any(char in _FORBIDDEN_CHARACTERS or char in "/\\" for char in stripped):
+            raise ValueError("application name contains forbidden shell or path characters")
+        if any(ord(char) < 32 for char in stripped):
+            raise ValueError("application name contains control characters")
+        if ".." in stripped:
             raise ValueError("application name contains path traversal tokens")
-
-        parts = stripped.split()
-        if len(parts) > 1:
-            for part in parts[1:]:
-                if part.startswith(("-", "/", "--")):
-                    raise ValueError("application name contains forbidden command arguments")
-
-        if not _SAFE_APP_NAME_RE.fullmatch(stripped):
-            raise ValueError(f"application name '{stripped}' contains unsupported characters")
+        for part in stripped.split()[1:]:
+            if part.startswith(("-", "/", "--")):
+                raise ValueError("application name contains forbidden command arguments")
+        if not all(char.isalnum() or char in " _.-()" for char in stripped):
+            raise ValueError("application name contains unsupported characters")
+        if not normalize_application_name(stripped):
+            raise ValueError("application name must contain a letter or number")
         return stripped
 
-    def resolve(self, app_name: str) -> ResolvedApplication:
-        """Resolve a semantic application name through the deterministic hierarchy."""
+    def discover_installed(self, *, refresh: bool = False) -> tuple[ApplicationDescriptor, ...]:
+        """Return the bounded installed-app catalog, cached for a short interval."""
+        with self._catalog_lock:
+            now = time.monotonic()
+            if (
+                not refresh
+                and self._catalog_cached_at > 0
+                and now - self._catalog_cached_at < self._cache_ttl_seconds
+            ):
+                return self._catalog_cache
+            try:
+                discovered = tuple(self._catalog.discover())[:4096]
+            except Exception:
+                discovered = ()
+            unique: dict[str, ApplicationDescriptor] = {}
+            for descriptor in discovered:
+                if not isinstance(descriptor, ApplicationDescriptor):
+                    continue
+                unique.setdefault(descriptor.canonical_identity, descriptor)
+            self._catalog_cache = tuple(
+                sorted(
+                    unique.values(),
+                    key=lambda item: (item.normalized_name, item.canonical_identity),
+                )
+            )
+            self._catalog_cached_at = now
+            return self._catalog_cache
+
+    def resolve(self, app_name: str) -> ApplicationDescriptor:
+        """Resolve one exact/high-confidence candidate or fail closed on ambiguity."""
         clean_name = self.validate_name(app_name)
-        key = clean_name.casefold()
+        query_key = normalize_application_name(clean_name)
+        alias = KNOWN_ALIASES.get(clean_name.casefold())
+        ranked = self._rank_catalog_matches(clean_name, alias)
+        if not ranked:
+            ranked = self._rank_fallback_matches(clean_name, alias)
 
-        # 1. Custom / fixture aliases
-        if key in self._custom_aliases:
-            return self._custom_aliases[key]
+        ranked = self._deduplicate_ranked(ranked)
+        ranked.sort(
+            key=lambda item: (
+                -item.score,
+                item.descriptor.normalized_name,
+                item.descriptor.canonical_identity,
+            )
+        )
+        candidate_diagnostics = [self._candidate_diagnostic(item) for item in ranked[:8]]
+        if not ranked:
+            self._last_diagnostic = self._resolution_diagnostic(
+                clean_name, query_key, "not_found", candidate_diagnostics
+            )
+            raise ComputerAdapterError(
+                ComputerFailureCode.APPLICATION_NOT_FOUND,
+                f"Application '{clean_name}' was not found in installed-app metadata, "
+                "Start Menu, App Paths, or PATH.",
+                source=PerceptionSource.APPLICATION_API,
+            )
 
-        alias = KNOWN_ALIASES.get(key)
+        best_score = ranked[0].score
+        best = [item for item in ranked if item.score == best_score]
+        if len(best) != 1:
+            self._last_diagnostic = self._resolution_diagnostic(
+                clean_name, query_key, "ambiguous", candidate_diagnostics
+            )
+            choices = ", ".join(
+                f"{self._diagnostic_label(item.descriptor.name)} [{item.descriptor.source}]"
+                for item in best[:5]
+            )
+            raise ComputerAdapterError(
+                ComputerFailureCode.APPLICATION_AMBIGUOUS,
+                f"Application '{clean_name}' matches multiple installed applications "
+                f"({choices}); specify a more exact name.",
+                source=PerceptionSource.APPLICATION_API,
+            )
+
+        selected = best[0]
+        self._last_diagnostic = self._resolution_diagnostic(
+            clean_name,
+            query_key,
+            "resolved",
+            candidate_diagnostics,
+            selected_identity=selected.descriptor.diagnostic_identity,
+        )
+        return selected.descriptor
+
+    def _rank_catalog_matches(
+        self, clean_name: str, alias: KnownAppAlias | None
+    ) -> list[_RankedApplication]:
+        query_key = normalize_application_name(clean_name)
+        ranked: list[_RankedApplication] = []
+        for descriptor in self.discover_installed():
+            score = 0
+            matched_by = ""
+            if query_key == descriptor.normalized_name:
+                score, matched_by = 120, "display_name_exact"
+            elif any(
+                query_key == normalize_application_name(value) for value in descriptor.aliases
+            ):
+                score, matched_by = 110, "catalog_alias_exact"
+            elif not descriptor.is_web_app and any(
+                query_key == normalize_application_name(_safe_basename(value))
+                for value in descriptor.process_names
+            ):
+                score, matched_by = 100, "process_name_exact"
+            elif alias is not None and query_key == normalize_application_name(alias.name):
+                score, matched_by = 90, "known_alias_canonical_name"
+            elif alias is not None and any(
+                query_key == normalize_application_name(_safe_basename(value))
+                for value in alias.process_names
+            ):
+                score, matched_by = 90, "known_alias_process_name"
+            if score:
+                ranked.append(_RankedApplication(descriptor, score, matched_by))
+        return ranked
+
+    def _rank_fallback_matches(
+        self, clean_name: str, alias: KnownAppAlias | None
+    ) -> list[_RankedApplication]:
         canonical_name = alias.name if alias else clean_name
         process_names = alias.process_names if alias else (f"{clean_name}.exe", clean_name)
         allow_reuse = alias.allow_reuse if alias else True
+        descriptors: list[ApplicationDescriptor] = []
 
-        # 2. Check standard Windows paths if known alias
-        if alias and sys.platform == "win32":
+        if alias is not None and sys.platform == "win32":
             for template in alias.standard_windows_paths:
-                expanded = os.path.expandvars(template)
-                if os.path.isfile(expanded):
-                    return ResolvedApplication(
-                        name=canonical_name,
-                        executable_path=os.path.normpath(expanded),
-                        process_names=process_names,
-                        allow_reuse=allow_reuse,
+                expanded = os.path.normpath(os.path.expandvars(template))
+                if os.path.isfile(expanded) and expanded.casefold().endswith(".exe"):
+                    descriptors.append(
+                        ApplicationDescriptor(
+                            name=canonical_name,
+                            executable_path=expanded,
+                            process_names=process_names,
+                            allow_reuse=allow_reuse,
+                            source="known_alias_path",
+                        )
                     )
 
-        # 3. Windows Registry: App Paths
         if sys.platform == "win32":
-            app_path = self._query_windows_app_paths(alias, clean_name)
-            if app_path:
-                return ResolvedApplication(
-                    name=canonical_name,
-                    executable_path=app_path,
-                    process_names=process_names,
-                    allow_reuse=allow_reuse,
+            for app_path in self._query_windows_app_paths_candidates(alias, clean_name):
+                descriptors.append(
+                    ApplicationDescriptor(
+                        name=canonical_name,
+                        executable_path=app_path,
+                        process_names=(*process_names, _safe_basename(app_path)),
+                        allow_reuse=allow_reuse,
+                        source="registry_app_paths",
+                    )
                 )
 
-        # 4. Windows Registry: Uninstall entries DisplayName match
-        if sys.platform == "win32":
-            uninstall_path = self._query_windows_uninstall(clean_name)
-            if uninstall_path:
-                return ResolvedApplication(
-                    name=canonical_name,
-                    executable_path=uninstall_path,
-                    process_names=process_names,
-                    allow_reuse=allow_reuse,
-                )
-
-        # 5. PATH executable resolution via shutil.which
-        candidates = (
-            alias.executables
-            if alias
-            else (clean_name, f"{clean_name}.exe", f"{clean_name}.cmd", f"{clean_name}.bat")
-        )
-        for candidate in candidates:
+        path_candidates = list(alias.executables) if alias is not None else []
+        path_candidates.extend((clean_name, f"{clean_name}.exe"))
+        for candidate in dict.fromkeys(path_candidates):
             found = shutil.which(candidate)
-            if found and os.path.isfile(found):
-                resolved_proc = (_safe_basename(found), *process_names)
-                return ResolvedApplication(
+            if not found or not os.path.isfile(found):
+                continue
+            if sys.platform == "win32" and not found.casefold().endswith(".exe"):
+                continue
+            descriptors.append(
+                ApplicationDescriptor(
                     name=canonical_name,
                     executable_path=os.path.normpath(found),
-                    process_names=resolved_proc,
+                    process_names=(_safe_basename(found), *process_names),
                     allow_reuse=allow_reuse,
+                    source="path_executable",
                 )
+            )
 
-        # If on non-Windows (e.g. Linux test environment with standard binaries)
-        if sys.platform != "win32":
-            found = shutil.which(clean_name.lower())
-            if found and os.path.isfile(found):
-                return ResolvedApplication(
-                    name=canonical_name,
-                    executable_path=os.path.normpath(found),
-                    process_names=(_safe_basename(found), clean_name),
-                    allow_reuse=allow_reuse,
-                )
+        custom = self._custom_aliases.get(normalize_application_name(clean_name))
+        if custom is not None:
+            descriptors.append(custom)
 
-        raise ComputerAdapterError(
-            ComputerFailureCode.APPLICATION_NOT_FOUND,
-            f"Application '{app_name}' could not be resolved to an installed executable.",
-            source=PerceptionSource.APPLICATION_API,
+        # Fallbacks are intentionally lower priority than installed catalog metadata;
+        # an explicitly registered alias only outranks OS path fallbacks.
+        return [
+            _RankedApplication(
+                item,
+                90 if item is custom else 80,
+                "registered_alias_exact" if item is custom else f"{item.source}_exact",
+            )
+            for item in descriptors
+        ]
+
+    @staticmethod
+    def _deduplicate_ranked(items: Sequence[_RankedApplication]) -> list[_RankedApplication]:
+        unique: dict[str, _RankedApplication] = {}
+        for item in items:
+            current = unique.get(item.descriptor.canonical_identity)
+            if current is None or item.score > current.score:
+                unique[item.descriptor.canonical_identity] = item
+        return list(unique.values())
+
+    @staticmethod
+    def _candidate_diagnostic(item: _RankedApplication) -> dict[str, Any]:
+        summary = item.descriptor.diagnostic_summary()
+        summary.update(score=item.score, matched_by=item.matched_by)
+        return summary
+
+    @staticmethod
+    def _diagnostic_label(value: str) -> str:
+        return "".join(
+            character if character.isalnum() or character in " _.-()" else "?"
+            for character in value[:128]
         )
 
-    def _query_windows_app_paths(self, alias: KnownAppAlias | None, clean_name: str) -> str | None:
+    def _resolution_diagnostic(
+        self,
+        requested: str,
+        normalized_query: str,
+        outcome: str,
+        candidates: list[dict[str, Any]],
+        *,
+        selected_identity: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "requested_application": self._diagnostic_label(requested),
+            "normalized_query": normalized_query[:128],
+            "outcome": outcome,
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "selected_identity": selected_identity,
+        }
+
+    def _query_windows_app_paths_candidates(
+        self, alias: KnownAppAlias | None, clean_name: str
+    ) -> tuple[str, ...]:
         try:
             import winreg
         except ImportError:
-            return None
-
-        candidates: list[str] = []
-        if alias:
-            candidates.extend(alias.executables)
-        candidates.extend([f"{clean_name}.exe", clean_name])
-
+            return ()
+        candidates = list(alias.executables) if alias is not None else []
+        candidates.extend((clean_name, f"{clean_name}.exe"))
         roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
         flags = (
             winreg.KEY_READ,
             winreg.KEY_READ | winreg.KEY_WOW64_32KEY,
             winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
         )
-
-        for candidate in candidates:
-            subpath = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{candidate}"
-            if not candidate.casefold().endswith(".exe"):
-                subpath = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{candidate}.exe"
-            for root in roots:
+        found_paths: dict[str, str] = {}
+        for candidate in dict.fromkeys(candidates):
+            registry_name = (
+                candidate if candidate.casefold().endswith(".exe") else f"{candidate}.exe"
+            )
+            subpath = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{registry_name}"
+            for registry_root in roots:
                 for flag in flags:
                     try:
-                        with winreg.OpenKey(root, subpath, 0, flag) as key:
-                            val, _ = winreg.QueryValueEx(key, "")
-                            if isinstance(val, str) and val.strip():
-                                clean_val = val.strip().strip('"')
-                                expanded = os.path.expandvars(clean_val)
-                                if os.path.isfile(expanded):
-                                    return os.path.normpath(expanded)
+                        with winreg.OpenKey(registry_root, subpath, 0, flag) as key:
+                            value, _ = winreg.QueryValueEx(key, "")
                     except OSError:
                         continue
-        return None
+                    if not isinstance(value, str):
+                        continue
+                    expanded = os.path.normpath(os.path.expandvars(value.strip().strip('"')))
+                    if expanded.casefold().endswith(".exe") and os.path.isfile(expanded):
+                        found_paths.setdefault(normalized_executable_key(expanded), expanded)
+        return tuple(found_paths.values())
+
+    def _query_windows_app_paths(self, alias: KnownAppAlias | None, clean_name: str) -> str | None:
+        """Compatibility helper; ambiguity is represented by returning no single path."""
+        paths = self._query_windows_app_paths_candidates(alias, clean_name)
+        return paths[0] if len(paths) == 1 else None
 
     def _query_windows_uninstall(self, clean_name: str) -> str | None:
-        try:
-            import winreg
-        except ImportError:
-            return None
-
-        roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
-        flags = (
-            winreg.KEY_READ,
-            winreg.KEY_READ | winreg.KEY_WOW64_32KEY,
-            winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
-        )
-        uninstall_subpath = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
-        target_name = clean_name.casefold()
-
-        for root in roots:
-            for flag in flags:
-                try:
-                    with winreg.OpenKey(root, uninstall_subpath, 0, flag) as uninstall_key:
-                        num_subkeys = winreg.QueryInfoKey(uninstall_key)[0]
-                        for idx in range(min(num_subkeys, 1024)):
-                            try:
-                                subkey_name = winreg.EnumKey(uninstall_key, idx)
-                                with winreg.OpenKey(uninstall_key, subkey_name) as subkey:
-                                    disp_name, _ = winreg.QueryValueEx(subkey, "DisplayName")
-                                    if (
-                                        not isinstance(disp_name, str)
-                                        or target_name not in disp_name.casefold()
-                                    ):
-                                        continue
-                                    try:
-                                        icon, _ = winreg.QueryValueEx(subkey, "DisplayIcon")
-                                        if isinstance(icon, str):
-                                            icon_clean = icon.split(",")[0].strip().strip('"')
-                                            expanded_icon = os.path.expandvars(icon_clean)
-                                            if (
-                                                os.path.isfile(expanded_icon)
-                                                and expanded_icon.lower().endswith(".exe")
-                                            ):
-                                                return os.path.normpath(expanded_icon)
-                                    except OSError:
-                                        pass
-                                    try:
-                                        loc, _ = winreg.QueryValueEx(subkey, "InstallLocation")
-                                        if isinstance(loc, str) and loc.strip():
-                                            loc_clean = loc.strip().strip('"')
-                                            expanded_loc = os.path.expandvars(loc_clean)
-                                            if os.path.isdir(expanded_loc):
-                                                for root_dir, _, files in os.walk(expanded_loc):
-                                                    for file in files:
-                                                        if file.lower().endswith(".exe"):
-                                                            full_cand = os.path.join(
-                                                                root_dir, file
-                                                            )
-                                                            if os.path.isfile(full_cand):
-                                                                return os.path.normpath(full_cand)
-                                    except OSError:
-                                        pass
-                            except OSError:
-                                continue
-                except OSError:
-                    continue
-        return None
+        """Return only a unique exact-name registry executable; never the first .exe."""
+        key = normalize_application_name(clean_name)
+        matches = {
+            normalized_executable_key(item.executable_path): item.executable_path
+            for item in self.discover_installed(refresh=True)
+            if item.source == "installed_registry"
+            and item.normalized_name == key
+            and item.executable_path
+        }
+        return next(iter(matches.values())) if len(matches) == 1 else None
 
 
 class WindowsAppLaunchBackend(Protocol):
-    """Port isolating process spawning and window query operations."""
+    """Port isolating safe activation and observed desktop operations."""
 
     async def list_running_processes(self) -> Sequence[dict[str, Any]]: ...
 
     async def launch_process(self, executable_path: str) -> int: ...
+
+    async def activate_application(self, application: ApplicationDescriptor) -> int | None: ...
 
     async def is_process_alive(self, pid: int) -> bool: ...
 
@@ -604,13 +717,27 @@ class Win32AppLaunchBackend:
         results: list[dict[str, Any]] = []
         try:
             for proc in psutil.process_iter(["pid", "name", "exe"]):
+                if len(results) >= _MAX_OBSERVED_PROCESSES + 1:
+                    break
                 try:
                     info = proc.info
                     pid = int(info.get("pid") or proc.pid)
                     name = str(info.get("name") or proc.name())
                     exe = str(info.get("exe") or "")
                     if pid > 0 and name:
-                        results.append({"pid": pid, "name": name, "exe": exe})
+                        package_family = (
+                            package_family_name_for_pid(pid)
+                            if "\\windowsapps\\" in exe.casefold()
+                            else None
+                        )
+                        results.append(
+                            {
+                                "pid": pid,
+                                "name": name,
+                                "exe": exe,
+                                "package_family_name": package_family,
+                            }
+                        )
                 except (psutil.Error, OSError, ValueError):
                     continue
         except (psutil.Error, OSError):
@@ -620,6 +747,16 @@ class Win32AppLaunchBackend:
     async def launch_process(self, executable_path: str) -> int:
         return await asyncio.to_thread(self._sync_launch_process, executable_path)
 
+    async def activate_application(self, application: ApplicationDescriptor) -> int | None:
+        """Dispatch through the descriptor's safe native activation mechanism."""
+        if application.activation_method is ActivationMethod.PACKAGED_AUMID:
+            return await asyncio.to_thread(activate_packaged_application, application.aumid or "")
+        if application.activation_method is ActivationMethod.START_MENU_SHORTCUT:
+            return await asyncio.to_thread(shell_execute_shortcut, application.shortcut_path or "")
+        if application.executable_path:
+            return await self.launch_process(application.executable_path)
+        raise OSError("Resolved application has no supported activation target.")
+
     def _sync_launch_process(self, executable_path: str) -> int:
         if sys.platform != "win32":
             raise ComputerAdapterError(
@@ -628,8 +765,10 @@ class Win32AppLaunchBackend:
                 source=PerceptionSource.APPLICATION_API,
             )
         norm_path = os.path.normpath(executable_path)
+        if not norm_path.casefold().endswith(".exe"):
+            raise OSError("Only directly executable Windows .exe files are supported.")
         if not os.path.isfile(norm_path):
-            raise FileNotFoundError(f"Executable not found: {norm_path}")
+            raise FileNotFoundError("Resolved executable is no longer available.")
 
         creationflags = 0
         if sys.platform == "win32":
@@ -664,8 +803,8 @@ class Win32AppLaunchBackend:
         if self._uia_backend is not None and hasattr(self._uia_backend, "list_windows"):
             return await self._uia_backend.list_windows()
         raise ComputerAdapterError(
-            ComputerFailureCode.ADAPTER_UNAVAILABLE,
-            "Application window observation backend is unavailable.",
+            ComputerFailureCode.UIA_NOT_AVAILABLE,
+            "Windows window observation is unavailable for launch verification.",
             source=PerceptionSource.APPLICATION_API,
         )
 
@@ -673,23 +812,20 @@ class Win32AppLaunchBackend:
         if self._uia_backend is not None and hasattr(self._uia_backend, "focus_window"):
             return await self._uia_backend.focus_window(window_id)
         raise ComputerAdapterError(
-            ComputerFailureCode.ADAPTER_UNAVAILABLE,
-            "Window focus backend is unavailable.",
+            ComputerFailureCode.UIA_NOT_AVAILABLE,
+            "Windows focus is unavailable for launch verification.",
             source=PerceptionSource.APPLICATION_API,
         )
 
 
 @dataclass(frozen=True, slots=True)
 class ObservedProcess:
-    """One observed process.
-
-    The executable path is the only trusted application identity; a process name
-    alone never proves that a process belongs to the resolved application.
-    """
+    """One observed process with OS-supplied executable/package identity."""
 
     process_id: int
     name: str
     executable_path: str
+    package_family_name: str | None = None
 
     @property
     def executable_key(self) -> str:
@@ -808,13 +944,18 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 process_id=process_id,
                 name=str(proc.get("name") or ""),
                 executable_path=str(proc.get("exe") or ""),
+                package_family_name=str(proc.get("package_family_name") or "") or None,
             ),
             resolved,
         )
 
     def _process_matches(self, process: ObservedProcess, resolved: ResolvedApplication) -> bool:
-        """Native launches require the resolved executable's observed path."""
+        """Require exact executable or Windows package-family identity."""
         if self._requires_window:
+            if resolved.package_family_name:
+                return normalize_application_name(
+                    process.package_family_name or ""
+                ) == normalize_application_name(resolved.package_family_name)
             expected = _executable_key(resolved.executable_path)
             return bool(expected) and process.executable_key == expected
         names = {_safe_basename(name).casefold() for name in resolved.process_names}
@@ -826,37 +967,67 @@ class WindowsAppLaunchProvider(ApplicationProvider):
     def _window_owner_identity(
         self, window: WindowRecord, snapshot: DesktopSnapshot
     ) -> tuple[int | None, list[str]]:
-        """Observed executable identity of a window's owning process.
-
-        The window record can carry the owner's executable path (recorded by the
-        native window backend while enumerating the HWND); the process snapshot is
-        an independent observation of the same owner. Both are compared when present.
-        """
+        """Gather independent OS observations of the HWND owner's identity."""
         owner_pid = window.process_id if window.process_id and window.process_id > 0 else None
         identities: list[str] = []
+        if window.aumid:
+            identities.append(f"aumid:{window.aumid.casefold()}")
+        if window.package_family_name:
+            identities.append(f"package:{normalize_application_name(window.package_family_name)}")
         record_key = _executable_key(window.executable_path)
         if record_key:
-            identities.append(record_key)
+            identities.append(f"executable:{record_key}")
         observed = snapshot.processes.get(owner_pid) if owner_pid is not None else None
-        if observed is not None and observed.executable_key:
-            identities.append(observed.executable_key)
+        if observed is not None:
+            if observed.package_family_name:
+                identities.append(
+                    f"package:{normalize_application_name(observed.package_family_name)}"
+                )
+            if observed.executable_key:
+                identities.append(f"executable:{observed.executable_key}")
         return owner_pid, identities
 
     def _window_owner_verified(
         self, window: WindowRecord, snapshot: DesktopSnapshot, resolved: ResolvedApplication
     ) -> bool:
-        """Prove that a window belongs to the resolved application's executable.
-
-        Ownership is established only from observed executable paths: a missing
-        identity fails closed, and a conflicting identity also fails closed.
-        """
-        expected = _executable_key(resolved.executable_path)
-        if not expected:
+        """Fail closed unless the window owner has exact observed app identity."""
+        if (
+            resolved.is_web_app
+            and normalize_application_name(window.title) != resolved.normalized_name
+        ):
             return False
         owner_pid, identities = self._window_owner_identity(window, snapshot)
         if owner_pid is None or not identities:
             return False
-        return all(identity == expected for identity in identities)
+        if resolved.package_family_name:
+            expected_family = f"package:{normalize_application_name(resolved.package_family_name)}"
+            package_identities = [
+                identity for identity in identities if identity.startswith("package:")
+            ]
+            if package_identities and not all(
+                identity == expected_family for identity in package_identities
+            ):
+                return False
+            aumid_identities = [
+                identity for identity in identities if identity.startswith("aumid:")
+            ]
+            if resolved.aumid and aumid_identities:
+                expected_aumid = f"aumid:{resolved.aumid.casefold()}"
+                return all(identity == expected_aumid for identity in aumid_identities) and all(
+                    identity == expected_family for identity in package_identities
+                )
+            return bool(package_identities) and all(
+                identity == expected_family for identity in package_identities
+            )
+        expected_executable = _executable_key(resolved.executable_path)
+        executable_identities = [
+            identity.removeprefix("executable:")
+            for identity in identities
+            if identity.startswith("executable:")
+        ]
+        return bool(expected_executable and executable_identities) and all(
+            identity == expected_executable for identity in executable_identities
+        )
 
     @staticmethod
     def _window_is_active(window: WindowRecord) -> bool:
@@ -925,6 +1096,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 process_id=process_id,
                 name=str(proc.get("name") or ""),
                 executable_path=str(proc.get("exe") or ""),
+                package_family_name=str(proc.get("package_family_name") or "") or None,
             )
 
         observed_windows: dict[str, WindowRecord] = {}
@@ -975,16 +1147,32 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self, application_id: str, *, timeout_seconds: float = 10.0
     ) -> RunningApplication:
         self._launch_diagnostic = {"stage": "resolution", "mode": "not_dispatched"}
-        resolved = self._resolver.resolve(application_id)
-        self._launch_diagnostic.update(
-            stage="baseline_observation",
-            executable_identity=hashlib.sha256(
+        try:
+            resolved = await asyncio.to_thread(self._resolver.resolve, application_id)
+        except ComputerAdapterError as exc:
+            self._launch_diagnostic.update(self._resolver.last_diagnostic)
+            self._launch_diagnostic["failure_code"] = exc.code.value
+            raise
+        identity_fields: dict[str, Any] = {
+            "application_identity": resolved.diagnostic_identity,
+            "activation_method": str(resolved.activation_method),
+        }
+        if resolved.executable_path:
+            identity_fields["executable_identity"] = hashlib.sha256(
                 _executable_key(resolved.executable_path).encode("utf-8")
-            ).hexdigest(),
-        )
+            ).hexdigest()
+        self._launch_diagnostic.update(stage="baseline_observation", **identity_fields)
 
         deadline = time.monotonic() + self._bounded_timeout(timeout_seconds)
-        baseline = await self._snapshot_desktop()
+        try:
+            baseline = await self._snapshot_desktop()
+        except ComputerAdapterError as exc:
+            self._launch_diagnostic.update(
+                stage="baseline_observation",
+                mode="observation_failed",
+                failure_code=exc.code.value,
+            )
+            raise
         baseline_processes = self._application_process_ids(baseline, resolved)
         baseline_windows = self._application_windows(baseline, resolved, baseline_processes)
         self._launch_diagnostic.update(
@@ -1002,6 +1190,13 @@ class WindowsAppLaunchProvider(ApplicationProvider):
 
         dispatched_pid = await self._dispatch_process(resolved)
         if not self._requires_window:
+            if dispatched_pid is None:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.ACTION_UNKNOWN_OUTCOME,
+                    "The activation request was dispatched without a process handle; "
+                    "process-only verification is unavailable.",
+                    source=PerceptionSource.APPLICATION_API,
+                )
             return await self._await_process_only_launch(resolved, dispatched_pid, deadline)
 
         # Polling and confirmation share one deadline: a window that cannot be
@@ -1020,33 +1215,97 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 return confirmed
             rejected_window_ids.add(evidence.window_id)
             if time.monotonic() >= deadline:
+                self._launch_diagnostic.update(
+                    failure_reason="fresh_window_confirmation_failed",
+                    failure_code=ComputerFailureCode.ACTION_VERIFICATION_FAILED.value,
+                )
                 raise ComputerAdapterError(
-                    ComputerFailureCode.ACTION_UNKNOWN_OUTCOME,
-                    f"The window observed for '{resolved.name}' could not be confirmed by a fresh "
-                    "observation; the external effect is unknown.",
+                    ComputerFailureCode.ACTION_VERIFICATION_FAILED,
+                    "The application window could not be confirmed by a fresh observation "
+                    "after activation.",
                     source=PerceptionSource.APPLICATION_API,
                 )
 
-    async def _dispatch_process(self, resolved: ResolvedApplication) -> int:
-        self._launch_diagnostic.update(stage="process_dispatch", mode="spawn_attempt")
+    async def _dispatch_process(self, resolved: ApplicationDescriptor) -> int | None:
+        self._launch_diagnostic.update(
+            stage="activation_dispatch",
+            mode="activation_attempt",
+            activation_method=str(resolved.activation_method),
+        )
         try:
-            pid = await self._backend.launch_process(resolved.executable_path)
-        except ComputerAdapterError:
-            raise
-        except Exception as exc:
+            activate = getattr(self._backend, "activate_application", None)
+            if callable(activate):
+                pid = await activate(resolved)
+            elif (
+                resolved.activation_method is ActivationMethod.EXECUTABLE
+                and resolved.executable_path
+            ):
+                pid = await self._backend.launch_process(resolved.executable_path)
+            else:
+                raise OSError("The selected backend does not support this activation method.")
+        except ComputerAdapterError as exc:
+            self._launch_diagnostic.update(
+                stage="activation_dispatch",
+                mode="activation_failed",
+                activation_error=exc.code.value,
+                failure_code=exc.code.value,
+            )
+            if exc.code in {
+                ComputerFailureCode.ACTIVATION_FAILED,
+                ComputerFailureCode.ADAPTER_UNAVAILABLE,
+                ComputerFailureCode.UIA_NOT_AVAILABLE,
+            }:
+                raise
+            self._launch_diagnostic["failure_code"] = ComputerFailureCode.ACTIVATION_FAILED.value
             raise ComputerAdapterError(
-                ComputerFailureCode.INTERNAL_ADAPTER_ERROR,
-                f"Failed to launch '{resolved.name}': {type(exc).__name__}: {exc}",
+                ComputerFailureCode.ACTIVATION_FAILED,
+                f"Windows rejected the selected activation method ({exc.code.value}).",
+                source=PerceptionSource.APPLICATION_API,
+            ) from exc
+        except Exception as exc:
+            self._launch_diagnostic.update(
+                stage="activation_dispatch",
+                mode="activation_failed",
+                activation_error=type(exc).__name__,
+            )
+            raise ComputerAdapterError(
+                ComputerFailureCode.ACTIVATION_FAILED,
+                f"Application activation failed ({type(exc).__name__}).",
                 source=PerceptionSource.APPLICATION_API,
             ) from exc
 
-        if pid <= 0:
+        if pid is None:
+            self._launch_diagnostic.update(
+                stage="activation_dispatch",
+                mode="dispatched_without_process_handle",
+            )
+            return None
+        try:
+            process_id = int(pid)
+        except (TypeError, ValueError) as exc:
             raise ComputerAdapterError(
-                ComputerFailureCode.INTERNAL_ADAPTER_ERROR,
-                f"Failed to launch '{resolved.name}': invalid PID returned.",
+                ComputerFailureCode.ACTIVATION_FAILED,
+                "Application activation returned an invalid process handle.",
+                source=PerceptionSource.APPLICATION_API,
+            ) from exc
+        if process_id == 0:
+            self._launch_diagnostic.update(
+                stage="activation_dispatch",
+                mode="dispatched_without_process_handle",
+            )
+            return None
+        if process_id < 0:
+            raise ComputerAdapterError(
+                ComputerFailureCode.ACTIVATION_FAILED,
+                "Application activation returned an invalid process handle.",
                 source=PerceptionSource.APPLICATION_API,
             )
-        return pid
+        self._launch_diagnostic.update(
+            stage="activation_dispatch",
+            mode="dispatched",
+            dispatched_process_id=process_id,
+        )
+        return process_id
 
     async def _reuse_existing_window(
         self, resolved: ResolvedApplication, baseline_windows: Mapping[str, WindowRecord]
@@ -1077,6 +1336,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 name=resolved.name,
                 executable_path=resolved.executable_path,
                 window_ids=(target.window_id,),
+                package_family_name=resolved.package_family_name,
             )
 
         focus_error: str | None = None
@@ -1106,6 +1366,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 name=resolved.name,
                 executable_path=resolved.executable_path,
                 window_ids=(target.window_id,),
+                package_family_name=resolved.package_family_name,
             )
 
         # Not swallowed: the failed or unconfirmed activation is recorded, and the
@@ -1175,6 +1436,54 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             window_ids=tuple(window_ids),
         )
 
+    def _window_claims_application_identity(
+        self, window: WindowRecord, snapshot: DesktopSnapshot, resolved: ApplicationDescriptor
+    ) -> bool:
+        """Weakly detect a same-named window for diagnostics, never for acceptance."""
+        if resolved.package_family_name:
+            expected_family = normalize_application_name(resolved.package_family_name)
+            process = snapshot.processes.get(window.process_id or -1)
+            observed_families = {
+                normalize_application_name(value)
+                for value in (
+                    window.package_family_name,
+                    process.package_family_name if process is not None else None,
+                )
+                if value
+            }
+            observed_aumids = {window.aumid.casefold()} if window.aumid else set()
+            return expected_family in observed_families or bool(
+                resolved.aumid and resolved.aumid.casefold() in observed_aumids
+            )
+        expected_names = {
+            normalize_application_name(_safe_basename(value))
+            for value in (*resolved.process_names, _safe_basename(resolved.executable_path or ""))
+            if value
+        }
+        process = snapshot.processes.get(window.process_id or -1)
+        observed_paths = [
+            value
+            for value in (
+                window.executable_path,
+                process.executable_path if process is not None else None,
+            )
+            if value
+        ]
+        if observed_paths:
+            observed_path_names = {
+                normalize_application_name(_safe_basename(value)) for value in observed_paths
+            }
+            return bool(expected_names.intersection(observed_path_names))
+        observed_names = {
+            normalize_application_name(_safe_basename(value))
+            for value in (
+                window.application,
+                process.name if process is not None else None,
+            )
+            if value
+        }
+        return bool(expected_names.intersection(observed_names))
+
     def _window_evidence_candidates(
         self,
         resolved: ResolvedApplication,
@@ -1222,31 +1531,48 @@ class WindowsAppLaunchProvider(ApplicationProvider):
 
     async def _poll_window_evidence(
         self,
-        resolved: ResolvedApplication,
+        resolved: ApplicationDescriptor,
         baseline_windows: Mapping[str, WindowRecord],
-        dispatched_pid: int,
+        dispatched_pid: int | None,
         deadline: float,
         *,
         excluded_window_ids: frozenset[str] = frozenset(),
     ) -> WindowEvidence:
-        """Poll for a new or newly activated visible window of the resolved application.
-
-        The spawned PID is not the association anchor: for Chromium-style
-        applications the visible browser window may be owned by a different
-        process, and the launcher may exit after handing the request to an already
-        running browser process. A window must be observed twice consecutively
-        before it is accepted.
-        """
+        """Require stable, newly observed window ownership before accepting launch."""
         self._launch_diagnostic.update(
             stage="window_poll", mode="spawn", dispatched_process_id=dispatched_pid
         )
         stable_window_id: str | None = None
         stable_checks = 0
         exit_checks = 0
+        ownership_rejections: set[str] = set()
+        owned_existing_windows: set[str] = set()
+        visible_candidate_count = 0
 
         while time.monotonic() < deadline:
-            dispatched_alive = await self._backend.is_process_alive(dispatched_pid)
+            dispatched_alive = bool(
+                dispatched_pid is not None and await self._backend.is_process_alive(dispatched_pid)
+            )
             snapshot = await self._snapshot_desktop()
+            visible_candidate_count = max(
+                visible_candidate_count,
+                sum(
+                    1
+                    for window in snapshot.windows.values()
+                    if window.visible and not window.minimized
+                ),
+            )
+            for window_id, window in snapshot.windows.items():
+                if not window.visible or window.minimized:
+                    continue
+                if self._window_owner_verified(window, snapshot, resolved):
+                    if window_id in baseline_windows:
+                        owned_existing_windows.add(window_id)
+                elif window_id not in baseline_windows and self._window_claims_application_identity(
+                    window, snapshot, resolved
+                ):
+                    ownership_rejections.add(window_id)
+
             candidates = self._window_evidence_candidates(
                 resolved, snapshot, baseline_windows, excluded_window_ids
             )
@@ -1259,32 +1585,76 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                     stable_window_id = selected.window_id
                     stable_checks = 1
                 if stable_checks >= _LAUNCH_REQUIRED_STABLE_CHECKS:
+                    self._launch_diagnostic.update(
+                        ownership_rejections=len(ownership_rejections),
+                        window_evidence_candidates=1,
+                    )
                     return selected
             else:
                 stable_window_id = None
                 stable_checks = 0
-                if not dispatched_alive and not self._application_process_ids(snapshot, resolved):
+                if (
+                    dispatched_pid is not None
+                    and not dispatched_alive
+                    and not self._application_process_ids(snapshot, resolved)
+                ):
                     exit_checks += 1
                     if exit_checks >= _LAUNCH_EXIT_GRACE_CHECKS:
+                        self._launch_diagnostic["failure_code"] = (
+                            ComputerFailureCode.ACTION_UNKNOWN_OUTCOME.value
+                        )
                         raise ComputerAdapterError(
                             ComputerFailureCode.ACTION_UNKNOWN_OUTCOME,
-                            f"Process '{resolved.name}' (PID {dispatched_pid}) exited without "
-                            "leaving an identifiable application process or visible window.",
+                            "The activation process exited without leaving an identifiable "
+                            "application process or visible window.",
                             source=PerceptionSource.APPLICATION_API,
                         )
                 else:
                     exit_checks = 0
             await asyncio.sleep(_LAUNCH_POLL_INTERVAL_SECONDS)
 
+        self._launch_diagnostic.update(
+            stage="window_poll",
+            launch_outcome="verification_failed",
+            ownership_rejections=len(ownership_rejections),
+            owned_existing_windows=len(owned_existing_windows),
+            visible_window_count=visible_candidate_count,
+        )
+        if ownership_rejections:
+            self._launch_diagnostic.update(
+                failure_reason="ownership_verification_failed",
+                failure_code=ComputerFailureCode.OWNERSHIP_VERIFICATION_FAILED.value,
+            )
+            raise ComputerAdapterError(
+                ComputerFailureCode.OWNERSHIP_VERIFICATION_FAILED,
+                "A newly observed same-named window did not have verifiable ownership "
+                "by the resolved application.",
+                source=PerceptionSource.APPLICATION_API,
+            )
+        if owned_existing_windows or self._launch_diagnostic.get("confirmation_failed"):
+            self._launch_diagnostic.update(
+                failure_reason="activation_not_observed",
+                failure_code=ComputerFailureCode.ACTION_VERIFICATION_FAILED.value,
+            )
+            raise ComputerAdapterError(
+                ComputerFailureCode.ACTION_VERIFICATION_FAILED,
+                "The application window was observed but a new window or fresh activation "
+                "could not be verified.",
+                source=PerceptionSource.APPLICATION_API,
+            )
+        self._launch_diagnostic.update(
+            failure_reason="window_not_found",
+            failure_code=ComputerFailureCode.WINDOW_NOT_FOUND.value,
+        )
         raise ComputerAdapterError(
-            ComputerFailureCode.TIMEOUT,
-            f"Timed out verifying launch for '{resolved.name}': no new or newly activated "
-            "visible application window was observed.",
+            ComputerFailureCode.WINDOW_NOT_FOUND,
+            "No visible window belonging to the resolved application was observed "
+            "after activation.",
             source=PerceptionSource.APPLICATION_API,
         )
 
     async def _confirm_window_evidence(
-        self, resolved: ResolvedApplication, evidence: WindowEvidence, dispatched_pid: int
+        self, resolved: ApplicationDescriptor, evidence: WindowEvidence, dispatched_pid: int | None
     ) -> RunningApplication | None:
         """Bring the observed window forward and confirm it with a fresh observation.
 
@@ -1341,6 +1711,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             name=resolved.name,
             executable_path=resolved.executable_path,
             window_ids=(window_id,),
+            package_family_name=resolved.package_family_name,
         )
 
     async def running_applications(self) -> Sequence[RunningApplication]:
@@ -1367,27 +1738,24 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                     name=name,
                     executable_path=exe,
                     window_ids=win_ids,
+                    package_family_name=str(p.get("package_family_name") or "") or None,
                 )
             )
         return tuple(results)
 
-    async def installed_applications(self, *, limit: int = 512) -> Sequence[RunningApplication]:
-        apps: list[RunningApplication] = []
-        for name in KNOWN_ALIASES:
-            if len(apps) >= limit:
-                break
-            try:
-                resolved = self._resolver.resolve(name)
-                apps.append(
-                    RunningApplication(
-                        process_id=0,
-                        name=resolved.name,
-                        executable_path=resolved.executable_path,
-                    )
-                )
-            except Exception:
-                continue
-        return tuple(apps)
+    async def installed_applications(self, *, limit: int = 512) -> Sequence[InstalledApplication]:
+        if limit <= 0:
+            return ()
+        descriptors = await asyncio.to_thread(self._resolver.discover_installed)
+        return tuple(
+            InstalledApplication(
+                identity=descriptor.diagnostic_identity,
+                name=descriptor.name,
+                source=descriptor.source,
+                activation_method=str(descriptor.activation_method),
+            )
+            for descriptor in descriptors[: min(limit, 512)]
+        )
 
     async def observe(self, action: ActionContract) -> ObservationLease:
         app_name = (
@@ -1405,14 +1773,25 @@ class WindowsAppLaunchProvider(ApplicationProvider):
 
         if app_name:
             try:
-                resolved = self._resolver.resolve(str(app_name))
+                resolved = await asyncio.to_thread(self._resolver.resolve, str(app_name))
                 resolved_name = resolved.name
                 snapshot = await self._snapshot_desktop()
                 application_process_ids = self._application_process_ids(snapshot, resolved)
-                is_running = bool(application_process_ids)
-                pid = min(application_process_ids) if application_process_ids else None
                 application_windows = self._application_windows(
                     snapshot, resolved, application_process_ids
+                )
+                is_running = bool(application_process_ids or application_windows)
+                pid = (
+                    min(application_process_ids)
+                    if application_process_ids
+                    else min(
+                        (
+                            int(window.process_id)
+                            for window in application_windows.values()
+                            if window.process_id is not None and window.process_id > 0
+                        ),
+                        default=None,
+                    )
                 )
                 window_ids = [
                     window_id
@@ -1588,9 +1967,7 @@ class AppLaunchTool(ActionTool):
         ):
             raise ValueError("system.app_launch requires an 'application' parameter")
         app_name = (
-            parameters.get("application")
-            or parameters.get("app_name")
-            or parameters.get("name")
+            parameters.get("application") or parameters.get("app_name") or parameters.get("name")
         )
         if not isinstance(app_name, str) or not app_name.strip():
             raise ValueError("application must be a non-empty string")
@@ -1637,9 +2014,7 @@ class AppLaunchTool(ActionTool):
         )
 
 
-def register_app_launch_tools(
-    registry: ToolRegistry, provider: WindowsAppLaunchProvider
-) -> None:
+def register_app_launch_tools(registry: ToolRegistry, provider: WindowsAppLaunchProvider) -> None:
     registry.register(AppLaunchTool(provider))
 
 

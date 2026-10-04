@@ -30,13 +30,20 @@ results are supplied by trusted runtime code.
   `UNTRUSTED_USER_PERSONALIZATION_JSON:`,
   `UNTRUSTED_MATCHED_PROCEDURAL_WORKFLOW_JSON:`,
   `UNTRUSTED_EXTERNAL_RESEARCH_JSON:`, `UNTRUSTED_DETERMINISTIC_INTENT_HINT_JSON:`).
-* The system message contains: 16 mandatory output rules, the exact current
-  TaskPlan/PlanStep/ActionProposal schema (including the enum spellings read
-  from the live contracts), the registered tools with their accepted parameter
-  keys, target scope, minimum risk, idempotency, and side effects, and a
-  minimal, contract-valid JSON example built from a real registered tool.
-* `ModelRequest.response_format="json_object"` is a provider-neutral request
-  hint. The OpenAI-compatible adapter maps it to
+* The system message contains: mandatory output rules, the current
+  TaskPlan/PlanStep/ActionProposal fields (including enum spellings read from
+  the live contracts), a Pydantic-generated ConditionModel JSON Schema and a
+  concrete condition/postcondition example, the registered tools with their
+  accepted parameter keys, target scope, minimum risk, idempotency, and side
+  effects, and a minimal, contract-valid JSON example built from a real
+  registered tool. A condition is emitted as a direct object with `key`,
+  `operator`, `expected`, and `description`; `condition` is not an alias for
+  `key` or a wrapper around a postcondition array item.
+* The diagnostic contract revision is `planner-contract-5`. That value is an
+  audit label, not a version delivered to the model or a constrained-decoding
+  schema. `ModelRequest.response_format="json_object"` is a provider-neutral
+  hint for syntactically valid JSON only; it does not enforce nested TaskPlan
+  fields. The OpenAI-compatible adapter maps it to
   `response_format={"type":"json_object"}` only when the provider is configured
   to support it. If the endpoint rejects the field with a client error, the
   adapter degrades once for that provider instance and otherwise leaves the
@@ -59,8 +66,10 @@ results are supplied by trusted runtime code.
    schema-invalid planner output (`ARISE__MODEL__PLANNER_MAX_ATTEMPTS`,
    default 2, maximum 2). The retry appends a deterministic correction
    instruction that names the sanitized category and rejected schema paths — it
-   never echoes model text. The original system prompt, user request, and
-   untrusted context messages are preserved unchanged. Provider failures,
+   never echoes model text. When a condition path is rejected, the correction
+   also supplies the exact direct ConditionModel shape, without relaxing
+   validation. The original system prompt, user request, and untrusted context
+   messages are preserved unchanged. Provider failures,
    timeouts, cancellations, and execution failures are never retried here.
 
 ## Rejection diagnostics

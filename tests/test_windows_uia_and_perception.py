@@ -19,8 +19,11 @@ from arise.adapters.perception import (
     make_captured_image_from_rgba,
 )
 from arise.adapters.secrets import MemorySecretProvider
+from arise.adapters.windows_app_discovery import ActivationMethod, ApplicationDescriptor
+from arise.adapters.windows_app_launch import WindowsApplicationResolver
 from arise.adapters.windows_uia import (
     RawUiaNode,
+    WindowsUiaActionTool,
     WindowsUiaProvider,
     register_windows_uia_tools,
 )
@@ -290,6 +293,67 @@ class WindowsUiaProviderTests(unittest.IsolatedAsyncioTestCase):
             backend=self.backend,
             secret_provider=self.secrets,
         )
+
+    async def test_semantic_app_grounding_uses_package_aumid_not_host_process_alias(self) -> None:
+        family = "Vendor.Camera_abc123"
+        aumid = f"{family}!App"
+        self.backend.windows = [
+            replace(
+                self.backend.windows[0],
+                window_id="hwnd-camera",
+                title="Camera",
+                application="ApplicationFrameHost.exe",
+                package_family_name=None,
+                aumid=aumid,
+            )
+        ]
+        self.backend.nodes = [
+            replace(
+                self.backend.nodes[0],
+                window_id="hwnd-camera",
+                application="ApplicationFrameHost.exe",
+            )
+        ]
+        descriptor = ApplicationDescriptor(
+            name="Camera",
+            activation_method=ActivationMethod.PACKAGED_AUMID,
+            package_family_name=family,
+            aumid=aumid,
+        )
+
+        class Catalog:
+            def discover(self):
+                return (descriptor,)
+
+        resolver = WindowsApplicationResolver(catalog=Catalog())
+        provider = WindowsUiaProvider(
+            backend=self.backend,
+            secret_provider=self.secrets,
+            application_resolver=resolver,
+        )
+        tool = WindowsUiaActionTool(provider, "invoke")
+        action = ActionContract(
+            task_id="task-package-grounding",
+            target=TargetIdentity(
+                platform="windows",
+                application="Camera",
+                role="button",
+                semantic_name="Save Changes",
+            ),
+            tool_name="uia.invoke",
+            risk=RiskLevel.R1,
+            authority=AuthorizationContext(
+                principal_id="user",
+                user_intent_id="intent-package-grounding",
+                capabilities=frozenset({"desktop.ui_automation"}),
+            ),
+            parameters={},
+        )
+
+        grounded = await tool.ground_action(action)
+
+        self.assertIsNotNone(grounded.target)
+        self.assertEqual(grounded.target.window_id, "hwnd-camera")
 
     async def test_window_and_control_tree_discovery_redact_secrets(self) -> None:
         windows = await self.provider.list_windows()

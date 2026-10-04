@@ -357,7 +357,7 @@ async def test_conflicting_window_owner_identity_is_rejected():
     with pytest.raises(ComputerAdapterError) as failure:
         await provider.launch_application("chrome", timeout_seconds=2)
 
-    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert failure.value.code is ComputerFailureCode.OWNERSHIP_VERIFICATION_FAILED
     assert backend.focus_calls == []
 
 
@@ -375,7 +375,7 @@ async def test_preexisting_application_window_is_not_evidence_of_a_new_launch():
         await provider.launch_application("chrome", timeout_seconds=2)
 
     # A pre-existing Chrome process/window and an unrelated foreground window prove nothing.
-    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert failure.value.code is ComputerFailureCode.ACTION_VERIFICATION_FAILED
     assert backend.launched_paths == [CHROME_EXE]
     assert "hwnd-existing-chrome" not in backend.focus_calls
 
@@ -494,7 +494,7 @@ async def test_no_visible_window_fails_launch_and_rejects_process_only_success()
 
     with pytest.raises(ComputerAdapterError) as failure:
         await provider.launch_application("chrome", timeout_seconds=2)
-    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert failure.value.code is ComputerFailureCode.WINDOW_NOT_FOUND
     assert backend.launched_paths == [CHROME_EXE]
 
     observation = await provider.observe(action)
@@ -542,7 +542,7 @@ async def test_reuse_focus_failure_without_fresh_evidence_fails_closed():
     with pytest.raises(ComputerAdapterError) as failure:
         await provider.launch_application("chrome", timeout_seconds=2)
 
-    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert failure.value.code is ComputerFailureCode.ACTION_VERIFICATION_FAILED
     assert provider.launch_diagnostic["mode"] == "spawn"
     assert (
         provider.launch_diagnostic["reuse_focus_error"]
@@ -567,7 +567,7 @@ async def test_window_that_disappears_before_confirmation_fails_closed():
     with pytest.raises(ComputerAdapterError) as failure:
         await provider.launch_application("chrome", timeout_seconds=2)
 
-    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert failure.value.code is ComputerFailureCode.ACTION_VERIFICATION_FAILED
     assert provider.launch_diagnostic["confirmation_failed"] is True
 
 
@@ -738,7 +738,7 @@ async def test_unavailable_native_backend_is_blocked_not_missing_resource():
     with patch("arise.adapters.windows_uia.sys.platform", "linux"):
         result = await runtime.execute_action(action)
     assert result.step_status is StepStatus.BLOCKED
-    assert "adapter_unavailable" in runtime.tasks.get(action.task_id).steps[0].status_reason.lower()
+    assert "uia_not_available" in runtime.tasks.get(action.task_id).steps[0].status_reason.lower()
 
 
 @pytest.mark.asyncio
@@ -826,7 +826,7 @@ async def test_native_backend_without_visible_window_times_out_instead_of_succee
     backend, provider, _ = launch_fixture()
     with pytest.raises(ComputerAdapterError) as failure:
         await provider.launch_application("chrome", timeout_seconds=2)
-    assert failure.value.code is ComputerFailureCode.TIMEOUT
+    assert failure.value.code is ComputerFailureCode.WINDOW_NOT_FOUND
     assert len(backend.launched_paths) == 1
 
 
@@ -835,7 +835,7 @@ async def test_native_window_observation_failure_is_not_silently_empty():
     backend = Win32AppLaunchBackend()
     with pytest.raises(ComputerAdapterError) as failure:
         await backend.list_windows()
-    assert failure.value.code is ComputerFailureCode.ADAPTER_UNAVAILABLE
+    assert failure.value.code is ComputerFailureCode.UIA_NOT_AVAILABLE
 
 
 @pytest.mark.asyncio

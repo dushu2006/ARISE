@@ -521,7 +521,7 @@ class PlannerDiagnostic(ContractModel):
     transport_normalization: Literal["none", "code_fence_unwrapped"] = "none"
     provider_id: str = Field(default="", max_length=128)
     model_id: str = Field(default="", max_length=256)
-    contract_version: str = Field(default="planner-contract-4", max_length=64)
+    contract_version: str = Field(default="planner-contract-5", max_length=64)
     context_sources: tuple[str, ...] = Field(default=(), max_length=8)
     occurred_at: datetime = Field(default_factory=_utc_now)
 

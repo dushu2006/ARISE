@@ -351,7 +351,7 @@ class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
         obs = await self.provider.observe(action)
         with self.assertRaises(ComputerAdapterError) as caught:
             await self.tool.execute(action, obs, None)  # type: ignore[arg-type]
-        self.assertEqual(caught.exception.code, ComputerFailureCode.INTERNAL_ADAPTER_ERROR)
+        self.assertEqual(caught.exception.code, ComputerFailureCode.ACTIVATION_FAILED)
 
     async def test_process_exits_immediately_fails_verification(self) -> None:
         self.backend.exit_immediately = True
@@ -396,9 +396,7 @@ class AppLaunchExecutionAndVerificationTests(unittest.IsolatedAsyncioTestCase):
             risk=RiskLevel.R1,
             authority=self.authority,
             parameters={"application": "Notepad"},
-            postconditions=(
-                Condition("nonexistent_fact", expected=True),
-            ),
+            postconditions=(Condition("nonexistent_fact", expected=True),),
         )
         verification = await self.provider.verify(action)
         self.assertEqual(verification.status, VerificationStatus.FAILED)
@@ -562,7 +560,7 @@ class ProductionCompositionAndPlannerTests(unittest.IsolatedAsyncioTestCase):
                     '{"needs_clarification":false,"steps":['
                     '{"step_id":"step-1","title":"Open Chrome","action":'
                     '{"tool_name":"system.app_launch","risk":1,"parameters":{"application":"Chrome"}}}'
-                    ']}'
+                    "]}"
                 )
                 planner_provider = MockPlannerProvider(plan_content)
                 services.router.register(planner_provider)

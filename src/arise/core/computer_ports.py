@@ -18,6 +18,7 @@ from arise.core.computer import (
     DisplayGeometry,
     EnvironmentFingerprint,
     GroundingProposal,
+    InstalledApplication,
     InteractionTelemetry,
     OCRText,
     PerceptionSource,
@@ -49,7 +50,9 @@ class WindowProvider(Protocol):
 class ApplicationProvider(Protocol):
     async def running_applications(self) -> Sequence[RunningApplication]: ...
 
-    async def installed_applications(self, *, limit: int = 512) -> Sequence[RunningApplication]: ...
+    async def installed_applications(
+        self, *, limit: int = 512
+    ) -> Sequence[InstalledApplication]: ...
 
     async def launch_application(
         self, application_id: str, *, timeout_seconds: float
