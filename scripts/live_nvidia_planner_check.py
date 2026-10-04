@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import threading
 import time
 import uuid
@@ -45,6 +46,8 @@ TERMINAL_STATES = {
     "partially_completed",
     "interrupted",
     "requires_user_input",
+    "waiting_user",
+    "waiting_auth",
 }
 PENDING_STATES = {"queued", "understanding", "planning", "ready", "recovering"}
 LAUNCH_TOOL_MARKERS = ("launch", "open_app", "app.start")
@@ -78,12 +81,15 @@ def _print_outcome(task: dict, diagnostic: dict, tools: tuple[str, ...]) -> int:
         return 3
     if diagnostic.get("accepted"):
         if state == "completed":
-            print("VERDICT: PLANNER VERIFIED; EXECUTION VERIFIED (task completed)")
+            print(
+                "VERDICT: PLANNER ACCEPTED; BACKEND REPORTS COMPLETED "
+                "(visible Windows behavior requires confirmation on this machine)"
+            )
         elif state == "requires_user_input":
-            print("VERDICT: PLANNER VERIFIED (clarification plan accepted by TaskEngine)")
+            print("VERDICT: PLANNER ACCEPTED (clarification plan accepted by TaskEngine)")
         else:
             print(
-                "VERDICT: PLANNER VERIFIED; EXECUTION NOT VERIFIED "
+                "VERDICT: PLANNER ACCEPTED; EXECUTION NOT VERIFIED "
                 f"(state={state}, reason={reason})"
             )
         return 0
@@ -104,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout", type=float, default=180.0, help="seconds to wait for a terminal state"
     )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="print bounded execution-path metadata (no parameters, UI text, or credentials)",
+    )
     arguments = parser.parse_args(argv)
 
     settings = get_settings()
@@ -112,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
     tools = tuple(spec.name for spec in services.tools.list_specs())
     provider_status = [(item.provider_id, item.status.value) for item in services.router.status()]
     print("ARISE live planner check")
+    print(f"host: {sys.platform}; Python {sys.version_info.major}.{sys.version_info.minor}")
     print(f"started at: {datetime.now(UTC).isoformat()}")
     print(f"model provider configured: {bool(services.router.providers())}")
     print(f"provider status: {provider_status or '(none)'}")
@@ -120,6 +132,29 @@ def main(argv: list[str] | None = None) -> int:
         "api auth:",
         "enabled (bearer token in use)" if services.api_token else "disabled (loopback)",
     )
+    if arguments.diagnostics:
+        composition = []
+        for spec in services.tools.list_specs():
+            if not (spec.name.startswith("uia.") or spec.name == "system.app_launch"):
+                continue
+            tool = services.tools.get(spec.name)
+            provider = getattr(tool, "provider", None)
+            backend = getattr(provider, "_backend", None)
+            composition.append(
+                {
+                    "tool": spec.name,
+                    "risk_floor": int(spec.minimum_risk),
+                    "provider": type(provider).__name__,
+                    "backend": type(backend).__name__,
+                    "static_resources": list(spec.required_resources),
+                    "target_scope": spec.target_scope,
+                    "requires_visible_window": bool(
+                        getattr(backend, "requires_visible_window", False)
+                    ),
+                }
+            )
+        print("production composition (registration is not execution evidence):")
+        print(json.dumps(composition, indent=2))
     planner = services.engine.planner
     planner_kind = type(planner).__name__ if hasattr(planner, "last_diagnostic") else "unavailable"
     print(f"planner: {planner_kind}")
@@ -185,7 +220,9 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"task query status: {detail.status_code}")
                     break
                 task = detail.json().get("task") or {}
-                if task.get("state") in TERMINAL_STATES:
+                # PARTIALLY_COMPLETED is also a transient between plan steps.
+                # Do not stop the backend while the next step is still grounding.
+                if task.get("state") in TERMINAL_STATES and task_id not in services.engine._active:
                     break
                 time.sleep(0.5)
             diagnostic_response = client.get("/api/v1/diagnostics/planner")
@@ -193,6 +230,56 @@ def main(argv: list[str] | None = None) -> int:
                 diagnostic_response.json()
                 if diagnostic_response.status_code == 200
                 else {"category": "unknown"}
+            )
+        if arguments.diagnostics:
+            launch = services.app_launch_provider
+            if launch is not None:
+                print("launch dispatch diagnostic (not verification evidence):")
+                print(json.dumps(launch.launch_diagnostic, indent=2))
+                # Only native observation facts, never application names/paths or UI text.
+                observations = list(launch._observations.values())[-8:]
+                print("bounded launch observation evidence:")
+                print(
+                    json.dumps(
+                        [
+                            {
+                                "observation_id": observation.lease_id,
+                                "state_hash": observation.state_hash,
+                                "observation_error": observation.facts.get("observation.error"),
+                                "process_id": observation.facts.get("process_id"),
+                                "process_running": observation.facts.get("process.running"),
+                                "visible_window_open": observation.facts.get("window.open"),
+                                "window_count": len(observation.facts.get("window_ids", ())),
+                            }
+                            for observation in observations
+                        ],
+                        indent=2,
+                    )
+                )
+            allowed = {
+                "EXECUTION_PATH",
+                "RESOURCE_WAITING",
+                "RESOURCE_ACQUIRED",
+                "RESOURCE_RELEASED",
+                "OBSERVATION_CREATED",
+                "EXECUTION_RESULT",
+                "VERIFICATION_EVIDENCE",
+            }
+            events = services.event_store.read_after(task_id=task_id, limit=500)
+            print("bounded execution diagnostic (first 500 task events; values/UI text omitted):")
+            print(
+                json.dumps(
+                    [
+                        {
+                            "event": event.event_type,
+                            "action_id": event.step_id,
+                            "payload": event.to_dict()["payload"],
+                        }
+                        for event in events
+                        if event.event_type in allowed
+                    ],
+                    indent=2,
+                )
             )
         post_status = [(item.provider_id, item.status.value) for item in services.router.status()]
         print(f"provider status after the run: {post_status}")

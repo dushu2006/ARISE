@@ -8,6 +8,7 @@ provider. Audio/transcript payloads and resumption handles are kept in memory on
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from typing import Any
@@ -239,6 +240,7 @@ class _GeminiLiveSession:
         self.session = session
         self.blob_factory = blob_factory
         self.function_response_factory = function_response_factory
+        self._utterance_id = str(uuid.uuid4())
         self._audio_sequence = 0
         self._output_generation = 0
         self._awaiting_interrupt_ack = False
@@ -366,10 +368,12 @@ class _GeminiLiveSession:
             if isinstance(output_text, str) and output_text:
                 audio_transcript = output_text[:16_384]
                 events.append(
-                    LiveEvent(type=LiveEventType.OUTPUT_TRANSCRIPT, text=audio_transcript)
+                    LiveEvent(
+                        type=LiveEventType.OUTPUT_TRANSCRIPT,
+                        text=audio_transcript,
+                        is_audio_transcript=True,
+                    )
                 )
-            if bool(_get(content, "turn_complete")):
-                events.append(LiveEvent(type=LiveEventType.TURN_COMPLETE))
         text = _get(message, "text")
         if (
             isinstance(text, str)
@@ -402,10 +406,29 @@ class _GeminiLiveSession:
                     )
                 else:
                     events.append(LiveEvent(type=LiveEventType.TOOL_CALL, tool_call=call))
+        if isinstance(audio_data, (bytes, bytearray)) and len(audio_data) >= 2:
+            # Same-packet transcripts describe provider audio, not another TTS utterance.
+            events = [
+                replace(event, is_audio_transcript=True)
+                if event.type is LiveEventType.OUTPUT_TRANSCRIPT
+                else event
+                for event in events
+            ]
+        if content is not None and bool(_get(content, "turn_complete")):
+            # Keep transcript authorization and task-claim guards until every event
+            # in this server packet has been handled, including calls and final audio.
+            events.append(LiveEvent(type=LiveEventType.TURN_COMPLETE))
+        identity = self._utterance_id
+        if any(event.type is LiveEventType.TURN_COMPLETE for event in events):
+            self._utterance_id = str(uuid.uuid4())
         return tuple(
-            event
-            if event.generation_id is not None
-            else replace(event, generation_id=message_generation)
+            replace(
+                event,
+                utterance_id=identity,
+                generation_id=event.generation_id
+                if event.generation_id is not None
+                else message_generation,
+            )
             for event in events
         )
 

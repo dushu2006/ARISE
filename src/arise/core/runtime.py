@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from arise.core.computer_ports import ComputerAdapterError
 from arise.core.contracts import (
     ActionContract,
     EvidenceSource,
@@ -65,6 +66,7 @@ class ActionRunResult:
     message: str
     executed: bool = False
     verification: VerificationResult | None = None
+    bound_action: ActionContract | None = None
 
 
 class FactVerifier:
@@ -284,9 +286,36 @@ class AgentRuntime:
         except ToolNotFoundError:
             return self._block_unavailable_tool(task, action)
 
+        original_fingerprint = self.policy.contract_fingerprint(action, tool.spec)
+        if existing_step is not None and existing_step.contract_fingerprint != original_fingerprint:
+            raise DuplicateActionError("action_id was reused with a different action contract")
+        grounding_error: ComputerAdapterError | None = None
+        ground_action = getattr(tool, "ground_action", None)
+        if callable(ground_action) and task.authorization == action.authority:
+            try:
+                action = await asyncio.wait_for(ground_action(action), action.timeout_seconds)
+            except ComputerAdapterError as exc:
+                grounding_error = exc
+            except TimeoutError:
+                from arise.core.computer import ComputerFailureCode
+
+                grounding_error = ComputerAdapterError(
+                    ComputerFailureCode.TIMEOUT, "Semantic target observation timed out."
+                )
+
         effective_risk = RiskLevel(max(int(action.risk), int(tool.spec.minimum_risk)))
         fingerprint = self.policy.contract_fingerprint(action, tool.spec)
         step = task.find_step(action.action_id)
+        if (
+            step is not None
+            and step.status is StepStatus.PLANNED
+            and grounding_error is None
+            and callable(ground_action)
+        ):
+            # Only refine an undispatched proposal whose original contract matched.
+            # Approval is issued later against this observed identity, never the proposal.
+            step.contract_fingerprint = fingerprint
+            self.tasks.save(task)
         if step is not None:
             if step.contract_fingerprint != fingerprint:
                 raise DuplicateActionError("action_id was reused with a different action contract")
@@ -327,6 +356,55 @@ class AgentRuntime:
             )
             return self._block(task, step, reason=decision.reason, policy_decision=decision)
 
+        provider = getattr(tool, "provider", None)
+        backend = getattr(provider, "_backend", None)
+        self._emit(
+            "EXECUTION_PATH",
+            task,
+            step,
+            {
+                "tool": tool.spec.name,
+                "provider": type(provider).__name__ if provider is not None else None,
+                "backend": type(backend).__name__ if backend is not None else None,
+                "target_fingerprint": action.target.fingerprint if action.target else None,
+                "process_id": action.target.process_id if action.target else None,
+                "window_id": action.target.window_id if action.target else None,
+                "postcondition_count": len(action.postconditions),
+                "postcondition_keys": [
+                    item.key
+                    if item.key
+                    in {
+                        "window.id",
+                        "window.foreground",
+                        "window.focused_element",
+                        "window.open",
+                        "application.running",
+                        "process.running",
+                        "process_id",
+                        "window.element_count",
+                        "uia.state_hash",
+                    }
+                    else "dynamic-key-withheld"
+                    for item in action.postconditions
+                ],
+                "postcondition_operators": [item.operator.value for item in action.postconditions],
+                "postcondition_expected_types": [
+                    type(item.expected).__name__ for item in action.postconditions
+                ],
+                "required_resources": list(action.required_resources),
+            },
+        )
+
+        if grounding_error is not None:
+            return self._block(
+                task,
+                step,
+                reason=f"Target grounding failed: {grounding_error.code.value}. {grounding_error}",
+                policy_decision=PolicyDecision(
+                    PolicyDecisionKind.DENY, effective_risk, "target observation unavailable"
+                ),
+            )
+
         try:
             tool.validate_parameters(action.parameters)
         except Exception as exc:
@@ -357,7 +435,11 @@ class AgentRuntime:
                 return self._block(
                     task,
                     step,
-                    reason=f"Tool resource requirements failed validation: {type(exc).__name__}.",
+                    reason=(
+                        f"Tool resource requirements failed validation: {exc.code.value}."
+                        if isinstance(exc, ComputerAdapterError)
+                        else f"Tool resource requirements failed validation: {type(exc).__name__}."
+                    ),
                     policy_decision=PolicyDecision(
                         PolicyDecisionKind.DENY,
                         effective_risk,
@@ -399,6 +481,7 @@ class AgentRuntime:
                 step.status,
                 decision,
                 "Waiting for approval of this exact action.",
+                bound_action=action,
             )
 
         if task.status is TaskStatus.WAITING_USER:
@@ -490,6 +573,7 @@ class AgentRuntime:
                                 confirmation_required=True,
                             ),
                             "Waiting for fresh approval.",
+                            bound_action=action,
                         )
                     approval_consumed = True
 
@@ -523,12 +607,16 @@ class AgentRuntime:
                         "The tool timed out after dispatch; the external effect is unknown.",
                     )
                 except Exception as exc:
+                    code = (
+                        exc.code.value
+                        if isinstance(exc, ComputerAdapterError)
+                        else type(exc).__name__
+                    )
                     return self._mark_unknown_result(
                         task,
                         step,
                         decision,
-                        f"The tool failed after dispatch ({type(exc).__name__}); "
-                        "the external effect is unknown.",
+                        f"The tool failed after dispatch ({code}); the external effect is unknown.",
                     )
 
                 if not isinstance(outcome, ExecutionOutcome):
@@ -539,6 +627,15 @@ class AgentRuntime:
                         "The tool returned a malformed outcome after dispatch; "
                         "the external effect is unknown.",
                     )
+                self._emit(
+                    "EXECUTION_RESULT",
+                    task,
+                    step,
+                    {
+                        "status": outcome.status.value,
+                        "side_effect_may_have_occurred": outcome.side_effect_may_have_occurred,
+                    },
+                )
                 if json_byte_size(outcome.result_metadata) > tool.spec.max_result_bytes:
                     self._emit(
                         "TOOL_RESULT_DISCARDED",
@@ -621,6 +718,23 @@ class AgentRuntime:
                         "The resource lease expired before verification completed.",
                     )
 
+                self._emit(
+                    "VERIFICATION_EVIDENCE",
+                    task,
+                    step,
+                    {
+                        "status": verification.status.value,
+                        "level": verification.level,
+                        "evidence": [
+                            {
+                                "source": item.source,
+                                "observation_id": item.observation_id,
+                                "state_hash": item.state_hash,
+                            }
+                            for item in verification.evidence[:16]
+                        ],
+                    },
+                )
                 if verification.status is PortVerificationStatus.PASSED:
                     step.verification_status = TaskVerificationStatus.PASSED
                     self._set_step_status(step, StepStatus.SUCCEEDED, "Postconditions verified.")

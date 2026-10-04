@@ -22,6 +22,20 @@ from typing import Any, TypeAlias
 class ContractValidationError(ValueError):
     """Raised when an untrusted or malformed contract is rejected."""
 
+    @property
+    def diagnostic(self) -> str:
+        # freeze_json paths can contain arbitrary user-controlled dictionary keys.
+        # Keep the constraint but never expose those keys or their values.
+        message = str(self)
+        if " contains " in message:
+            # Match only known suffixes; a malicious dictionary key can itself
+            # contain the delimiter. Never split and echo its arbitrary suffix.
+            for constraint in ("a non-finite number", "a non-string key"):
+                if message.endswith(f" contains {constraint}"):
+                    return f"json contains {constraint}"
+            return "json contains an unsupported value type"
+        return message[:256]
+
 
 _SAFE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 

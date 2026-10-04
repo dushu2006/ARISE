@@ -243,10 +243,18 @@ class MemoryWriteRequest(MemoryContentRequest):
 class MemoryUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    consent_reference: str | None = Field(default=None, min_length=32, max_length=128)
     text: str | None = Field(default=None, min_length=1, max_length=16_384)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     sensitivity: Literal["public", "internal", "personal", "restricted"] | None = None
     expires_at: datetime | None = None
+
+    @field_validator("expires_at")
+    @classmethod
+    def require_timezone(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("memory expiry must include a timezone")
+        return value
 
 
 class MemorySettingsToggleRequest(BaseModel):
@@ -604,7 +612,11 @@ class _VoiceEventJournal(VoiceEventSink):
                     session_id=event.session_id,
                     source="voice-runtime",
                     severity=severity,
-                    payload={"state": event.state.value, "error_code": event.error_code},
+                    payload={
+                        "state": event.state.value,
+                        "error_code": event.error_code,
+                        "utterance_id": event.utterance_id,
+                    },
                 )
             )
         except Exception:
@@ -1060,9 +1072,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
             browser_provider.discover_browsers if browser_provider is not None else None
         ),
         desktop_host_supported=(
-            (lambda: sys.platform == "win32")
-            if (uia_provider is not None or app_launch_provider is not None)
-            else None
+            uia_backend.desktop_available if uia_provider is not None else None
         ),
     )
     health = HealthService(
@@ -1705,11 +1715,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             updated = await services.memory.update_record(
                 principal_id=principal,
                 record_id=record_id,
+                consent_reference=body.consent_reference,
                 text=body.text,
                 confidence=body.confidence,
                 sensitivity=body.sensitivity,
                 expires_at=body.expires_at,
             )
+        except (MemoryConsentError, MemoryDisabledError) as exc:
+            raise HTTPException(
+                status_code=403,
+                detail="Memory consent is missing, expired, used, or memory is disabled",
+            ) from exc
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Memory record not found") from exc
         except ValueError as exc:
@@ -2088,10 +2104,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                             )
                 except Exception as exc:
                     _LOG.warning(
-                        "Text interaction was not fully persisted for request %s (%s: %s)",
+                        "Text interaction was not fully persisted for request %s (%s)",
                         request_body.request_id,
                         type(exc).__name__,
-                        exc,
                     )
             return response
 
@@ -2134,16 +2149,18 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 task
                 for task in services.engine.list_tasks(principal_id=principal, limit=100)
                 if task.session_id == session.session_id
-                and task.status
-                not in {
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                    TaskStatus.BLOCKED,
-                    TaskStatus.UNKNOWN,
-                    TaskStatus.INTERRUPTED,
-                    TaskStatus.PARTIALLY_COMPLETED,
-                }
+                and (
+                    services.engine.is_active(task.task_id)
+                    or task.status not in {
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.CANCELLED,
+                        TaskStatus.BLOCKED,
+                        TaskStatus.UNKNOWN,
+                        TaskStatus.INTERRUPTED,
+                        TaskStatus.PARTIALLY_COMPLETED,
+                    }
+                )
             ]
             if not session_tasks:
                 answer = "There is no active task in this conversation to cancel."
@@ -2245,10 +2262,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     )
             except Exception as exc:
                 _LOG.warning(
-                    "Conversation context was not persisted for task %s (%s: %s)",
+                    "Conversation context was not persisted for task %s (%s)",
                     task.task_id,
                     type(exc).__name__,
-                    exc,
                 )
             return TextInteractionResponse(
                 outcome="task",

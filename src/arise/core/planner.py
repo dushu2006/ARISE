@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from arise.core.contracts import RiskLevel
+from arise.core.contracts import AuthorizationContext, ContractValidationError, RiskLevel
 from arise.core.errors import CapabilityUnavailableError, ProviderUnavailableError
 from arise.core.extensions import ContextQuery, MemoryPort, ResearchQuery, WebResearchPort
 from arise.core.intent import IntentClassifier
@@ -37,7 +37,7 @@ from arise.core.ports import ToolRegistry
 from arise.core.tasks import TaskRecord
 
 # Identifies the prompt/response contract revision for audit records.
-PLANNER_CONTRACT_VERSION = "planner-contract-3"
+PLANNER_CONTRACT_VERSION = "planner-contract-4"
 
 MAX_PLANNER_ATTEMPTS = 2
 
@@ -414,6 +414,35 @@ class GatewayTaskPlanner(TaskPlanner):
                 category=PlanFailureCategory.SCHEMA_INVALID,
                 detail=describe_validation_failure(exc),
             ) from exc
+        # Exercise the identical conversion used by TaskEngine, including fallbacks
+        # and step conditions. Pydantic acceptance alone is not domain acceptance.
+        authority = task.authorization or AuthorizationContext(
+            principal_id=None, user_intent_id=None
+        )
+        for index, step in enumerate(plan.steps):
+            proposals = [("action", step.action)]
+            if step.fallback_policy.fallback_action is not None:
+                proposals.append(
+                    ("fallback_policy.fallback_action", step.fallback_policy.fallback_action)
+                )
+            for field, proposal in proposals:
+                try:
+                    proposal.to_domain(task_id=task.task_id, authority=authority)
+                except ContractValidationError as exc:
+                    raise InvalidPlan(
+                        "planner proposal failed domain conversion",
+                        category=PlanFailureCategory.SCHEMA_INVALID,
+                        detail=f"steps.{index}.{field}: {exc.diagnostic}",
+                    ) from exc
+            if step.condition is not None:
+                try:
+                    step.condition.to_domain()
+                except ContractValidationError as exc:
+                    raise InvalidPlan(
+                        "planner step condition failed domain conversion",
+                        category=PlanFailureCategory.SCHEMA_INVALID,
+                        detail=f"steps.{index}.condition: {exc.diagnostic}",
+                    ) from exc
         self._validate_consequential_postconditions(plan)
         return plan
 

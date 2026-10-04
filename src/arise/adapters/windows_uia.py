@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Protocol
 
@@ -193,6 +193,28 @@ class Win32UiaBackend:
                 "Windows UI Automation requires a supported Windows desktop host.",
                 source=PerceptionSource.UI_AUTOMATION,
             )
+
+    def desktop_available(self) -> bool:
+        """Probe an accessible input desktop; OS name alone is not availability."""
+        if sys.platform != "win32":
+            return False
+        from ctypes import wintypes
+
+        try:
+            user32 = self._get_user32()
+            user32.OpenInputDesktop.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            user32.OpenInputDesktop.restype = wintypes.HANDLE
+            user32.CloseDesktop.argtypes = [wintypes.HANDLE]
+            user32.CloseDesktop.restype = wintypes.BOOL
+            desktop = user32.OpenInputDesktop(0, False, 0x0001)
+            if not desktop:
+                return False
+            try:
+                return bool(user32.GetForegroundWindow())
+            finally:
+                user32.CloseDesktop(desktop)
+        except (OSError, AttributeError):
+            return False
 
     def _get_user32(self) -> Any:
         if self._user32 is not None:
@@ -1068,12 +1090,22 @@ class WindowsUiaProvider:
         ]
         if len(exact) == 1:
             return exact[0]
-        if identity.semantic_name or identity.stable_id:
+        if identity.stable_id:
+            candidates = [
+                item
+                for item in candidates
+                if item.descriptor.identity.stable_id == identity.stable_id
+                and item.descriptor.visible
+                and item.descriptor.enabled
+                and (identity.role is None or item.descriptor.identity.role == identity.role)
+            ]
+            if not identity.semantic_name and len(candidates) == 1:
+                return candidates[0]
+        if identity.semantic_name:
             resolution = self._resolver.resolve(
                 TargetQuery(
                     semantic_name=identity.semantic_name,
                     role=identity.role,
-                    automation_id=identity.stable_id,
                     window_id=window_id,
                     allowed_sources=(PerceptionSource.UI_AUTOMATION,),
                 ),
@@ -1089,7 +1121,8 @@ class WindowsUiaProvider:
                 )
         raise ComputerAdapterError(
             ComputerFailureCode.TARGET_STALE,
-            "Stale UIA target could not be uniquely re-resolved.",
+            "Semantic control was not found in the observed Win32 HWND tree; "
+            "custom accessibility controls (including Chrome omnibox) may not be exposed.",
             source=PerceptionSource.UI_AUTOMATION,
         )
 
@@ -1864,7 +1897,8 @@ class WindowsUiaActionTool:
             version="1.0.0",
             description=(
                 f"{operation.title()} a grounded control via Windows UI Automation. The native "
-                "backend can verify keyboard focus only when Windows reports the target as a "
+                "runtime grounds semantic application/control targets before locking and approval; "
+                "never invent window IDs. The backend can verify keyboard focus only for a "
                 "named HWND in the inspected tree; custom-drawn controls may not be identifiable."
             ),
             minimum_risk=risk,
@@ -1880,6 +1914,56 @@ class WindowsUiaActionTool:
     @property
     def spec(self) -> ToolSpec:
         return self._spec
+
+    async def ground_action(self, action: ActionContract) -> ActionContract:
+        """Bind a semantic proposal to observed identity before locks and approval.
+
+        Never pick an arbitrary foreground window for an application-scoped request.
+        Native HWND-only inspection fails closed for inaccessible custom controls.
+        """
+        target = action.target
+        if target is None or target.platform != "windows" or not target.has_semantic_anchor:
+            raise ComputerAdapterError(
+                ComputerFailureCode.INVALID_TARGET,
+                "Windows action requires a semantic Windows target.",
+                source=PerceptionSource.UI_AUTOMATION,
+            )
+        from arise.adapters.windows_app_launch import KNOWN_ALIASES, _safe_basename
+
+        windows = await self.provider.list_windows()
+        matches = []
+        for window in windows:
+            if target.window_id is not None and window.window_id != target.window_id:
+                continue
+            if target.process_id is not None and window.process_id != target.process_id:
+                continue
+            if target.application:
+                requested = target.application.casefold()
+                alias = KNOWN_ALIASES.get(requested)
+                names = {requested}
+                if alias is not None:
+                    names.update(name.casefold() for name in alias.process_names)
+                    names.add(alias.name.casefold())
+                observed = {
+                    (window.application or "").casefold(),
+                    _safe_basename(window.executable_path or "").casefold(),
+                }
+                if not names.intersection(observed):
+                    continue
+            if window.visible:
+                matches.append(window)
+        if len(matches) != 1:
+            raise ComputerAdapterError(
+                ComputerFailureCode.TARGET_AMBIGUOUS
+                if matches
+                else ComputerFailureCode.WINDOW_NOT_FOUND,
+                "Semantic target needs exactly one observed matching application window.",
+                source=PerceptionSource.UI_AUTOMATION,
+            )
+        candidate = await self.provider.reground_stale_target(
+            replace(target, window_id=matches[0].window_id)
+        )
+        return replace(action, target=candidate.descriptor.identity)
 
     def resources_for(self, action: ActionContract) -> tuple[str, ...]:
         target = action.target

@@ -438,7 +438,11 @@ class CapabilityService:
                 health=HealthStatus.HEALTHY,
                 requirements=requirements,
                 adapter="adapters.windows_uia.WindowsUiaProvider",
-                limitations=("Not validated against a live Windows desktop in this environment.",),
+                limitations=(
+                    "Native inspection is limited to Win32 HWND controls, not the full UIA tree. "
+                    "Chrome omnibox accessibility is not established. Host availability does not "
+                    "prove execution; actions require fresh observation and verification.",
+                ),
             )
         reason = (
             "The UIA adapter is registered, but this process is not running on a supported "

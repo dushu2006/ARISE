@@ -585,9 +585,14 @@ class Phase5MemoryPersonalizationAndSupervisionTests(unittest.IsolatedAsyncioTes
             self.assertEqual(stored.expiration_policy, "ttl")
 
             # Edit memory record
+            edit_proposal = replace(
+                entry, text="Prefer solarized dark theme in Windows Terminal.", confidence=0.99
+            )
+            edit_consent, _ = await repo.issue_write_consent(edit_proposal)
             edited = await repo.update_record(
                 principal_id="user-a",
                 record_id=rec_id,
+                consent_reference=edit_consent,
                 text="Prefer solarized dark theme in Windows Terminal.",
                 confidence=0.99,
             )
@@ -604,7 +609,11 @@ class Phase5MemoryPersonalizationAndSupervisionTests(unittest.IsolatedAsyncioTes
             completed_task.transition_to(TaskStatus.RUNNING)
             completed_task.transition_to(TaskStatus.VERIFYING)
             completed_task.transition_to(TaskStatus.COMPLETED, verification_passed=True)
-            ep_id = await repo.record_episodic_task_summary(completed_task, now=now)
+            proposal = repo.propose_episodic_task_summary(completed_task, now=now)
+            consent, _ = await repo.issue_write_consent(proposal)
+            ep_id = await repo.record_episodic_task_summary(
+                completed_task, now=now, consent_reference=consent
+            )
             ep_rec = repo.get_record(principal_id="user-a", record_id=ep_id)
             assert ep_rec is not None
             self.assertIs(ep_rec.kind, MemoryKind.EPISODIC)

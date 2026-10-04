@@ -126,6 +126,11 @@ class CircuitBreaker:
         self._half_open_calls += 1
         return True
 
+    def record_cancelled(self) -> None:
+        """Release an abandoned half-open probe without claiming health or failure."""
+        if self._state is CircuitState.HALF_OPEN:
+            self._half_open_calls = max(0, self._half_open_calls - 1)
+
     def record_success(self) -> None:
         self._failure_count = 0
         self._opened_at = None

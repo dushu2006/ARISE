@@ -8,13 +8,14 @@ cancellation, and verification.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from typing import Any, Protocol
 
-from arise.core.contracts import thaw_json
+from arise.core.contracts import thaw_json, validate_safe_token
 from arise.core.engine import TaskEngine
 from arise.core.intent import IntentClassifier, IntentKind
 from arise.core.models import RequestSource, UserRequest
@@ -28,7 +29,6 @@ _TERMINAL_STATES = frozenset(
         TaskStatus.CANCELLED,
         TaskStatus.BLOCKED,
         TaskStatus.UNKNOWN,
-        TaskStatus.PARTIALLY_COMPLETED,
         TaskStatus.INTERRUPTED,
     }
 )
@@ -73,6 +73,9 @@ class TaskEngineVoiceAdapter:
     async def cancel(self, task_id: str, *, principal_id: str) -> TaskRecord:
         return await self.engine.cancel(task_id, principal_id=principal_id)
 
+    def is_settled(self, task_id: str) -> bool:
+        return self.engine.is_settled(task_id)
+
     async def watch(
         self,
         task_id: str,
@@ -85,14 +88,16 @@ class TaskEngineVoiceAdapter:
             task = await self.get(task_id, principal_id=principal_id)
             if task is None:
                 return
+            settled = self.is_settled(task_id)
             signature = (
                 task.status,
+                settled,
                 tuple((step.action_id, step.status) for step in task.steps),
             )
             if signature != previous_signature:
                 yield task
                 previous_signature = signature
-            if task.status in _TERMINAL_STATES:
+            if settled:
                 return
             await asyncio.sleep(poll_interval_seconds)
 
@@ -112,6 +117,10 @@ class VoiceConversationBridge:
         self._session_tasks: OrderedDict[str, OrderedDict[str, None]] = OrderedDict()
         self._task_session: OrderedDict[str, str] = OrderedDict()
         self._task_owner: dict[str, str] = {}
+        self._utterance_lock = asyncio.Lock()
+        self._utterance_results: OrderedDict[
+            tuple[str, str, str], tuple[str, str, dict[str, Any]]
+        ] = OrderedDict()
 
     def immediate_acknowledgement(self, user_text: str) -> str:
         """Return a deterministic local acknowledgement without requiring a cloud round-trip."""
@@ -125,7 +134,7 @@ class VoiceConversationBridge:
         if classification.kind is IntentKind.CLARIFICATION:
             return "Could you clarify what you would like ARISE to do?"
         if classification.may_require_runtime_task and classification.confidence >= 0.75:
-            return "ARISE accepted the task and is working on it."
+            return "ARISE heard your action request; admission is not yet confirmed."
         return "ARISE heard your request."
 
     async def process_utterance(
@@ -135,6 +144,54 @@ class VoiceConversationBridge:
         principal_id: str,
         session_id: str,
         locale: str = "en",
+        utterance_id: str | None = None,
+    ) -> dict[str, Any]:
+        """A new ingress gets a new identity; retries must retain that identity.
+
+        Serialize admission/informational replies, never infer identity from command text.
+        Replay responses are marked so callers do not replay speech or acceptance events.
+        """
+        identity = utterance_id or str(uuid.uuid4())
+        validate_safe_token(identity, "voice utterance_id")
+        fingerprint = hashlib.sha256(user_text.encode("utf-8")).hexdigest()
+        key = (principal_id, session_id, identity)
+        async with self._utterance_lock:
+            cached = self._utterance_results.get(key)
+            if cached is not None:
+                if cached[:2] != (fingerprint, locale):
+                    return {
+                        **self._not_authorized(
+                            "Utterance identity conflicts with its original request."
+                        ),
+                        "utterance_id": identity,
+                        "replayed": True,
+                    }
+                response = cached[2]
+                if isinstance(response.get("task_id"), str):
+                    task = await self.tasks.get(response["task_id"], principal_id=principal_id)
+                    response = self._status_result(task) if task is not None else self._not_found()
+                return {**response, "utterance_id": identity, "replayed": True}
+            result = await self._process_utterance(
+                user_text,
+                principal_id=principal_id,
+                session_id=session_id,
+                locale=locale,
+                utterance_id=identity,
+            )
+            result = {**result, "utterance_id": identity, "replayed": False}
+            self._utterance_results[key] = (fingerprint, locale, dict(result))
+            while len(self._utterance_results) > _MAX_TRACKED_TASKS:
+                self._utterance_results.popitem(last=False)
+            return result
+
+    async def _process_utterance(
+        self,
+        user_text: str,
+        *,
+        principal_id: str,
+        session_id: str,
+        locale: str = "en",
+        utterance_id: str,
     ) -> dict[str, Any]:
         """Route a transcribed spoken utterance through IntentClassifier without bypassing policy.
 
@@ -180,12 +237,7 @@ class VoiceConversationBridge:
                     }
                 )
             call = LiveToolCall(
-                call_id=str(
-                    uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        f"arise-voice-utterance:{session_id}:{cleaned}",
-                    )
-                ),
+                call_id=utterance_id,
                 name="execute_task",
                 arguments={"text": cleaned},
             )
@@ -196,6 +248,7 @@ class VoiceConversationBridge:
                 session_id=session_id,
                 locale=locale,
                 user_text=cleaned,
+                utterance_id=utterance_id,
             )
             result["intent"] = classification.kind.value
             return result
@@ -288,6 +341,7 @@ class VoiceConversationBridge:
         session_id: str,
         locale: str,
         user_text: str | None,
+        utterance_id: str | None = None,
     ) -> dict[str, Any]:
         if set(arguments) != {"text"}:
             return self._invalid_arguments()
@@ -307,8 +361,10 @@ class VoiceConversationBridge:
             )
         canonical_text = user_text.strip()
         try:
-            request_id = str(
-                uuid.uuid5(uuid.NAMESPACE_URL, f"arise-voice:{session_id}:{call.call_id}")
+            request_id = (
+                utterance_id
+                or call.utterance_id
+                or str(uuid.uuid5(uuid.NAMESPACE_URL, f"arise-voice:{session_id}:{call.call_id}"))
             )
             request = UserRequest(
                 request_id=request_id,
@@ -328,9 +384,11 @@ class VoiceConversationBridge:
         return {
             "status": "accepted",
             "task_id": task.task_id,
+            "utterance_id": request_id,
+            "request_id": request_id,
             "state": task.status.value,
             "verified": False,
-            "acknowledgement": self.immediate_acknowledgement(canonical_text),
+            "acknowledgement": "ARISE accepted your task for planning; execution is not verified.",
             "local_acknowledgement": True,
         }
 
@@ -395,9 +453,15 @@ class VoiceConversationBridge:
         self._remember(session_id, task.task_id, principal_id=principal_id)
         return self._status_result(task, cancellation_requested=True)
 
-    @staticmethod
-    def _status_result(task: TaskRecord, *, cancellation_requested: bool = False) -> dict[str, Any]:
+    def _status_result(
+        self, task: TaskRecord, *, cancellation_requested: bool = False
+    ) -> dict[str, Any]:
         state = task.status
+        settled = state in _TERMINAL_STATES or (
+            state is TaskStatus.PARTIALLY_COMPLETED
+            and callable(getattr(self.tasks, "is_settled", None))
+            and self.tasks.is_settled(task.task_id)
+        )
         verified = state is TaskStatus.COMPLETED
         if verified:
             summary = "ARISE reports completion after its task verifier passed."
@@ -427,6 +491,10 @@ class VoiceConversationBridge:
             summary = "ARISE is still working on the task."
         result: dict[str, Any] = {
             "status": state.value,
+            "settled": settled,
+            "version": task.version,
+            "utterance_id": task.request_id,
+            "request_id": task.request_id,
             "task_id": task.task_id,
             "state": state.value,
             "verified": verified,
@@ -435,7 +503,7 @@ class VoiceConversationBridge:
             "total_steps": len(task.steps),
         }
         if cancellation_requested:
-            result["cancellation_requested"] = state not in _TERMINAL_STATES
+            result["cancellation_requested"] = not settled
         return result
 
     def _remember(self, session_id: str, task_id: str, *, principal_id: str) -> None:

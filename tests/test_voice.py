@@ -1147,7 +1147,9 @@ class AudioHubTests(unittest.IsolatedAsyncioTestCase):
         await hub.start()
         try:
             ack = await hub.acknowledge_locally("Open Chrome and search NVIDIA", speak=True)
-            self.assertEqual(ack, "ARISE accepted the task and is working on it.")
+            self.assertEqual(
+                ack, "ARISE heard your action request; admission is not yet confirmed."
+            )
             self.assertEqual(synthesizer.synthesized_texts, [ack])
             self.assertEqual([c.sequence for c in playback.played], [101, 102])
             self.assertIn("local_acknowledgement_latency_ms", hub.snapshot().telemetry)
