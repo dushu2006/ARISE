@@ -1127,10 +1127,14 @@ class PerceptionHierarchyPipeline:
         resolver: TargetResolver | None = None,
         ocr: OcrPerceptionAdapter | None = None,
         vision: VisionGroundingAdapter | None = None,
+        unsafe_regions: tuple[Rect, ...] = (),
     ) -> None:
+        if any(not isinstance(region, Rect) for region in unsafe_regions):
+            raise ValueError("unsafe_regions must contain only Rect values")
         self.resolver = resolver or TargetResolver()
         self.ocr = ocr
         self.vision = vision
+        self.unsafe_regions = tuple(unsafe_regions)
 
     async def resolve_hierarchical(
         self,
@@ -1200,6 +1204,7 @@ class PerceptionHierarchyPipeline:
                     query=query,
                     corroborating_candidates=pool,
                     corroborating_ocr=ocr_items,
+                    unsafe_regions=self.unsafe_regions,
                 )
                 pool.append(vision_candidate)
                 vision_resolution = self.resolver.resolve(query, pool)

@@ -121,7 +121,7 @@
 - [x] COMPLETE — Vision confidence handling implemented (rejects proposals below `minimum_confidence`; verified with REAL unit tests).
 - [x] COMPLETE — Vision target verification implemented (validates image bounds and optional OCR/UIA corroboration; verified with REAL unit tests).
 - [x] COMPLETE — UIA → DOM → OCR → Vision → Coordinate hierarchy implemented (`PerceptionHierarchyPipeline` in `src/arise/adapters/perception.py`; verified with REAL resolver and FAKE perception backends).
-- [x] COMPLETE — Coordinate fallback fails closed when unsafe (`CoordinateFallbackSafetyGate` rejects disabled/stale/R2+/uncorroborated coordinates; verified with REAL gate tests).
+- [x] COMPLETE — Coordinate click fallback is disabled unless `ARISE__PERCEPTION__ALLOW_COORDINATE_FALLBACK=true`; enabled fallback checks fresh UIA state, DPI, focus, human interference, and configured `ARISE__PERCEPTION__UNSAFE_REGIONS` physical-pixel rectangles. `CoordinateFallbackSafetyGate` rejects disabled/stale/unverified/unsafe coordinates; software guards are covered by deterministic geometry and FAKE UIA-contract tests. Live Windows execution remains ENVIRONMENT-BLOCKED below.
 - [x] COMPLETE — Browser/UIA replay tests pass (`tests/test_browser_playwright.py` and `tests/test_windows_uia_and_perception.py`; FAKE/REPLAY scope).
 - [x] COMPLETE — Failure-injection tests pass for browser/UIA failure modes (stale target, ambiguous target, focus loss, DPI change, human interference, crash/navigation recovery; FAKE backend scope).
 - [!] BLOCKED — ENVIRONMENT — Run a real Playwright/Chromium installation and supported-Windows browser/UIA integration suite.
@@ -486,7 +486,7 @@
 - [x] COMPLETE — Ruff check passes (`.venv/bin/ruff check .`).
 - [x] COMPLETE — Python formatting passes (`.venv/bin/ruff format --check .`).
 - [x] COMPLETE — Python compile passes (`.venv/bin/python -m compileall -q src tests scripts`).
-- [x] COMPLETE — Full pytest passes (315 tests and 64 subtests; one upstream Starlette/httpx deprecation warning).
+- [x] COMPLETE — Full pytest passes (319 tests and 68 subtests; one upstream Starlette/httpx deprecation warning; rerun after Windows-release safety and lifecycle tests).
 - [x] COMPLETE — Frontend typecheck passes (`npm --prefix frontend run typecheck`).
 - [x] COMPLETE — Frontend production build passes (`npm --prefix frontend run build`).
 - [x] COMPLETE — Secret/token scan passes (no high-confidence credential patterns in source/config/docs; dependency/build dirs excluded).

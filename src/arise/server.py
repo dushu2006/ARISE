@@ -77,6 +77,7 @@ from arise.adapters.windows_uia import (
 )
 from arise.config.settings import AppSettings, get_settings, validate_api_token
 from arise.core.capabilities import CapabilityService
+from arise.core.computer import Rect
 from arise.core.contracts import ActionContract, ObservationLease, utc_now
 from arise.core.engine import (
     TaskEngine,
@@ -771,6 +772,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
     procedural_store = ProceduralMemoryStore(database)
     working_memory_store = WorkingMemoryStore()
     short_term_memory_store = ShortTermConversationMemory()
+    unsafe_regions = tuple(Rect(*bounds) for bounds in settings.perception.unsafe_regions)
     uia_provider: WindowsUiaProvider | None = None
     if settings.desktop.enabled:
         uia_provider = WindowsUiaProvider(
@@ -778,6 +780,8 @@ def _build_services(settings: AppSettings) -> ServerServices:
             secret_provider=secret_provider,
             max_tree_depth=settings.desktop.max_tree_depth,
             max_tree_nodes=settings.desktop.max_nodes,
+            allow_coordinate_fallback=settings.perception.allow_coordinate_fallback,
+            unsafe_regions=unsafe_regions,
         )
         register_windows_uia_tools(tools, uia_provider)
     browser_provider: PlaywrightBrowserProvider | None = None
@@ -806,6 +810,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         perception = PerceptionHierarchyPipeline(
             ocr=ocr_adapter,
             vision=vision_grounding,
+            unsafe_regions=unsafe_regions,
         )
 
     planner = UnavailablePlanner()
@@ -1690,6 +1695,26 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 status_code=503,
                 detail="Perception hierarchy is not enabled by configuration",
             )
+        unsafe_regions = tuple(
+            Rect(*bounds) for bounds in chosen_settings.perception.unsafe_regions
+        )
+        structural_candidates = []
+        if services.browser_provider is not None:
+            page_id = services.browser_provider.default_page_id
+            if page_id is not None:
+                try:
+                    structural_candidates.extend(await services.browser_provider.inspect(page_id))
+                except Exception:
+                    pass
+        if services.uia_provider is not None:
+            try:
+                foreground = await services.uia_provider.foreground_window()
+                if foreground is not None:
+                    structural_candidates.extend(
+                        await services.uia_provider.inspect(foreground.window_id)
+                    )
+            except Exception:
+                pass
         image = None
         if body.capture_screen_if_needed and services.screen_capture is not None:
             try:
@@ -1697,10 +1722,15 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             except Exception:
                 image = None
         resolution = await services.perception.resolve_hierarchical(
-            TargetQuery(semantic_name=body.query),
+            TargetQuery(
+                semantic_name=body.query,
+                allow_coordinate_fallback=chosen_settings.perception.allow_coordinate_fallback,
+            ),
+            structural_candidates=tuple(structural_candidates),
             screenshot=image,
             coordinate_safety=CoordinateFallbackSafetyGate(
-                allow_coordinate_fallback=chosen_settings.perception.allow_coordinate_fallback
+                allow_coordinate_fallback=chosen_settings.perception.allow_coordinate_fallback,
+                unsafe_regions=unsafe_regions,
             ),
         )
         return {

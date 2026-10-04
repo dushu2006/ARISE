@@ -1,19 +1,24 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::fs;
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 
 const BACKEND_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+const BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(150);
+const BACKEND_RESTART_LIMIT: u32 = 3;
 
-struct BackendProcess(Mutex<Option<Child>>);
+struct BackendProcess {
+    api_token: String,
+    stopping: Arc<AtomicBool>,
+    monitor: Mutex<Option<JoinHandle<()>>>,
+}
 
 fn shutdown_backend(child: &mut Child, grace_period: Duration) {
     // The supervised Python process watches stdin for EOF so it can stop Uvicorn
@@ -32,11 +37,26 @@ fn shutdown_backend(child: &mut Child, grace_period: Duration) {
     let _ = child.wait();
 }
 
+fn wait_or_stopping(stopping: &AtomicBool, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
 impl Drop for BackendProcess {
     fn drop(&mut self) {
-        if let Ok(slot) = self.0.get_mut() {
-            if let Some(child) = slot.as_mut() {
-                shutdown_backend(child, BACKEND_SHUTDOWN_GRACE);
+        self.stopping.store(true, Ordering::Release);
+        if let Ok(monitor) = self.monitor.get_mut() {
+            if let Some(handle) = monitor.take() {
+                let _ = handle.join();
             }
         }
     }
@@ -52,7 +72,22 @@ fn backend_is_running(address: SocketAddr) -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
 }
 
-fn find_bundled_sidecar() -> Option<PathBuf> {
+fn generate_api_token() -> Result<String, String> {
+    // Tauri owns one fresh token per desktop launch. The same in-memory token is
+    // passed to backend restarts and returned only through the scoped IPC command.
+    let mut bytes = [0_u8; 48];
+    getrandom::fill(&mut bytes)
+        .map_err(|_| "ARISE could not generate a secure local API credential.".to_string())?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut token = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        token.push(HEX[(byte >> 4) as usize] as char);
+        token.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    validate_api_token(token)
+}
+
+fn find_bundled_sidecar() -> Option<std::path::PathBuf> {
     let exe_dir = env::current_exe().ok()?.parent()?.to_path_buf();
     let candidates = [
         "arise-backend-x86_64-pc-windows-msvc.exe",
@@ -72,7 +107,7 @@ fn find_bundled_sidecar() -> Option<PathBuf> {
     None
 }
 
-fn spawn_backend() -> Result<Child, String> {
+fn spawn_backend(api_token: &str) -> Result<Child, String> {
     let address = backend_address();
     if backend_is_running(address) {
         // Do not send the local API credential to an unverified process on loopback.
@@ -95,6 +130,7 @@ fn spawn_backend() -> Result<Child, String> {
     command
         .env("ARISE__API__HOST", "127.0.0.1")
         .env("ARISE__API__PORT", "8765")
+        .env("ARISE__API__AUTH_TOKEN", api_token)
         .env("ARISE__SECURITY__ENVIRONMENT", "production")
         .env("ARISE_BACKEND_READY_SIGNAL", "1")
         .env("ARISE_BACKEND_SUPERVISED", "1")
@@ -151,14 +187,55 @@ fn spawn_backend() -> Result<Child, String> {
     Err("The local backend did not become ready before the startup deadline.".to_string())
 }
 
-fn api_token_path() -> Result<PathBuf, String> {
-    if let Some(data_dir) = env::var_os("ARISE__DATA_DIR") {
-        return Ok(PathBuf::from(data_dir).join("api.token"));
+fn supervise_backend(child: Child, api_token: String, stopping: Arc<AtomicBool>) {
+    supervise_backend_with(child, api_token, stopping, spawn_backend);
+}
+
+fn supervise_backend_with<F>(
+    mut child: Child,
+    api_token: String,
+    stopping: Arc<AtomicBool>,
+    mut spawn: F,
+) where
+    F: FnMut(&str) -> Result<Child, String>,
+{
+    let mut restart_attempts = 0_u32;
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            shutdown_backend(&mut child, BACKEND_SHUTDOWN_GRACE);
+            return;
+        }
+        match child.try_wait() {
+            Ok(None) => {
+                thread::sleep(BACKEND_MONITOR_INTERVAL);
+                continue;
+            }
+            Ok(Some(_)) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+
+        if stopping.load(Ordering::Acquire) || restart_attempts >= BACKEND_RESTART_LIMIT {
+            return;
+        }
+        let backoff_ms = 500_u64.saturating_mul(1_u64 << restart_attempts.min(4));
+        if wait_or_stopping(&stopping, Duration::from_millis(backoff_ms)) {
+            return;
+        }
+        restart_attempts += 1;
+        match spawn(&api_token) {
+            Ok(mut restarted) if stopping.load(Ordering::Acquire) => {
+                shutdown_backend(&mut restarted, BACKEND_SHUTDOWN_GRACE);
+                return;
+            }
+            Ok(restarted) => child = restarted,
+            // Keep the dead child handle and try again after a bounded backoff.
+            // Every attempt is limited by BACKEND_RESTART_LIMIT.
+            Err(_) => {}
+        }
     }
-    let local_app_data = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .ok_or_else(|| "Windows local application data directory is unavailable.".to_string())?;
-    Ok(local_app_data.join("ARISE").join("api.token"))
 }
 
 fn validate_api_token(token: String) -> Result<String, String> {
@@ -173,49 +250,106 @@ fn validate_api_token(token: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn get_api_token() -> Result<String, String> {
-    if let Some(configured) = env::var_os("ARISE__API__AUTH_TOKEN") {
-        let token = configured
-            .into_string()
-            .map_err(|_| "The configured ARISE API credential is invalid.".to_string())?;
-        return validate_api_token(token);
-    }
-    let path = api_token_path()?;
-    let value = fs::read_to_string(path).map_err(|_| {
-        "The ARISE API credential is not available. Start the local backend once and retry."
-            .to_string()
-    })?;
-    let token = value
-        .strip_suffix("\r\n")
-        .or_else(|| value.strip_suffix('\n'))
-        .unwrap_or(&value)
-        .to_string();
-    validate_api_token(token)
+fn get_api_token(state: State<'_, BackendProcess>) -> Result<String, String> {
+    validate_api_token(state.api_token.clone())
 }
 
 fn main() {
     tauri::Builder::default()
-        .manage(BackendProcess(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![get_api_token])
         .setup(|app| {
-            let child = spawn_backend().map_err(std::io::Error::other)?;
-            let state: State<BackendProcess> = app.state();
-            *state
-                .0
-                .lock()
-                .map_err(|_| std::io::Error::other("backend process state is unavailable"))? =
-                Some(child);
+            let api_token = generate_api_token().map_err(std::io::Error::other)?;
+            let child = spawn_backend(&api_token).map_err(std::io::Error::other)?;
+            let stopping = Arc::new(AtomicBool::new(false));
+            let monitor_stopping = Arc::clone(&stopping);
+            let monitor_token = api_token.clone();
+            let monitor = thread::spawn(move || {
+                supervise_backend(child, monitor_token, monitor_stopping);
+            });
+            app.manage(BackendProcess {
+                api_token,
+                stopping,
+                monitor: Mutex::new(Some(monitor)),
+            });
             Ok(())
         })
         .run(tauri::generate_context!())
         .expect("ARISE desktop shell failed to start");
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::{shutdown_backend, Command, Stdio};
+    use super::generate_api_token;
+
+    #[test]
+    fn generates_a_unique_valid_token_for_each_launch() {
+        let first = generate_api_token().expect("OS CSPRNG token");
+        let second = generate_api_token().expect("second OS CSPRNG token");
+        assert_eq!(first.len(), 96);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn restarts_a_crashed_child_and_reuses_the_launch_token() {
+        use super::supervise_backend_with;
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let mut crashed = Command::new("python")
+            .args(["-c", "raise SystemExit(17)"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn process that exits unexpectedly");
+        // Ensure the supervisor receives a real exited process handle.
+        let _ = crashed.wait();
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let monitor_stopping = Arc::clone(&stopping);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let spawn_starts = Arc::clone(&starts);
+        let monitor = thread::spawn(move || {
+            supervise_backend_with(
+                crashed,
+                "launch-token".to_string(),
+                monitor_stopping,
+                move |token| {
+                    if token != "launch-token" {
+                        return Err("launch token changed during restart".to_string());
+                    }
+                    spawn_starts.fetch_add(1, Ordering::SeqCst);
+                    Command::new("python")
+                        .args(["-c", "import sys; sys.stdin.buffer.read()"])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .map_err(|_| "restart test child could not start".to_string())
+                },
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while starts.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        let observed_restarts = starts.load(Ordering::SeqCst);
+        stopping.store(true, Ordering::Release);
+        monitor.join().expect("supervisor monitor exits on shutdown");
+        assert_eq!(observed_restarts, 1);
+    }
+
+    #[cfg(unix)]
+    use super::shutdown_backend;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     #[test]
     fn shutdown_closes_supervision_pipe_and_waits_for_graceful_exit() {
         let mut child = Command::new("sh")
@@ -229,6 +363,7 @@ mod tests {
         assert!(child.try_wait().expect("wait for child").is_some());
     }
 
+    #[cfg(unix)]
     #[test]
     fn shutdown_kills_a_child_that_ignores_pipe_eof_after_deadline() {
         let mut child = Command::new("sh")

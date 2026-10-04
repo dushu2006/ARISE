@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -239,6 +240,27 @@ class PerceptionSettings(BaseModel):
     enabled: bool = False
     allow_coordinate_fallback: bool = False
     minimum_vision_confidence: float = Field(default=0.75, ge=0.0, le=1.0)
+    # Physical virtual-desktop rectangles: (x, y, width, height).
+    unsafe_regions: tuple[tuple[float, float, float, float], ...] = ()
+
+    @field_validator("unsafe_regions")
+    @classmethod
+    def validate_unsafe_regions(
+        cls, regions: tuple[tuple[float, float, float, float], ...]
+    ) -> tuple[tuple[float, float, float, float], ...]:
+        if len(regions) > 64:
+            raise ValueError("at most 64 coordinate fallback unsafe regions may be configured")
+        validated: list[tuple[float, float, float, float]] = []
+        for region in regions:
+            if len(region) != 4:
+                raise ValueError("each unsafe region must be (x, y, width, height)")
+            values = tuple(float(value) for value in region)
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("unsafe region coordinates must be finite")
+            if values[2] <= 0 or values[3] <= 0:
+                raise ValueError("unsafe region width and height must be positive")
+            validated.append(values)
+        return tuple(validated)
 
 
 class EmbeddingSettings(BaseModel):

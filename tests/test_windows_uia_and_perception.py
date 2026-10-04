@@ -164,6 +164,7 @@ class FakeUiaBackend:
         self.cursor = Point(200.0, 240.0)
         self.user_input_detected = False
         self.invoked_nodes: list[str] = []
+        self.invoked_points: list[Point | None] = []
         self.values_set: dict[str, str] = {}
         self.focused_nodes: list[str] = []
         self.keys_sent: list[tuple[str, str]] = []
@@ -228,8 +229,9 @@ class FakeUiaBackend:
     async def invoke_node(
         self, window_id: str, node: RawUiaNode, *, click_point: Point | None = None
     ) -> None:
-        del window_id, click_point
+        del window_id
         self.invoked_nodes.append(node.node_id)
+        self.invoked_points.append(click_point)
 
     async def set_node_value(self, window_id: str, node: RawUiaNode, value: str) -> None:
         del window_id
@@ -328,6 +330,36 @@ class WindowsUiaProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("node-username", self.backend.focused_nodes)
         await self.provider.press(by_name["Username"], "Enter")
         self.assertEqual(self.backend.keys_sent, [("hwnd-1001", "Enter")])
+
+    async def test_coordinate_click_fallback_requires_opt_in_and_avoids_unsafe_regions(
+        self,
+    ) -> None:
+        from dataclasses import replace
+
+        self.backend.nodes[0] = replace(self.backend.nodes[0], supported_patterns=())
+        query = TargetQuery(semantic_name="Save Changes", role="button", window_id="hwnd-1001")
+        denied = await self.provider.resolve(query)
+        self.assertIs(denied.status, ResolutionStatus.RESOLVED)
+        assert denied.selected is not None
+        with self.assertRaises(ComputerAdapterError) as disabled:
+            await self.provider.invoke(denied.selected)
+        self.assertIs(disabled.exception.code, ComputerFailureCode.POLICY_DENIED)
+
+        unsafe = Rect(200, 230, 20, 20)
+        enabled_provider = WindowsUiaProvider(
+            backend=self.backend,
+            secret_provider=self.secrets,
+            allow_coordinate_fallback=True,
+            unsafe_regions=(unsafe,),
+        )
+        allowed = await enabled_provider.resolve(query)
+        self.assertIs(allowed.status, ResolutionStatus.RESOLVED)
+        assert allowed.selected is not None
+        await enabled_provider.invoke(allowed.selected)
+        point = self.backend.invoked_points[-1]
+        self.assertIsNotNone(point)
+        assert point is not None
+        self.assertFalse(unsafe.contains(point))
 
     async def test_mixed_dpi_normalization_and_round_trip(self) -> None:
         displays = await self.provider.displays()
@@ -619,6 +651,17 @@ class PerceptionAndHierarchyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(vis_res.selected.descriptor.source, PerceptionSource.VISION)
         self.assertEqual(vis_res.selected.descriptor.bounds, Rect(400.0, 200.0, 200.0, 150.0))
 
+        unsafe_pipeline = PerceptionHierarchyPipeline(
+            ocr=ocr_adapter,
+            vision=vision_adapter,
+            unsafe_regions=(Rect(400, 200, 200, 150),),
+        )
+        unsafe_vision = await unsafe_pipeline.resolve_hierarchical(
+            TargetQuery(semantic_name="Gear Icon Settings", role="button"),
+            screenshot=screenshot,
+        )
+        self.assertIs(unsafe_vision.status, ResolutionStatus.NOT_FOUND)
+
         # 3. Low-confidence vision proposal is rejected
         low_proposal = GroundingProposal(
             target_description="Gear Icon Settings",
@@ -673,7 +716,32 @@ class PerceptionAndHierarchyTests(unittest.IsolatedAsyncioTestCase):
             no_human_interference=True,
         )
         safe_pt = safe_gate.validate_or_raise(coord_cand)
-        self.assertTrue(Rect(100, 100, 80, 40).contains(safe_pt))
+        target_bounds = Rect(100, 100, 80, 40)
+        self.assertTrue(target_bounds.contains(safe_pt))
+
+        unsafe_region = Rect(130, 110, 20, 20)
+        protected_gate = CoordinateFallbackSafetyGate(
+            allow_coordinate_fallback=True,
+            observation_current=True,
+            dpi_verified=True,
+            focus_verified=True,
+            no_human_interference=True,
+            unsafe_regions=(unsafe_region,),
+        )
+        protected_point = protected_gate.validate_or_raise(coord_cand)
+        self.assertTrue(target_bounds.contains(protected_point))
+        self.assertFalse(unsafe_region.contains(protected_point))
+
+        fully_unsafe_gate = CoordinateFallbackSafetyGate(
+            allow_coordinate_fallback=True,
+            observation_current=True,
+            dpi_verified=True,
+            focus_verified=True,
+            no_human_interference=True,
+            unsafe_regions=(target_bounds,),
+        )
+        with self.assertRaises(ComputerAdapterError):
+            fully_unsafe_gate.validate_or_raise(coord_cand)
 
     async def test_win32_screen_capture_backend_and_win32_uia_backend_contracts(self) -> None:
         import ctypes

@@ -783,6 +783,8 @@ class WindowsUiaProvider:
         max_tree_nodes: int = _MAX_TREE_NODES,
         max_tree_depth: int = _MAX_TREE_DEPTH,
         allow_stale_regrounding: bool = True,
+        allow_coordinate_fallback: bool = False,
+        unsafe_regions: tuple[Rect, ...] = (),
     ) -> None:
         if not 0.2 <= observation_lease_seconds <= 60.0:
             raise ValueError("observation_lease_seconds must be between 0.2 and 60")
@@ -797,9 +799,13 @@ class WindowsUiaProvider:
         self._resolver = resolver or TargetResolver()
         self.observation_lease_seconds = observation_lease_seconds
         self.default_timeout_seconds = default_timeout_seconds
+        if any(not isinstance(region, Rect) for region in unsafe_regions):
+            raise ValueError("unsafe_regions must contain only Rect values")
         self.max_tree_nodes = max_tree_nodes
         self.max_tree_depth = max_tree_depth
         self.allow_stale_regrounding = allow_stale_regrounding
+        self.allow_coordinate_fallback = allow_coordinate_fallback
+        self.unsafe_regions = tuple(unsafe_regions)
         self._observations: OrderedDict[str, _WindowObservation] = OrderedDict()
         self._change_detector = EnvironmentChangeDetector()
         self._reground_count = 0
@@ -1139,6 +1145,12 @@ class WindowsUiaProvider:
         )
         click_point: Point | None = None
         if "InvokePattern" not in raw_node.supported_patterns:
+            if not self.allow_coordinate_fallback:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.POLICY_DENIED,
+                    "Coordinate click fallback is disabled; configure explicit opt-in first.",
+                    source=PerceptionSource.COORDINATE,
+                )
             if fresh_candidate.descriptor.bounds is None:
                 raise ComputerAdapterError(
                     ComputerFailureCode.INVALID_COORDINATE,
@@ -1152,7 +1164,10 @@ class WindowsUiaProvider:
                     source=PerceptionSource.UI_AUTOMATION,
                 )
             try:
-                click_point = CoordinateMapper.safe_click_point(fresh_candidate.descriptor.bounds)
+                click_point = CoordinateMapper.safe_click_point(
+                    fresh_candidate.descriptor.bounds,
+                    unsafe_regions=self.unsafe_regions,
+                )
             except ValueError as exc:
                 raise ComputerAdapterError(
                     ComputerFailureCode.INVALID_COORDINATE,

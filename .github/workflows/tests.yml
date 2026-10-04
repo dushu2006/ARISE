@@ -74,3 +74,5 @@ jobs:
       - run: npm run build
       - name: Compile Tauri shell on Windows
         run: python ../scripts/ci_diagnostics.py cargo
+      - name: Run Tauri token-generation tests on Windows
+        run: cargo test --manifest-path src-tauri/Cargo.toml --color never

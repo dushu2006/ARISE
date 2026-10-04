@@ -1523,7 +1523,7 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
     ) -> None:
         import json as _json
         import time as _time
-        from unittest.mock import patch
+        from unittest.mock import AsyncMock, patch
 
         from fastapi.testclient import TestClient
 
@@ -1539,6 +1539,14 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
             SecuritySettings,
             VoiceSettings,
         )
+        from arise.core.computer import (
+            CoordinateSpace,
+            PerceptionSource,
+            SelectorQuality,
+            TargetCandidate,
+            TargetDescriptor,
+        )
+        from arise.core.contracts import TargetIdentity, utc_now
         from arise.core.models import ModelResponse, ModelRole
         from arise.server import create_app
 
@@ -1556,7 +1564,11 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
                 database=DatabaseSettings(path=root / "prod-audit.sqlite3"),
                 desktop=DesktopSettings(enabled=True),
                 browser=BrowserSettings(enabled=True, allowed_domains=["example.com"]),
-                perception=PerceptionSettings(enabled=True, allow_coordinate_fallback=False),
+                perception=PerceptionSettings(
+                    enabled=True,
+                    allow_coordinate_fallback=True,
+                    unsafe_regions=((0, 0, 10, 10),),
+                ),
                 embeddings=EmbeddingSettings(use_local_fallback=True),
                 model=ModelSettings(
                     provider_id="local-llm",
@@ -1595,8 +1607,13 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
             self.assertIsNotNone(services.voice_hub.playback)
             self.assertIsNotNone(services.voice_hub.conversation_bridge)
             self.assertIsNotNone(services.uia_provider)
+            assert services.uia_provider is not None
+            self.assertTrue(services.uia_provider.allow_coordinate_fallback)
+            self.assertEqual(services.uia_provider.unsafe_regions, (Rect(0, 0, 10, 10),))
             self.assertIsNotNone(services.browser_provider)
             self.assertIsNotNone(services.perception)
+            assert services.perception is not None
+            self.assertEqual(services.perception.unsafe_regions, (Rect(0, 0, 10, 10),))
             self.assertIsNotNone(services.screen_capture)
             self.assertIsNotNone(services.working_memory)
             self.assertIsNotNone(services.short_term_memory)
@@ -1814,17 +1831,63 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
                     ["succeeded", "succeeded"],
                 )
 
-                # D. Verify /api/v1/perception/resolve fails closed when coordinate fallback off
-                p_res = client.post(
-                    "/api/v1/perception/resolve",
-                    headers=headers,
-                    json={"query": "Submit", "risk_level": 2},
+                # D. Production perception asks UIA before lower-confidence visual fallback,
+                # returns only an untrusted proposal, and never admits a task by itself.
+                foreground = WindowRecord(
+                    window_id="hwnd-perception-test",
+                    process_id=5200,
+                    title="Test window",
+                    application="test-app.exe",
+                    visible=True,
+                    minimized=False,
+                    maximized=False,
+                    foreground=True,
+                    bounds=Rect(0, 0, 640, 480),
                 )
+                ui_candidate = TargetCandidate(
+                    descriptor=TargetDescriptor(
+                        identity=TargetIdentity(
+                            platform="windows",
+                            window_id=foreground.window_id,
+                            role="button",
+                            semantic_name="Submit",
+                            stable_id="submit-button",
+                        ),
+                        source=PerceptionSource.UI_AUTOMATION,
+                        observed_at=utc_now(),
+                        observation_id="uia-perception-test",
+                        bounds=Rect(100, 100, 80, 32),
+                        coordinate_space=CoordinateSpace.PHYSICAL_DESKTOP,
+                        selector_quality=SelectorQuality.EXACT_ACCESSIBLE_ROLE_NAME,
+                    ),
+                    confidence=0.99,
+                    evidence=("test UIA semantic match",),
+                )
+                with (
+                    patch.object(
+                        services.uia_provider,
+                        "foreground_window",
+                        new=AsyncMock(return_value=foreground),
+                    ),
+                    patch.object(
+                        services.uia_provider,
+                        "inspect",
+                        new=AsyncMock(return_value=(ui_candidate,)),
+                    ),
+                ):
+                    p_res = client.post(
+                        "/api/v1/perception/resolve",
+                        headers=headers,
+                        json={"query": "Submit", "capture_screen_if_needed": False},
+                    )
                 self.assertEqual(p_res.status_code, 200, p_res.text)
+                self.assertEqual(p_res.json()["status"], "resolved")
+                self.assertEqual(p_res.json()["target"]["semantic_name"], "Submit")
                 self.assertEqual(
                     p_res.json()["authority"],
                     "untrusted_grounding_requires_policy_and_verifier",
                 )
+                self.assertEqual(len(client.get("/api/v1/tasks", headers=headers).json()), 2)
 
 
 if __name__ == "__main__":

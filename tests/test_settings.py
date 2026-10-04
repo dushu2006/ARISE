@@ -10,6 +10,7 @@ from arise.config.settings import (
     EmbeddingSettings,
     MemorySettings,
     ModelSettings,
+    PerceptionSettings,
     RuntimeSettings,
     SecuritySettings,
     VoiceSettings,
@@ -96,6 +97,24 @@ class SettingsValidationTests(unittest.TestCase):
             security=SecuritySettings(environment="test", allow_cloud_models=True),
         )
         self.assertTrue(settings.embeddings.enabled)
+
+    def test_coordinate_fallback_is_opt_in_and_unsafe_regions_are_validated(self) -> None:
+        self.assertFalse(PerceptionSettings().allow_coordinate_fallback)
+        settings = PerceptionSettings(
+            allow_coordinate_fallback=True,
+            unsafe_regions=((100, 200, 40, 30), (-50, 0, 10, 10)),
+        )
+        self.assertEqual(
+            settings.unsafe_regions, ((100.0, 200.0, 40.0, 30.0), (-50.0, 0.0, 10.0, 10.0))
+        )
+        for regions in (
+            ((0, 0, 0, 10),),
+            ((0, 0, 10, float("inf")),),
+            ((0, 0, 10),),
+            tuple((i, 0, 1, 1) for i in range(65)),
+        ):
+            with self.subTest(regions=regions[:1]), self.assertRaises(ValidationError):
+                PerceptionSettings(unsafe_regions=regions)
 
     def test_voice_defaults_are_dormant_and_local_voice_does_not_require_cloud(self) -> None:
         self.assertFalse(VoiceSettings().enabled)
