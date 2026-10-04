@@ -10,13 +10,13 @@
 ## A — BASE SOFTWARE REGRESSION
 
 - [x] REAL VALIDATED — A1. Backend pytest suite passes.
-  - Evidence: rerun after the release-gate fixes: .venv/bin/pytest -q -> 330 passed, 1 Starlette/httpx deprecation warning, 88 subtests passed in 11.90s (previous cycle: 319 passed / 68 subtests).
+  - Evidence: rerun after the release-gate fixes: .venv/bin/pytest -q -> 342 passed, 1 Starlette/httpx deprecation warning, 88 subtests passed in 10.86s (gate entry point: 319 passed / 68 subtests). Verified twice: in the full venv and in a clean `pip install -e ".[dev]"` venv that matches the CI dependency set (342 passed / 88 subtests in each).
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — A2. Ruff check passes.
   - Evidence: .venv/bin/ruff check . -> All checks passed!
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — A3. Ruff format check passes.
-  - Evidence: .venv/bin/ruff format --check . -> 102 files already formatted (the 3 new/updated test and adapter files were reformatted in this cycle).
+  - Evidence: .venv/bin/ruff format --check . -> 103 files already formatted (new/updated test and adapter files reformatted in this cycle).
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — A4. Python compileall passes.
   - Evidence: .venv/bin/python -m compileall -q src tests scripts -> exit 0.
@@ -696,7 +696,7 @@
 ## M — FINAL REGRESSION
 
 - [x] REAL VALIDATED — M1. Full pytest passes after all fixes.
-  - Evidence: .venv/bin/pytest -q -> 330 passed, 1 Starlette/httpx deprecation warning, 88 subtests passed in 11.90s after the redaction, workflow-adapt, browser-discovery, and conversation-memory fixes.
+  - Evidence: .venv/bin/pytest -q -> 342 passed, 1 Starlette/httpx deprecation warning, 88 subtests passed in 10.86s after the redaction, workflow-adapt, browser-discovery, conversation-memory, and capability-truth fixes; also 342 passed in a clean `-e ".[dev]"` venv (no optional extras), which is the dependency set that caught defect 15.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M2. Full Ruff check passes.
   - Evidence: .venv/bin/ruff check . -> All checks passed!
@@ -732,13 +732,13 @@
   - Evidence: Re-read README.md, docs/security.md, docs/architecture.md, docs/roadmap.md, phase1-audit historical banner, final-runtime audit, and current source/config; contradictory unregistered-adapter claims corrected.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M13. Master checklist counts are internally consistent.
-  - Evidence: Recount of docs/master-completion-checklist.md -> 469 rows: 455 [x], 9 [!], 5 [?], 0 [-], 0 [ ]. Eight rows added by this gate (redaction, browser-discovery gate, two workflow-adapt rows, two conversation-memory rows); no row removed or merged.
+  - Evidence: Recount of docs/master-completion-checklist.md -> 471 rows: 457 [x], 9 [!], 5 [?], 0 [-], 0 [ ]. Ten rows added by this gate (redaction, browser-discovery gate, two workflow-adapt rows, two conversation-memory rows); no row removed or merged.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M14. No validation result is incorrectly labelled REAL.
   - Evidence: Manual audit of every evidence label in this file: no FAKE/REPLAY/SIMULATION fixture is labelled live provider/device/browser/Windows execution; category counts below are per checklist row and may overlap.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 - [x] REAL VALIDATED — M15. No environment-blocked test is falsely labelled COMPLETE.
-  - Evidence: Manual cross-check of every [!] and [?] item against the Windows/platform and missing-config inventory below; all 239 rows have an evidence record and none remains [ ].
+  - Evidence: Manual cross-check of every [!] and [?] item against the Windows/platform and missing-config inventory below; all 240 rows have an evidence record and none remains [ ].
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim unless evidence names hosted Windows CI); External config: N/A for the exact criterion; any live-provider secondary gap is noted in evidence; Final status: COMPLETE for this exact criterion and scope.
 
 ## N — RELEASE-GATE DEFECT REGRESSION (added by this validation cycle)
@@ -767,9 +767,15 @@
   - Evidence: Commit `bc437f8` failed all four backend CI jobs (`ubuntu-latest` and `windows-latest`, Python 3.11 and 3.12) at the `Run backend tests` step with `tests/test_browser_playwright.py::PlaywrightBrowserTests::test_browser_discovery_reports_a_missing_chromium_binary_truthfully -> AssertionError: False is not true`, while the local venv passed. Cause: the fix conflated the wheel with the binary (`chromium_installed = playwright_installed and _playwright_chromium_installed()`), so a registry containing a browser but no wheel reported no browser; CI installs only `-e ".[dev]"`, where `playwright` is absent. This is recorded as a [!] item rather than [FAIL] because the shipped defect was caught and corrected before release validation, and because the corrected result cannot be marked REAL VALIDATED until the rerun of hosted CI passes on the follow-up commit. Fixed by reporting the two conditions independently and only requiring both for adapter availability; verified locally in a clean `-e ".[dev]"` venv and in the full venv across all four wheel/binary combinations (330 passed / 88 subtests each). Rerun confirmed: workflow `ARISE validation` run `37184893771` on commit `928bc88e19cf0dd019c5d52a4ce656e7ae4af3c5` completed `success` for `backend (windows-latest, 3.11)`, `backend (windows-latest, 3.12)`, `backend (ubuntu-latest, 3.11)`, `backend (ubuntu-latest, 3.12)`, `frontend`, and `windows-tauri-compile` (0 failed steps in every job), which is REAL hosted-Windows execution of the corrected discovery code and its tests. The failing run `37184468477` on `bc437f8` remains on record as the evidence that the first fix was wrong. Raw runner log text was still not readable from this sandbox (the log endpoint returned EOF); failure detail is reconstructed from the GitHub Actions job metadata (`gh api .../jobs` -> failed step "Run backend tests"), because `gh run view --log-failed` and the job-log endpoint both returned EOF from this sandbox, so the raw runner log text was not read directly here.
   - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed on this host; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim); External config: N/A for the exact criterion; Final status: COMPLETE for this exact criterion and scope.
 
+- [x] REAL VALIDATED — N8. The capability inventory cannot claim a live capability the host cannot provide.
+  - Evidence: RELEASE-GATE DEFECT FOUND AND FIXED HERE (sixth product defect). `GET /api/v1/capabilities` derived `browser.dom` and `desktop.ui_automation` purely from whether `browser.*`/`uia.*` tool specs were registered, and registration follows configuration. So on this host — `playwright` wheel installed, no Chromium binary, not Windows — the authoritative inventory advertised both as `available` while `provider.start()` would fail with `Executable doesn't exist` and the UIA adapter raises `Windows UI Automation requires a supported Windows desktop host`. `CapabilityService` had no direct unit test, only `/api/v1/capabilities` fixtures that registered the adapters, which is how the overclaim survived. Fixed in `src/arise/core/capabilities.py` + `_build_services`: `browser_availability` (the real `PlaywrightBrowserProvider.discover_browsers` report, which also makes discovery production-reachable rather than adapter-only) yields `AVAILABLE` only when `playwright_installed and chromium_installed`, `REQUIRES_CONFIGURATION` with the reason otherwise, `DEGRADED` with no probe, `UNAVAILABLE` if the probe raises; `desktop_host_supported` gates UIA on the same platform rule the adapter enforces. Verified live through `create_app` with both adapters enabled: `browser.dom -> requires_configuration` and `desktop.ui_automation -> requires_configuration`, each carrying its reason. Locked by new `tests/test_capabilities.py` (12 tests, both directions); **all 12 fail against the pre-fix capability service**, proving the lock is non-vacuous. `ProductionRuntimeCompositionAuditTests` was changed from hardcoding `available` to deriving the expectation from `sys.platform` and the live discovery report — the old assertion was itself the false claim. No frontend change was required: `frontend/src/types.ts` already declares `'requires_configuration'` and `styles.css` renders it with the amber degraded treatment, so the honest status is displayed rather than unknown.
+  - Validation record: Implementation: YES; Production wiring: YES (for criteria with runtime composition; local/static checks name their scope in evidence); Real execution: YES (named code/command executed on this host; target Windows/hardware status is separately stated); Test evidence: REAL; Environment: AVAILABLE (Linux software checks; no native Windows claim); External config: N/A for the exact criterion; Final status: COMPLETE for this exact criterion and scope.
+
 ## Execution ledger (exact commands and outcomes)
 
-- `.venv/bin/pytest -q` — **330 passed, 1 warning, 88 subtests passed** (11.90s); one Starlette/httpx deprecation warning. Previous cycle: 319 passed / 68 subtests.
+- `.venv/bin/pytest -q` — **342 passed, 1 warning, 88 subtests passed** (10.86s); one Starlette/httpx deprecation warning. Gate entry point: 319 passed / 68 subtests.
+- Clean-interpreter reproduction of the CI dependency set: `python3 -m venv /tmp/ci_venv2 && /tmp/ci_venv2/bin/pip install -e ".[dev]"` (no `playwright`/`vosk`/`keyring`/`sounddevice`) -> **342 passed, 88 subtests**. This venv is what exposed defect 15 and it is re-run for every subsequent fix.
+- Pre-fix falsification runs: `PYTHONPATH=<pre-fix src> pytest ::ConversationMemoryWiringTests` -> 2 failed; `tests/test_capabilities.py` -> **12 failed**; both pass on the working tree. A test that cannot fail against the broken code was not accepted as evidence.
 - `.venv/bin/ruff check .` — **All checks passed!**
 - `.venv/bin/ruff format --check .` — **102 files already formatted**.
 - `.venv/bin/python -m compileall -q src tests scripts` — exit 0.
@@ -975,7 +981,7 @@ Each figure below counts checklist rows whose `Test evidence` field contains tha
 
 | Evidence class | Checklist rows carrying this class |
 |---|---:|
-| REAL | 147 |
+| REAL | 148 |
 | FAKE | 151 |
 | REPLAY | 29 |
 | SIMULATION | 77 |
@@ -984,8 +990,8 @@ Each figure below counts checklist rows whose `Test evidence` field contains tha
 
 | Status | Count |
 |---|---:|
-| TOTAL | 239 |
-| REAL VALIDATED | 136 |
+| TOTAL | 240 |
+| REAL VALIDATED | 137 |
 | ENVIRONMENT BLOCKED | 45 |
 | EXTERNAL CONFIGURATION REQUIRED | 58 |
 | FAILED | 0 |

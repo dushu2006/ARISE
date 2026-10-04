@@ -949,6 +949,12 @@ def _build_services(settings: AppSettings) -> ServerServices:
             or (settings.memory.enabled and settings.embeddings.use_local_fallback)
         ),
         perception_enabled=perception is not None,
+        browser_availability=(
+            browser_provider.discover_browsers if browser_provider is not None else None
+        ),
+        desktop_host_supported=(
+            (lambda: sys.platform == "win32") if uia_provider is not None else None
+        ),
     )
     health = HealthService(
         app_name=settings.app_name,

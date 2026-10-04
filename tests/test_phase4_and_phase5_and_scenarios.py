@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 import unittest
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -1763,8 +1764,18 @@ class ProductionRuntimeCompositionAuditTests(unittest.TestCase):
                 caps = {
                     c["name"]: c for c in client.get("/api/v1/capabilities", headers=headers).json()
                 }
-                self.assertEqual(caps["desktop.ui_automation"]["status"], "available")
-                self.assertEqual(caps["browser.dom"]["status"], "available")
+                # Composition: these adapters are registered and reachable through the API.
+                # Truthfulness: "available" is only asserted when this host could actually act.
+                expected_uia = "available" if sys.platform == "win32" else "requires_configuration"
+                self.assertEqual(caps["desktop.ui_automation"]["status"], expected_uia)
+                discovery = services.browser_provider.discover_browsers()
+                launchable = discovery["playwright_installed"] and discovery["chromium_installed"]
+                self.assertEqual(
+                    caps["browser.dom"]["status"],
+                    "available" if launchable else "requires_configuration",
+                )
+                if not launchable:
+                    self.assertTrue(caps["browser.dom"]["limitations"])
                 self.assertEqual(caps["vision.ocr"]["status"], "available")
                 self.assertEqual(caps["memory.semantic"]["status"], "available")
 
