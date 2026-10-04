@@ -496,7 +496,7 @@
 - [x] COMPLETE — Replay suites pass (pytest replay/failure tests pass; harness replay probes ran under host guard).
 - [x] COMPLETE — Voice harness runs on Linux with the optional local extra; synthetic VAD and deterministic REPLAY/FAKE probes pass, while hardware/TaskEngine-composition probes report `ENVIRONMENT-LIMITED`/`BLOCKED` and Gemini is skipped (21 stages; no device/provider access).
 - [x] COMPLETE — No real-only claims made from replay tests (evidence labels and limitations remain explicit).
-- [!] BLOCKED — ENVIRONMENT — Prior GitHub Actions run 37135316889 passed Ubuntu/Windows backend, frontend, and Windows Tauri `cargo check` for an earlier pushed SHA; the Linux sandbox has no local Rust/Cargo or Windows runner.
+- [!] BLOCKED — ENVIRONMENT — Current-commit GitHub Actions run 37178668976 passed Ubuntu/Windows backend matrices, frontend build, Windows Tauri `cargo check`, and Rust token/restart-helper tests; this does not launch the packaged app or validate WebView2, Windows ACLs, UIA/audio hardware, or the installer. The Linux sandbox has no local Rust/Cargo or interactive Windows runner.
 - [x] COMPLETE — No fake success responses remain in production paths.
 - [x] COMPLETE — No accidental debug code remains.
 - [x] COMPLETE — No obsolete placeholders remain in production paths.
