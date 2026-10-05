@@ -23,7 +23,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from arise.core.contracts import ConditionOperator, Idempotency, RiskLevel
-from arise.core.models import ConditionModel
+from arise.core.models import ConditionModel, PlanStep
 from arise.core.ports import ToolSpec
 
 MAX_DIAGNOSTIC_DETAIL_LENGTH = 400
@@ -31,6 +31,21 @@ _MAX_REPORTED_ERRORS = 8
 _MAX_FIELD_SEGMENT_LENGTH = 32
 
 _JSON_FENCES = ("```json", "```JSON", "```")
+
+
+def _live_field_schema(model: type[Any], field_name: str) -> dict[str, Any]:
+    """Return one field's schema from the live Pydantic model.
+
+    Keeping this derived from the model prevents prompt examples from drifting
+    when a contract field changes (the failure mode this module is designed to
+    avoid).
+    """
+    schema = model.model_json_schema()
+    properties = schema.get("properties", {})
+    field = properties.get(field_name)
+    if not isinstance(field, dict):
+        raise RuntimeError(f"missing live schema field: {model.__name__}.{field_name}")
+    return field
 
 
 def _condition_object_schema() -> dict[str, Any]:
@@ -145,7 +160,23 @@ def correction_instruction(category: str, detail: str) -> str:
     if safe_detail:
         rejection += f"; rejected rules={safe_detail}"
     condition_guidance = ""
-    if any(marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")):
+    type_guidance = ""
+    if any(
+        marker in safe_detail
+        for marker in ("verification_checkpoint", "bool_type", "bool_parsing")
+    ):
+        type_guidance += (
+            " Set steps[].verification_checkpoint to a JSON boolean true or false, "
+            "not a quoted word or object."
+        )
+    if any(marker in safe_detail for marker in ("fallback_policy", "model_type")):
+        type_guidance += (
+            " Set steps[].fallback_policy to an object such as "
+            "{\"strategy\":\"none\",\"fallback_action\":null,\"reason\":\"\"}, not a string."
+        )
+    if any(
+        marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")
+    ):
         condition_example = json.dumps(
             _condition_object_example(), ensure_ascii=False, separators=(",", ":")
         )
@@ -161,7 +192,7 @@ def correction_instruction(category: str, detail: str) -> str:
         f"validation ({rejection}). Return exactly one JSON object that satisfies the ARISE "
         "TaskPlan schema in the system message. Do not repeat the rejected shape. Use only "
         "registered tools, integer risk values, and the exact enum spellings. No Markdown "
-        f"fences, no prose, no extra keys.{condition_guidance}"
+        f"fences, no prose, no extra keys.{type_guidance}{condition_guidance}"
     )
 
 
@@ -292,6 +323,20 @@ def _schema_lines() -> tuple[str, ...]:
         "Use the exact planner-output fields key, operator, expected, and description; put the "
         "fact identifier in key, never in a field named condition, and omit inherited "
         "schema_version.",
+        "- EXACT TYPES (these are not strings or descriptive labels): PlanStep.condition is "
+        "null or a ConditionModel object; verification_checkpoint is a JSON boolean (true/false); "
+        "fallback_policy is a StepFallbackPolicy object, never a strategy string. Its strategy "
+        "is exactly one of \"none\", \"fallback_action\", \"reground\", \"abort\" and its "
+        "fallback_action is null or an ActionProposal object.",
+        "- Live field schemas (generated from the current Pydantic models; follow these exactly): "
+        + json.dumps(
+            {
+                "condition": _live_field_schema(PlanStep, "condition"),
+                "verification_checkpoint": _live_field_schema(PlanStep, "verification_checkpoint"),
+                "fallback_policy": _live_field_schema(PlanStep, "fallback_policy"),
+            },
+            ensure_ascii=False, separators=(",", ":"),
+        ),
         "- The ConditionModel JSON Schema below is generated from the live typed contract; "
         "unknown condition-object keys are rejected: "
         + json.dumps(_condition_object_schema(), ensure_ascii=False, separators=(",", ":")),
@@ -354,6 +399,14 @@ def build_system_prompt(specs: Sequence[ToolSpec]) -> str:
         "Use only identifiers that come from the user's request; if a required grounding "
         "identifier is unknown, ask one short clarification question instead of guessing.",
         "16. Keep the plan as short as the request requires; one step is usually enough.",
+        "17. For system.app_launch, express semantic user intent with launch_intent: use "
+        "reuse_existing_if_available for ordinary 'open X', launch_if_not_running when that "
+        "fallback is explicitly intended, force_new_window for 'open a new window', and "
+        "force_new_instance for 'open a new/another instance'. Never infer this from the app "
+        "name and never use a Chrome-specific rule. Unsupported new-mode capabilities must "
+        "fail closed rather than silently reusing or launching normally.",
+        "18. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
+        "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
         "17. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
         "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
         "",
