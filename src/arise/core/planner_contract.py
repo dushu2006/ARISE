@@ -161,11 +161,22 @@ def correction_instruction(category: str, detail: str) -> str:
         rejection += f"; rejected rules={safe_detail}"
     condition_guidance = ""
     type_guidance = ""
-    if any(marker in safe_detail for marker in ("verification_checkpoint", "bool_type", "bool_parsing")):
-        type_guidance += " Set steps[].verification_checkpoint to a JSON boolean true or false, not a quoted word or object."
+    if any(
+        marker in safe_detail
+        for marker in ("verification_checkpoint", "bool_type", "bool_parsing")
+    ):
+        type_guidance += (
+            " Set steps[].verification_checkpoint to a JSON boolean true or false, "
+            "not a quoted word or object."
+        )
     if any(marker in safe_detail for marker in ("fallback_policy", "model_type")):
-        type_guidance += " Set steps[].fallback_policy to an object such as {\"strategy\":\"none\",\"fallback_action\":null,\"reason\":\"\"}, not a string."
-    if any(marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")): 
+        type_guidance += (
+            " Set steps[].fallback_policy to an object such as "
+            "{\"strategy\":\"none\",\"fallback_action\":null,\"reason\":\"\"}, not a string."
+        )
+    if any(
+        marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")
+    ):
         condition_example = json.dumps(
             _condition_object_example(), ensure_ascii=False, separators=(",", ":")
         )
@@ -318,7 +329,14 @@ def _schema_lines() -> tuple[str, ...]:
         "is exactly one of \"none\", \"fallback_action\", \"reground\", \"abort\" and its "
         "fallback_action is null or an ActionProposal object.",
         "- Live field schemas (generated from the current Pydantic models; follow these exactly): "
-        + json.dumps({"condition": _live_field_schema(PlanStep, "condition"), "verification_checkpoint": _live_field_schema(PlanStep, "verification_checkpoint"), "fallback_policy": _live_field_schema(PlanStep, "fallback_policy")}, ensure_ascii=False, separators=(",", ":")), 
+        + json.dumps(
+            {
+                "condition": _live_field_schema(PlanStep, "condition"),
+                "verification_checkpoint": _live_field_schema(PlanStep, "verification_checkpoint"),
+                "fallback_policy": _live_field_schema(PlanStep, "fallback_policy"),
+            },
+            ensure_ascii=False, separators=(",", ":"),
+        ),
         "- The ConditionModel JSON Schema below is generated from the live typed contract; "
         "unknown condition-object keys are rejected: "
         + json.dumps(_condition_object_schema(), ensure_ascii=False, separators=(",", ":")),

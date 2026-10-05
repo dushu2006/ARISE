@@ -1153,11 +1153,21 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         advertises the corresponding capability; they must never silently degrade
         into ordinary activation.
         """
-        valid_intents = {"reuse_existing_if_available", "launch_if_not_running", "force_new_window", "force_new_instance"}
+        valid_intents = {
+            "reuse_existing_if_available", "launch_if_not_running",
+            "force_new_window", "force_new_instance",
+        }
         if launch_intent not in valid_intents:
-            raise ComputerAdapterError(ComputerFailureCode.INVALID_TARGET, "Unsupported launch intent.", source=PerceptionSource.APPLICATION_API)
+            raise ComputerAdapterError(
+                ComputerFailureCode.INVALID_TARGET, "Unsupported launch intent.",
+                source=PerceptionSource.APPLICATION_API,
+            )
         if launch_intent in {"force_new_window", "force_new_instance"}:
-            raise ComputerAdapterError(ComputerFailureCode.ADAPTER_UNAVAILABLE, f"Resolved application does not advertise {launch_intent} support.", source=PerceptionSource.APPLICATION_API)
+            raise ComputerAdapterError(
+                ComputerFailureCode.ADAPTER_UNAVAILABLE,
+                f"Resolved application does not advertise {launch_intent} support.",
+                source=PerceptionSource.APPLICATION_API,
+            )
         self._launch_diagnostic = {"stage": "resolution", "mode": "not_dispatched"}
         try:
             resolved = await asyncio.to_thread(self._resolver.resolve, application_id)
@@ -1986,7 +1996,10 @@ class AppLaunchTool(ActionTool):
         if len(app_name) > 128:
             raise ValueError("application name exceeds maximum length of 128 characters")
         launch_intent = parameters.get("launch_intent", "reuse_existing_if_available")
-        if launch_intent not in {"reuse_existing_if_available", "launch_if_not_running", "force_new_window", "force_new_instance"}:
+        if launch_intent not in {
+            "reuse_existing_if_available", "launch_if_not_running",
+            "force_new_window", "force_new_instance",
+        }:
             raise ValueError("launch_intent is not a supported semantic launch intent")
         self.provider.resolver.validate_name(app_name)
 
