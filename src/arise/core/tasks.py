@@ -23,6 +23,7 @@ class DuplicateActionError(RuntimeError):
 
 class TaskStatus(StrEnum):
     CREATED = "created"
+    RECEIVED = "received"
     QUEUED = "queued"
     UNDERSTANDING = "understanding"
     PLANNING = "planning"
@@ -34,6 +35,13 @@ class TaskStatus(StrEnum):
     WAITING_RESOURCE = "waiting_resource"
     WAITING_USER = "waiting_user"
     WAITING_AUTH = "waiting_auth"
+    # Long-running waits name what the task is blocked on, so the engine always
+    # knows the completion source it is waiting for instead of merely "waiting".
+    WAITING_FOR_APPLICATION = "waiting_for_application"
+    WAITING_FOR_BROWSER = "waiting_for_browser"
+    WAITING_FOR_EXTERNAL_RESULT = "waiting_for_external_result"
+    WAITING_FOR_VERIFICATION = "waiting_for_verification"
+    RESUMING = "resuming"
     REQUIRES_USER_INPUT = "requires_user_input"
     VERIFYING = "verifying"
     RECOVERING = "recovering"
@@ -44,6 +52,21 @@ class TaskStatus(StrEnum):
     CANCELLED = "cancelled"
     BLOCKED = "blocked"
     COMPLETED = "completed"
+
+
+WAITING_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.WAITING,
+        TaskStatus.WAITING_MODEL,
+        TaskStatus.WAITING_RESOURCE,
+        TaskStatus.WAITING_USER,
+        TaskStatus.WAITING_AUTH,
+        TaskStatus.WAITING_FOR_APPLICATION,
+        TaskStatus.WAITING_FOR_BROWSER,
+        TaskStatus.WAITING_FOR_EXTERNAL_RESULT,
+        TaskStatus.WAITING_FOR_VERIFICATION,
+    }
+)
 
 
 class StepStatus(StrEnum):
@@ -111,7 +134,22 @@ class InvalidStepTransition(RuntimeError):
 
 _ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.CREATED: frozenset(
-        {TaskStatus.QUEUED, TaskStatus.UNDERSTANDING, TaskStatus.CANCELLED, TaskStatus.FAILED}
+        {
+            TaskStatus.RECEIVED,
+            TaskStatus.QUEUED,
+            TaskStatus.UNDERSTANDING,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+        }
+    ),
+    TaskStatus.RECEIVED: frozenset(
+        {
+            TaskStatus.QUEUED,
+            TaskStatus.UNDERSTANDING,
+            TaskStatus.REQUIRES_USER_INPUT,
+            TaskStatus.CANCELLED,
+            TaskStatus.FAILED,
+        }
     ),
     TaskStatus.QUEUED: frozenset(
         {
@@ -166,6 +204,13 @@ _ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.FAILED,
             TaskStatus.BLOCKED,
             TaskStatus.CANCELLED,
+            # A running action may hand control to a named wait, so the task keeps
+            # reporting *what* it is waiting for instead of a bare "running".
+            TaskStatus.WAITING_FOR_APPLICATION,
+            TaskStatus.WAITING_FOR_BROWSER,
+            TaskStatus.WAITING_FOR_EXTERNAL_RESULT,
+            TaskStatus.WAITING_FOR_VERIFICATION,
+            TaskStatus.RESUMING,
         }
     ),
     TaskStatus.WAITING: frozenset(
@@ -185,6 +230,66 @@ _ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.WAITING_USER,
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
+            TaskStatus.UNKNOWN,
+        }
+    ),
+    TaskStatus.WAITING_FOR_APPLICATION: frozenset(
+        {
+            TaskStatus.RESUMING,
+            TaskStatus.RUNNING,
+            TaskStatus.VERIFYING,
+            TaskStatus.RECOVERING,
+            TaskStatus.WAITING_USER,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+        }
+    ),
+    TaskStatus.WAITING_FOR_BROWSER: frozenset(
+        {
+            TaskStatus.RESUMING,
+            TaskStatus.RUNNING,
+            TaskStatus.VERIFYING,
+            TaskStatus.RECOVERING,
+            TaskStatus.WAITING_USER,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+        }
+    ),
+    TaskStatus.WAITING_FOR_EXTERNAL_RESULT: frozenset(
+        {
+            TaskStatus.RESUMING,
+            TaskStatus.RUNNING,
+            TaskStatus.VERIFYING,
+            TaskStatus.RECOVERING,
+            TaskStatus.WAITING_USER,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+        }
+    ),
+    TaskStatus.WAITING_FOR_VERIFICATION: frozenset(
+        {
+            TaskStatus.RESUMING,
+            TaskStatus.VERIFYING,
+            TaskStatus.RUNNING,
+            TaskStatus.RECOVERING,
+            TaskStatus.WAITING_USER,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
+            TaskStatus.UNKNOWN,
+        }
+    ),
+    TaskStatus.RESUMING: frozenset(
+        {
+            TaskStatus.RUNNING,
+            TaskStatus.VERIFYING,
+            TaskStatus.WAITING_USER,
+            TaskStatus.REQUIRES_USER_INPUT,
+            TaskStatus.RECOVERING,
+            TaskStatus.BLOCKED,
+            TaskStatus.FAILED,
             TaskStatus.UNKNOWN,
         }
     ),
@@ -229,6 +334,10 @@ _ALLOWED_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
             TaskStatus.UNKNOWN,
             TaskStatus.FAILED,
             TaskStatus.WAITING_USER,
+            # Verification of a slow external result waits on that result.
+            TaskStatus.WAITING_FOR_EXTERNAL_RESULT,
+            TaskStatus.WAITING_FOR_VERIFICATION,
+            TaskStatus.RESUMING,
             TaskStatus.COMPLETED,
         }
     ),
@@ -412,6 +521,11 @@ class TaskRecord:
     status_reason: str | None = None
     version: int = 0
     schema_version: int = 2
+    # What the engine is currently waiting for, and how often a waiting task has
+    # been resumed. Persisted so a restart or a reconnect can report and, where
+    # safe, continue an interrupted long-running wait.
+    waiting_reason: str | None = None
+    resume_count: int = 0
 
     def __post_init__(self) -> None:
         validate_safe_token(self.task_id, "task_id")
@@ -490,6 +604,39 @@ class TaskRecord:
             updated_at=now,
         )
 
+    @property
+    def waiting_target(self) -> str | None:
+        """The bounded identifier of what this task is waiting for, if any."""
+
+        return self.waiting_reason if self.status in WAITING_STATUSES else None
+
+    def begin_wait(
+        self,
+        status: TaskStatus,
+        *,
+        waiting_reason: str,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Enter a waiting state and record the completion source being awaited."""
+
+        if status not in WAITING_STATUSES:
+            raise InvalidTaskTransition(f"{status.value} is not a waiting state")
+        safe_reason = " ".join(str(waiting_reason).split())[:256] or None
+        if status is not self.status:
+            self.transition_to(status, reason=reason or safe_reason, now=now)
+        elif reason is not None or safe_reason is not None:
+            self.status_reason = reason or safe_reason
+            self.updated_at = now or utc_now()
+        self.waiting_reason = safe_reason
+
+    def end_wait(self, *, resume_count: int | None = None) -> None:
+        """Leave a waiting state; the resume counter records the transition out."""
+
+        if self.status in WAITING_STATUSES:
+            self.resume_count = self.resume_count + 1 if resume_count is None else int(resume_count)
+        self.waiting_reason = None
+
     def transition_to(
         self,
         status: TaskStatus,
@@ -550,6 +697,8 @@ class TaskRecord:
             "steps": [step.to_dict() for step in self.steps],
             "status_reason": self.status_reason,
             "version": self.version,
+            "waiting_reason": self.waiting_reason,
+            "resume_count": self.resume_count,
         }
 
     @classmethod
@@ -577,6 +726,8 @@ class TaskRecord:
             status_reason=data.get("status_reason"),
             version=int(data.get("version", 0)),
             schema_version=int(data.get("schema_version", 1)),
+            waiting_reason=data.get("waiting_reason"),
+            resume_count=int(data.get("resume_count", 0) or 0),
         )
 
 

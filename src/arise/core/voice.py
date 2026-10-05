@@ -696,7 +696,17 @@ class AudioHub:
         self._local_final_transcript: str | None = None
         self._turn_started_at = 0.0
         self._first_response_recorded = False
+        # Telemetry only: "the first audio of this turn reached the device".
         self._first_audio_recorded = False
+        # Output-mode state: once provider audio has actually been played for the
+        # current turn, local TTS must not re-speak its transcript. This is kept
+        # separate from the telemetry flag above because conflating them silently
+        # dropped every response segment after the first one.
+        self._provider_audio_played = False
+        self._output_segment_sequence = 0
+        # One output at a time: an acknowledgement must never interleave with a
+        # streamed response, and segments must play in arrival order.
+        self._speech_lock = asyncio.Lock()
         self._interrupt_started_at_ns: int | None = None
         self._intent_classifier = IntentClassifier()
         self._task_claim_guard = False
@@ -875,6 +885,7 @@ class AudioHub:
                 self._turn_started_at = time.perf_counter()
                 self._first_response_recorded = False
                 self._first_audio_recorded = False
+                self._provider_audio_played = False
             if new_speech and self._state in {VoiceState.SPEAKING, VoiceState.THINKING}:
                 interrupting_response = True
                 if captured_at is not None and captured_at <= vad_completed_ns:
@@ -1306,11 +1317,11 @@ class AudioHub:
         }:
             self._set_state(VoiceState.SPEAKING)
         try:
-            async for chunk in self.speech_synthesizer.synthesize(
-                cleaned,
-                locale=self.config.locale,
-                correlation_id=self._utterance_context.get() or self._session_id or "local-tts",
-            ):
+            # Serialize playback: two output sources must never interleave their
+            # audio, which is how a response appears to "jump" over a segment.
+            # Barge-in does not take this lock, so an interruption still stops the
+            # device immediately and this loop exits at the next chunk check.
+            async with self._speech_lock:
                 if (
                     self._closed
                     or self._suppress_provider_output
@@ -1322,15 +1333,32 @@ class AudioHub:
                     )
                 ):
                     self._emit(VoiceEventKind.OUTPUT_GATED)
-                    break
-                if self._turn_started_at and not self._first_audio_recorded:
-                    self.telemetry.record(
-                        "time_to_first_audio_ms",
-                        (time.perf_counter() - self._turn_started_at) * 1000,
-                    )
-                    self._first_audio_recorded = True
-                await self.playback.play(chunk)
-                chunks_played += 1
+                    return 0
+                async for chunk in self.speech_synthesizer.synthesize(
+                    cleaned,
+                    locale=self.config.locale,
+                    correlation_id=self._utterance_context.get() or self._session_id or "local-tts",
+                ):
+                    if (
+                        self._closed
+                        or self._suppress_provider_output
+                        or self._tts_generation_id != local_gen
+                        or (
+                            self._minimum_output_generation is not None
+                            and generation_id is not None
+                            and generation_id < self._minimum_output_generation
+                        )
+                    ):
+                        self._emit(VoiceEventKind.OUTPUT_GATED)
+                        break
+                    if self._turn_started_at and not self._first_audio_recorded:
+                        self.telemetry.record(
+                            "time_to_first_audio_ms",
+                            (time.perf_counter() - self._turn_started_at) * 1000,
+                        )
+                        self._first_audio_recorded = True
+                    await self.playback.play(chunk)
+                    chunks_played += 1
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1470,6 +1498,7 @@ class AudioHub:
         self._turn_started_at = started
         self._first_response_recorded = False
         self._first_audio_recorded = False
+        self._provider_audio_played = False
         config = LiveSessionConfig(session_id=self._session_id, locale=self.config.locale)
         session: LiveConversationSession | None = None
         try:
@@ -1607,7 +1636,9 @@ class AudioHub:
         self._live_utterance_id = None
         self._turn_in_flight = False
         self._turn_started_at = 0.0
-        self._first_response_recorded = self._first_audio_recorded = False
+        self._first_response_recorded = False
+        self._first_audio_recorded = False
+        self._provider_audio_played = False
         self._interrupt_started_at_ns = None
         self._last_user_transcript = self._provider_user_transcript = None
         self._local_final_transcript = None
@@ -1770,6 +1801,7 @@ class AudioHub:
                 self._turn_started_at = time.perf_counter()
                 self._first_response_recorded = False
                 self._first_audio_recorded = False
+                self._provider_audio_played = False
             if event.text:
                 if self._provider_user_transcript is None:
                     self._task_submission_used = False
@@ -1802,7 +1834,10 @@ class AudioHub:
                 and not event.is_audio_transcript
                 and event.text
                 and self.speech_synthesizer is not None
-                and not self._first_audio_recorded
+                # Speak locally only when this turn has delivered no provider audio.
+                # The telemetry flag that used to guard this latched after the first
+                # segment, so every later segment of a reply was silently dropped.
+                and not self._provider_audio_played
             ):
                 await self.speak_text(event.text, generation_id=event.generation_id)
         elif event.type is LiveEventType.OUTPUT_AUDIO and event.audio is not None:
@@ -1811,6 +1846,9 @@ class AudioHub:
                     "time_to_first_audio_ms", (time.perf_counter() - self._turn_started_at) * 1000
                 )
                 self._first_audio_recorded = True
+            # Provider audio really reached the device for this turn: the transcript
+            # of that audio must never be spoken again by local TTS.
+            self._provider_audio_played = True
             if (
                 self._task_claim_guard
                 or not event.text
@@ -1839,6 +1877,9 @@ class AudioHub:
             await self._handle_tool_call(session, event.tool_call)
         elif event.type is LiveEventType.TURN_COMPLETE:
             self._turn_in_flight = False
+            # The turn is over: the next reply starts with no provider audio played.
+            self._provider_audio_played = False
+            self._output_segment_sequence = 0
             if self._turn_started_at:
                 self.telemetry.record(
                     "response_latency_ms", (time.perf_counter() - self._turn_started_at) * 1000
@@ -2097,6 +2138,7 @@ class AudioHub:
         self._turn_started_at = time.perf_counter()
         self._first_response_recorded = False
         self._first_audio_recorded = False
+        self._provider_audio_played = False
         if self._state is VoiceState.LISTENING:
             self._set_state(VoiceState.THINKING)
         self._last_activity = time.monotonic()

@@ -15,9 +15,10 @@ import os
 import re
 import subprocess
 import sys
+import time
 import unicodedata
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,16 @@ _MAX_SHORTCUT_DEPTH = 12
 _MAX_SCAN_DIRECTORIES = 4096
 _MAX_REGISTRY_SEARCH_FILES = 16_384
 _MAX_START_APPS_BYTES = 1_000_000
+# Launch-mode switches are capability metadata, never user input: a bounded
+# switch spelling only, validated at the descriptor boundary.
+_LAUNCH_SWITCH = re.compile(r"^-{1,2}[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
+_MAX_LAUNCH_SWITCHES = 4
+# Windows registers browsers in its own StartMenuInternet list. That registration
+# is the generic signal that an application is a browser; nothing here names a
+# vendor, and an application absent from the list simply advertises nothing.
+_REGISTERED_BROWSER_ROOTS = ("SOFTWARE\\Clients\\StartMenuInternet",)
+_REGISTERED_BROWSER_CACHE_SECONDS = 300.0
+_registered_browser_cache: tuple[float, frozenset[str]] | None = None
 _SHORTCUT_COMMAND_HOSTS = frozenset(
     {
         "cmd.exe",
@@ -109,6 +120,14 @@ class ApplicationDescriptor:
     source: str = "resolved"
     aliases: tuple[str, ...] = ()
     is_web_app: bool = False
+    # Generic launch-mode capabilities. They are populated from discovered
+    # metadata (for example Windows' own registered-browser list), never from an
+    # application name, and a mode that is not advertised is refused rather than
+    # approximated by reusing or re-launching normally.
+    new_window_supported: bool = False
+    new_instance_supported: bool = False
+    new_window_arguments: tuple[str, ...] = ()
+    new_instance_arguments: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         clean_name = _safe_label(self.name, limit=256)
@@ -156,6 +175,23 @@ class ApplicationDescriptor:
         object.__setattr__(self, "source", source)
         if not isinstance(self.is_web_app, bool):
             raise ValueError("is_web_app must be a boolean")
+        for label, switches in (
+            ("new_window_arguments", self.new_window_arguments),
+            ("new_instance_arguments", self.new_instance_arguments),
+        ):
+            if len(switches) > _MAX_LAUNCH_SWITCHES or any(
+                not isinstance(item, str) or _LAUNCH_SWITCH.fullmatch(item) is None
+                for item in switches
+            ):
+                raise ValueError(f"{label} must be bounded launch switches")
+        for label, supported, switches in (
+            ("new_window", self.new_window_supported, self.new_window_arguments),
+            ("new_instance", self.new_instance_supported, self.new_instance_arguments),
+        ):
+            if not isinstance(supported, bool):
+                raise ValueError(f"{label}_supported must be a boolean")
+            if supported and not switches:
+                raise ValueError(f"{label}_supported requires its launch switches")
         method = self.activation_method
         if method is None:
             method = (
@@ -262,7 +298,13 @@ class WindowsApplicationCatalog:
         discovered.extend(self._discover_start_apps())
         discovered.extend(self._discover_start_menu_shortcuts())
         discovered.extend(self._discover_registry_apps())
-        return _deduplicate_descriptors(discovered)[:_MAX_CATALOG_ENTRIES]
+        merged = _deduplicate_descriptors(discovered)[:_MAX_CATALOG_ENTRIES]
+        browsers = registered_browser_executables()
+        if not browsers:
+            return merged
+        return tuple(
+            advertise_launch_capabilities(item, browser_executables=browsers) for item in merged
+        )
 
     def _discover_start_apps(self) -> list[ApplicationDescriptor]:
         try:
@@ -493,6 +535,130 @@ class WindowsApplicationCatalog:
         return tuple(values)
 
 
+def _read_registered_browsers() -> Sequence[Mapping[str, Any]]:
+    """Read the browsers Windows itself registers for the Start menu/Internet.
+
+    This is an operating-system registration, not a vendor list: any application
+    that registers here is treated as a browser for launch-capability purposes,
+    and an application that does not register advertises nothing.
+    """
+
+    if sys.platform != "win32":
+        return ()
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - non-Windows host
+        return ()
+    results: list[dict[str, Any]] = []
+    for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for base in _REGISTERED_BROWSER_ROOTS:
+            try:
+                container = winreg.OpenKey(root, base)
+            except OSError:
+                continue
+            with container:
+                index = 0
+                while len(results) < 64:
+                    try:
+                        browser_key = winreg.EnumKey(container, index)
+                    except OSError:
+                        break
+                    index += 1
+                    try:
+                        command_key = winreg.OpenKey(
+                            container, rf"{browser_key}\\shell\\open\\command"
+                        )
+                    except OSError:
+                        continue
+                    with command_key:
+                        try:
+                            value, _ = winreg.QueryValueEx(command_key, "")
+                        except OSError:
+                            continue
+                    if isinstance(value, str) and value.strip():
+                        results.append({"name": browser_key, "command": value})
+    return results
+
+
+def _command_executable(command: str) -> str | None:
+    """Extract the executable from a registered open-command string."""
+
+    text = str(command or "").strip()
+    if not text:
+        return None
+    if text.startswith('"'):
+        closing = text.find('"', 1)
+        candidate = text[1:closing] if closing > 0 else text.strip('"')
+    else:
+        candidate = text.split(" ")[0]
+    candidate = os.path.expandvars(candidate.strip().strip('"'))
+    if candidate.casefold().endswith(".exe"):
+        return os.path.normpath(candidate)
+    return None
+
+
+def registered_browser_executables(
+    *,
+    reader: Callable[[], Sequence[Mapping[str, Any]]] | None = None,
+    clock: Callable[[], float] = time.monotonic,
+) -> frozenset[str]:
+    """Return normalized executable keys of applications Windows registers as browsers."""
+
+    global _registered_browser_cache
+    source = reader or _read_registered_browsers
+    now = clock()
+    if _registered_browser_cache is not None:
+        cached_at, cached = _registered_browser_cache
+        if now - cached_at < _REGISTERED_BROWSER_CACHE_SECONDS:
+            return cached
+    keys: set[str] = set()
+    try:
+        entries = source()
+    except Exception:
+        entries = ()
+    for entry in tuple(entries)[:64]:
+        if not isinstance(entry, Mapping):
+            continue
+        executable = _command_executable(str(entry.get("command") or ""))
+        if executable:
+            key = normalized_executable_key(executable)
+            if key:
+                keys.add(key)
+    result = frozenset(keys)
+    _registered_browser_cache = (now, result)
+    return result
+
+
+def advertise_launch_capabilities(
+    descriptor: ApplicationDescriptor,
+    *,
+    browser_executables: frozenset[str] | None = None,
+) -> ApplicationDescriptor:
+    """Attach launch-mode capabilities discovered from generic OS metadata.
+
+    A browser that Windows registers as a Start-menu/Internet client is asked for
+    a new window with the conventional ``--new-window`` switch. Nothing here
+    inspects the application's name, so an unregistered application simply
+    advertises no new-window capability and an explicit request fails closed.
+    """
+
+    if descriptor.new_window_supported or descriptor.is_web_app:
+        return descriptor
+    browsers = (
+        browser_executables if browser_executables is not None else registered_browser_executables()
+    )
+    if not browsers:
+        return descriptor
+    key = normalized_executable_key(descriptor.executable_path)
+    if key and key in browsers:
+        return replace(
+            descriptor,
+            new_window_supported=True,
+            new_window_arguments=("--new-window",),
+        )
+    return descriptor
+
+
 def _aumid_from_shell_link(target: str, arguments: str) -> str | None:
     joined = f"{target} {arguments}"
     match = re.search(
@@ -604,6 +770,18 @@ def _deduplicate_descriptors(
                 source=current.source,
                 aliases=aliases,
                 is_web_app=current.is_web_app or descriptor.is_web_app,
+                new_window_supported=(
+                    current.new_window_supported or descriptor.new_window_supported
+                ),
+                new_instance_supported=(
+                    current.new_instance_supported or descriptor.new_instance_supported
+                ),
+                new_window_arguments=(
+                    current.new_window_arguments or descriptor.new_window_arguments
+                ),
+                new_instance_arguments=(
+                    current.new_instance_arguments or descriptor.new_instance_arguments
+                ),
             )
         else:
             by_identity[identity] = ApplicationDescriptor(
@@ -621,6 +799,18 @@ def _deduplicate_descriptors(
                 source=chosen.source,
                 aliases=aliases,
                 is_web_app=current.is_web_app or descriptor.is_web_app,
+                new_window_supported=(
+                    current.new_window_supported or descriptor.new_window_supported
+                ),
+                new_instance_supported=(
+                    current.new_instance_supported or descriptor.new_instance_supported
+                ),
+                new_window_arguments=(
+                    current.new_window_arguments or descriptor.new_window_arguments
+                ),
+                new_instance_arguments=(
+                    current.new_instance_arguments or descriptor.new_instance_arguments
+                ),
             )
     return tuple(
         sorted(

@@ -683,6 +683,8 @@ class TaskSnapshot(ContractModel):
     created_at: datetime
     updated_at: datetime
     status_reason: str | None = None
+    waiting_reason: str | None = None
+    resume_count: int = Field(default=0, ge=0)
     steps: tuple[TaskStepSnapshot, ...] = ()
     version: int = Field(ge=0)
 
@@ -699,6 +701,8 @@ class TaskSnapshot(ContractModel):
             created_at=record.created_at,
             updated_at=record.updated_at,
             status_reason=record.status_reason,
+            waiting_reason=getattr(record, "waiting_reason", None),
+            resume_count=int(getattr(record, "resume_count", 0) or 0),
             steps=tuple(TaskStepSnapshot.model_validate(step.to_dict()) for step in record.steps),
             version=record.version,
         )

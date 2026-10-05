@@ -35,8 +35,10 @@ from arise.core.ports import (
 )
 from arise.core.resources import ResourceAcquisitionTimeout, ResourceLeaseLost, ResourceManager
 from arise.core.tasks import (
+    WAITING_STATUSES,
     ActionStep,
     DuplicateActionError,
+    InvalidTaskTransition,
     StepStatus,
     TaskNotFoundError,
     TaskRecord,
@@ -378,7 +380,10 @@ class AgentRuntime:
                         "window.foreground",
                         "window.focused_element",
                         "window.open",
+                        "window.visible",
+                        "window.count",
                         "application.running",
+                        "application.focused",
                         "process.running",
                         "process_id",
                         "window.element_count",
@@ -1019,6 +1024,43 @@ class AgentRuntime:
 
     def _set_step_status(self, step: ActionStep, status: StepStatus, reason: str) -> None:
         step.set_status(status, reason=reason)
+
+    # ------------------------------------------------------------------
+    # Waiting-state sink used by tools that wait for external completion
+    # ------------------------------------------------------------------
+
+    def begin_wait(self, task_id: str, status: TaskStatus, *, waiting_reason: str) -> None:
+        """Record *what* a task is waiting for instead of a bare "running"."""
+
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+        try:
+            task.begin_wait(status, waiting_reason=waiting_reason)
+        except InvalidTaskTransition:
+            return
+        self.tasks.save(task)
+        self._emit(
+            "TASK_WAITING",
+            task,
+            None,
+            {"status": status.value, "waiting_reason": waiting_reason},
+        )
+
+    def end_wait(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if task is None:
+            return
+        resumed = task.status in WAITING_STATUSES
+        task.end_wait()
+        self.tasks.save(task)
+        if resumed:
+            self._emit(
+                "TASK_WAIT_ENDED",
+                task,
+                None,
+                {"status": task.status.value, "resume_count": task.resume_count},
+            )
 
     def _set_task_status(
         self,

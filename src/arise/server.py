@@ -14,6 +14,7 @@ import sys
 import threading
 import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -47,6 +48,7 @@ from arise.adapters.browser_playwright import (
     register_playwright_tools,
 )
 from arise.adapters.diagnostics import EnvironmentDiscovery
+from arise.adapters.environment_wait import register_environment_wait_tools
 from arise.adapters.gemini_live import GeminiLiveProvider
 from arise.adapters.openai_compatible import OpenAICompatibleProvider
 from arise.adapters.openai_embeddings import OpenAICompatibleEmbeddingAdapter
@@ -92,6 +94,7 @@ from arise.core.engine import (
     TaskQueueFull,
     UnavailablePlanner,
 )
+from arise.core.environment_questions import EnvironmentQuestionService
 from arise.core.errors import AriseError, classify_exception
 from arise.core.event_bus import EventBroker, EventSubscription, PublishingEventStore
 from arise.core.events import EventEnvelope, EventSeverity
@@ -133,7 +136,12 @@ from arise.core.personalization import (
 )
 from arise.core.planner import GatewayTaskPlanner
 from arise.core.policy import PolicyEngine
-from arise.core.ports import EnvironmentPort, ToolRegistry, VerificationResult
+from arise.core.ports import (
+    EnvironmentPort,
+    ToolNotFoundError,
+    ToolRegistry,
+    VerificationResult,
+)
 from arise.core.protocol import (
     PROTOCOL_VERSION,
     ClientFrame,
@@ -161,6 +169,7 @@ from arise.core.voice import (
     VoiceEventSink,
 )
 from arise.core.voice_bridge import TaskEngineVoiceAdapter, VoiceConversationBridge
+from arise.core.waits import WaitCoordinator
 
 _LOG = logging.getLogger("arise.api")
 _PREVIEW_ORIGIN = re.compile(r"^https://[0-9]+-[A-Za-z0-9-]+\.e2b\.app$")
@@ -412,10 +421,21 @@ class ServerServices:
     api_token_file: Path | None
     uia_provider: WindowsUiaProvider | None = None
     app_launch_provider: WindowsAppLaunchProvider | None = None
+    environment_questions: EnvironmentQuestionService = EnvironmentQuestionService()
     browser_provider: PlaywrightBrowserProvider | None = None
     perception: PerceptionHierarchyPipeline | None = None
     screen_capture: ScreenCaptureAdapter | None = None
     principal_id: str = "local-user"
+
+
+def _facts_observer(provider: Any) -> Any:
+    """Adapt an environment provider into a read-only facts source for waits."""
+
+    async def _observe_facts(action: ActionContract) -> Mapping[str, Any]:
+        lease = await provider.observe(action)
+        return dict(lease.facts)
+
+    return _observe_facts
 
 
 class CompositeEnvironment:
@@ -631,6 +651,7 @@ def _build_voice_runtime(
     gemini_opted_in: bool,
     gemini_secret_configured: bool,
     gemini_sdk_available: bool,
+    environment_questions: EnvironmentQuestionService | None = None,
 ) -> tuple[AudioHub | UnavailableVoiceDiagnostics, AudioHub | None, Any | None]:
     def unavailable(error_code: str | None = None):
         return (
@@ -686,6 +707,12 @@ def _build_voice_runtime(
             question_text: str, session_id: str, locale: str
         ) -> str | None:
             del locale
+            # System/environment questions are answered from observed state, never
+            # generated: a spoken "is Chrome open" must not become a guess.
+            if environment_questions is not None:
+                environment_answer = await environment_questions.answer(question_text)
+                if environment_answer is not None:
+                    return environment_answer.answer
             if router is None or not router.providers():
                 return None
             request_id = str(uuid.uuid4())
@@ -1018,6 +1045,31 @@ def _build_services(settings: AppSettings) -> ServerServices:
             app_launch=app_launch_provider,
         ),
     )
+    # Long-running waits: an environment-condition tool that prefers events and
+    # falls back to adaptive polling. It performs no side effect and cannot
+    # complete a task by itself.
+    wait_observers: list[Any] = []
+    if app_launch_provider is not None:
+        wait_observers.append(_facts_observer(app_launch_provider))
+    if uia_provider is not None:
+        wait_observers.append(_facts_observer(uia_provider))
+    if browser_provider is not None:
+        wait_observers.append(_facts_observer(browser_provider))
+    if wait_observers:
+        register_environment_wait_tools(
+            tools,
+            tuple(wait_observers),
+            coordinator=WaitCoordinator(broker=broker),
+        )
+        try:
+            wait_tool = tools.get("system.wait_for_condition")
+        except ToolNotFoundError:  # pragma: no cover - registration just succeeded
+            wait_tool = None
+        if wait_tool is not None:
+            setter = getattr(wait_tool, "set_status_sink", None)
+            if callable(setter):
+                setter(runtime)
+
     engine = TaskEngine(
         tasks=task_repository,
         events=event_store,
@@ -1037,6 +1089,11 @@ def _build_services(settings: AppSettings) -> ServerServices:
     gemini_opted_in, gemini_secret_configured, gemini_sdk_available = _voice_gemini_prerequisites(
         settings
     )
+    environment_questions = EnvironmentQuestionService(
+        applications=app_launch_provider,
+        windows=uia_provider,
+        redactor=engine.redactor,
+    )
     voice_diagnostics, voice_hub, voice_model = _build_voice_runtime(
         settings,
         secret_provider=secret_provider,
@@ -1046,6 +1103,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         gemini_opted_in=gemini_opted_in,
         gemini_secret_configured=gemini_secret_configured,
         gemini_sdk_available=gemini_sdk_available,
+        environment_questions=environment_questions,
     )
     capability_service = CapabilityService(
         router=router,
@@ -1104,6 +1162,7 @@ def _build_services(settings: AppSettings) -> ServerServices:
         voice_diagnostics=voice_diagnostics,
         voice_hub=voice_hub,
         voice_model=voice_model,
+        environment_questions=environment_questions,
         api_token=token,
         api_token_file=token_file,
         uia_provider=uia_provider,
@@ -2205,6 +2264,25 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     task=TaskSnapshot.from_record(cancelled),
                 )
             )
+
+        # System/environment questions are answered from observed state before any
+        # model call. Commands are never shadowed: this branch only runs for
+        # non-action classifications, so "open Chrome" still becomes a task.
+        if classification.kind in {
+            IntentKind.QUESTION,
+            IntentKind.CASUAL_CONVERSATION,
+            IntentKind.CLARIFICATION,
+            IntentKind.FOLLOW_UP,
+        }:
+            environment_answer = await services.environment_questions.answer(request_body.text)
+            if environment_answer is not None:
+                return finish(
+                    TextInteractionResponse(
+                        outcome="answer" if environment_answer.available else "unavailable",
+                        intent=classification.kind.value,
+                        answer=environment_answer.answer,
+                    )
+                )
 
         if classification.may_require_runtime_task:
             if classification.confidence < 0.75:
