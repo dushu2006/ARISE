@@ -381,6 +381,14 @@ def build_system_prompt(specs: Sequence[ToolSpec]) -> str:
         "Use only identifiers that come from the user's request; if a required grounding "
         "identifier is unknown, ask one short clarification question instead of guessing.",
         "16. Keep the plan as short as the request requires; one step is usually enough.",
+        "17. For system.app_launch, express semantic user intent with launch_intent: use "
+        "reuse_existing_if_available for ordinary 'open X', launch_if_not_running when that "
+        "fallback is explicitly intended, force_new_window for 'open a new window', and "
+        "force_new_instance for 'open a new/another instance'. Never infer this from the app "
+        "name and never use a Chrome-specific rule. Unsupported new-mode capabilities must "
+        "fail closed rather than silently reusing or launching normally.",
+        "18. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
+        "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
         "17. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
         "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
         "",

@@ -1143,8 +1143,21 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         )
 
     async def launch_application(
-        self, application_id: str, *, timeout_seconds: float = 10.0
+        self, application_id: str, *, timeout_seconds: float = 10.0,
+        launch_intent: str = "reuse_existing_if_available",
     ) -> RunningApplication:
+        """Launch according to semantic intent, never inferred from app name.
+
+        ``reuse_existing_if_available`` is the safe default. Explicit new-window
+        and new-instance requests are fail-closed until the resolved backend
+        advertises the corresponding capability; they must never silently degrade
+        into ordinary activation.
+        """
+        valid_intents = {"reuse_existing_if_available", "launch_if_not_running", "force_new_window", "force_new_instance"}
+        if launch_intent not in valid_intents:
+            raise ComputerAdapterError(ComputerFailureCode.INVALID_TARGET, "Unsupported launch intent.", source=PerceptionSource.APPLICATION_API)
+        if launch_intent in {"force_new_window", "force_new_instance"}:
+            raise ComputerAdapterError(ComputerFailureCode.ADAPTER_UNAVAILABLE, f"Resolved application does not advertise {launch_intent} support.", source=PerceptionSource.APPLICATION_API)
         self._launch_diagnostic = {"stage": "resolution", "mode": "not_dispatched"}
         try:
             resolved = await asyncio.to_thread(self._resolver.resolve, application_id)
@@ -1939,7 +1952,7 @@ class AppLaunchTool(ActionTool):
             declared_side_effects=("Starts or activates a desktop application process.",),
             idempotency=Idempotency.IDEMPOTENT,
             max_result_bytes=4096,
-            parameter_names=("application",),
+            parameter_names=("application", "launch_intent"),
             target_scope=None,
         )
 
@@ -1972,6 +1985,9 @@ class AppLaunchTool(ActionTool):
             raise ValueError("application must be a non-empty string")
         if len(app_name) > 128:
             raise ValueError("application name exceeds maximum length of 128 characters")
+        launch_intent = parameters.get("launch_intent", "reuse_existing_if_available")
+        if launch_intent not in {"reuse_existing_if_available", "launch_if_not_running", "force_new_window", "force_new_instance"}:
+            raise ValueError("launch_intent is not a supported semantic launch intent")
         self.provider.resolver.validate_name(app_name)
 
     async def execute(
@@ -1995,8 +2011,9 @@ class AppLaunchTool(ActionTool):
                 "No application name was provided.",
                 source=PerceptionSource.APPLICATION_API,
             )
+        launch_intent = action.parameters.get("launch_intent", "reuse_existing_if_available")
         app = await self.provider.launch_application(
-            app_name, timeout_seconds=action.timeout_seconds
+            app_name, timeout_seconds=action.timeout_seconds, launch_intent=launch_intent
         )
         finished_at = utc_now()
         return ExecutionOutcome(
