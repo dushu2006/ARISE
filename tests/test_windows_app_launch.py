@@ -230,7 +230,7 @@ class AppLaunchToolSpecTests(unittest.TestCase):
         self.assertEqual(spec.minimum_risk, RiskLevel.R1)
         self.assertEqual(spec.required_capabilities, frozenset({"desktop.launch"}))
         self.assertEqual(spec.idempotency, Idempotency.IDEMPOTENT)
-        self.assertEqual(spec.parameter_names, ("application",))
+        self.assertEqual(spec.parameter_names, ("application", "launch_intent"))
         self.assertIsNone(spec.target_scope)
 
     def test_parameter_validation(self) -> None:
