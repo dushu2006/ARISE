@@ -250,3 +250,276 @@ python -m arise serve            # then:
 
 No claim in this document asserts that a Windows behaviour was observed on Windows; every
 Windows-specific claim above is explicitly listed as pending verification.
+
+---
+
+# Pre-merge forensic review (additive, defect-driven)
+
+A second pass over the branch, asked to validate that the implementation preserves
+existing behaviour and closes the real Windows gaps, and to make **no broad changes**.
+Four concrete defects were found and fixed; everything else was verified as already
+correct and left alone.
+
+## A. Findings
+
+### A1. Multi-application decomposition (audit `#6`) — the audit was wrong, the code was right
+The audit claimed multi-application commands "cannot be deterministically decomposed".
+That is incorrect as an absolute statement:
+
+* `TaskEngineConfig.max_plan_steps = 64` leaves ample room for a five-step plan.
+* `AppLaunchTool.resources_for()` derives a **per-application** lock
+  (`desktop.app.<sanitised-name>`), so five launches do not serialise or collide.
+* Each step is verified independently by the runtime's `FactVerifier`.
+* The behaviour was demonstrated on real Windows: "Open Spotify, calculator, file
+  explorer, settings and camera" produced five independent `system.app_launch`
+  actions, all verified.
+
+The accurate problem statement is narrower: decomposition is **produced by the model**,
+with no prompt rule stating the expectation and no `application_entity` typing in the
+deterministic intent hint. That is YELLOW, not RED. The audit table and defect row have
+been corrected in place; **no code behaviour was changed** (planner rule 19 is additive
+prompt text and the strict validator is untouched).
+
+### A2. Launch-intent flow — verified end to end, one real defect fixed
+`launch_intent` is not dropped or rewritten by any layer:
+
+    planner (rule 17) → ActionProposal.parameters → ActionModel.to_domain()
+    → ActionContract.parameters (passed by reference, no filtering)
+    → AppLaunchTool.execute() reads action.parameters["launch_intent"]
+    → provider.launch_application(..., launch_intent=...)
+    → backend dispatch
+
+`ToolSpec.parameter_names` is advisory only (prompt + example); it does not filter
+parameters, and `AppLaunchTool.validate_parameters` rejects unknown intents before
+dispatch.
+
+**Defect found (fixed):** `Win32AppLaunchBackend.activate_application()` refused any
+argument-carrying launch unless the descriptor's activation method was `EXECUTABLE`.
+Browsers are discovered as **Start Menu shortcuts**, and `_deduplicate_descriptors`
+prefers the shortcut record over the executable record, so a shortcut-discovered browser
+advertised `new_window_supported` and then refused to honour `force_new_window` — the
+feature could not work for the most common case. Fixed: a launch mode that is advertised
+now dispatches the **executable** with exactly the advertised switches; a
+browser-installed application (PWA) still refuses (a bare browser switch would open the
+browser instead of the app), and a descriptor with no executable fails closed.
+
+### A3. Generic behaviour — no application-specific logic exists
+Verified by search: no `if Chrome:` / `if WhatsApp:` / `if Spotify:` branch exists
+anywhere in `src/`. The only application names in code are data, not behaviour:
+`KNOWN_ALIASES` (name→identity resolution table), Playwright's channel names, and a
+browser display-name map in diagnostics. Browser capability detection reads Windows'
+own `SOFTWARE\Clients\StartMenuInternet` registration, so any registered browser is
+treated as a browser and an unregistered application advertises nothing.
+
+### A4. Focus is separate from launch success — verified, and made explicit
+`system.app_launch` observation reports separate facts: `application.running` /
+`process.running`, `window.open`, `window.visible`, `window.count`,
+`window.minimized_count`, `window.foreground`, `application.focused`. Diagnostics report
+`focus_requested`, `focus_verified`, `focus_error`, `focus_strategy`, `focus_attempts`,
+`focus_owner_matches_foreground`. `window.focused_element` (UIA) remains the
+target-control fact.
+
+**Honest limitation found:** a `window.exists` fact was added and then **reverted**
+during this review. The bounded desktop snapshot carries *visible* windows only
+(`_snapshot_desktop`), so "a window exists but is minimized" is not observable through
+this path — publishing the fact would have invented it. Consequently
+`window.minimized_count` is structurally `0` with the current snapshot policy; it is
+reported as-is rather than approximated, and a minimized application is deliberately
+*not* claimed as open.
+
+A successful `SetForegroundWindow` is never treated as proof anywhere: every strategy
+ends with an independent `GetForegroundWindow` check, and the launch flow overrides the
+adapter's claim with a **fresh snapshot** (`_reconcile_focus_evidence`).
+
+### A5. Focus verification and duplicate launches — one real defect fixed
+* Foreground timing: `_await_foreground` polls briefly (5 × 20 ms) per strategy, three
+  bounded strategies, and the **fresh snapshot** decides (`_reconcile_focus_evidence`).
+* HWND/PID ownership: `WindowFocusEvidence` carries `foreground_window_id`,
+  `foreground_process_id` and `target_process_id`; `owner_matches_foreground` is
+  reported separately from `focus_verified`.
+* Packaged-app identity: `_window_owner_verified` matches on AUMID / package family from
+  `app_user_model_id_for_window()` and `package_family_name_for_pid()`, so
+  `ApplicationFrameHost`-hosted apps (Calculator, Settings, Camera) verify by app
+  identity rather than by the hosting process.
+* Stale observations and leases: the runtime observes immediately before dispatch,
+  re-validates the lease "as close to dispatch as possible", and the adapter re-observes
+  after the focus attempt; `FactVerifier.verify()` takes its **own** fresh observation,
+  so a long wait can never make verification stale.
+* Windows focus refusal: an already-open, ownership-verified, visible window satisfies
+  reuse even when focus is refused, and **no process is spawned**
+  (`tests/test_production_desktop_path.py::
+  test_reuse_focus_failure_is_recorded_and_never_duplicates_the_application` and
+  `test_unfocusable_existing_window_is_reused_with_unverified_focus`). Dispatch happens
+  **once**, before the poll loop, so a failed confirmation can never spawn a duplicate.
+* **Defect found (fixed):** the last activation strategy injects a synthetic Alt keypress
+  (global input). Because activation is retried on every launch-poll iteration (~0.15 s),
+  a slow launch could inject Alt several times per second into the user's session. It is
+  now rate-limited to once per 5 seconds; the ordinary `SetForegroundWindow` still runs
+  when the nudge is withheld.
+
+### A6. Browser-installed applications (PWA / "WhatsApp Web") — generic support added
+The reported failure was `requested_application = WhatsApp Web, candidate_count = 0,
+APPLICATION_NOT_FOUND`, i.e. **no candidate at all**, so the cause is discovery/resolution,
+not activation. Three generic gaps were found and fixed — none of them names a vendor or
+an application:
+
+1. **Discovery** (`_launches_browser_installed_app`): PWA detection previously matched
+   only `--app-id=` / `--app=`. It now also recognises any shortcut whose target is a
+   browser **registered with Windows** and whose arguments select an application (an
+   `--app*` switch or a non-switch target). A plain browser shortcut (no selecting
+   argument, e.g. `--profile-directory` only) is still the browser.
+2. **Resolution** (`_bounded_name_match`): matching was exact-normalised-name only, so an
+   application listed as "WhatsApp" was unreachable when the user said "WhatsApp Web"
+   (and vice versa). A **bounded whole-name containment** rule was added at the lowest
+   catalog priority (85, below exact 120 / alias 110 / process 100 / known-alias 95, above
+   PATH fallbacks 80). Short names never match by containment ("word" does not reach
+   "WordPad"); two equally plausible matches remain `APPLICATION_AMBIGUOUS`.
+3. **Verification** (`_web_app_title_matches`): a PWA window shows the *site's* title,
+   which changes as the page changes, so exact title equality made correct launches
+   unverifiable. A bounded prefix/suffix match is used, while the strong check — the
+   window's owning **executable** — is unchanged, and the window must still be one the
+   launch actually changed.
+4. **Entry-point identity** (`launch_arguments`): two Start Menu shortcuts pointing at the
+   same executable with different arguments used to collapse into one catalog entry (one
+   silently becoming an alias of the other, so launching by name could open the wrong
+   entry point). The descriptor now carries bounded launch arguments and the canonical
+   identity distinguishes those entry points; identical entry points found in the user and
+   common Start Menu roots still deduplicate.
+
+Whether the specific "WhatsApp Web" shortcut on the reporting machine is discovered can
+only be confirmed on that machine (section F).
+
+## B. Regressions found
+
+**None.** The full suite passed before and after every fix (602 → 620 tests, the delta
+being new tests). No existing test was weakened: the five `test_production_desktop_path`
+rewrites from the earlier stage were re-verified against the new contract, and no test in
+this review was changed to accommodate new behaviour.
+
+Two behaviour changes are intentional and are the fixes themselves:
+* argument-carrying launch modes now dispatch the executable (previously refused for
+  shortcut-discovered browsers);
+* synthetic Alt input is now rate-limited (previously unbounded).
+
+Both fail closed, and both are covered by new tests.
+
+## C. Exact files requiring changes (this review)
+
+```
+src/arise/adapters/windows_app_launch.py    +67/-7   launch-mode dispatch, PWA title match,
+                                                     bounded name containment, helpers
+src/arise/adapters/windows_app_discovery.py +67/-1   launch_arguments field + identity,
+                                                     generic browser-installed app detection,
+                                                     dedupe pass-through
+src/arise/adapters/windows_uia.py           +43/-7   Alt-nudge rate limit (threading lock)
+tests/test_launch_intent_and_pwa.py         new      18 tests
+docs/coherence-milestone-audit.md                    audit #6 / row 14 corrected
+docs/coherence-milestone-implementation.md           this section
+```
+
+Nothing else was touched: planner validation, contracts, risk/policy, memory, security,
+voice, tasks, runtime and the server are unchanged by this review.
+
+## D. Tests added/modified
+
+`tests/test_launch_intent_and_pwa.py` (new, 18 tests):
+
+* **Launch intent (6):** the advertised switch is dispatched to the executable through the
+  real `activate_application`; a browser-installed app never receives a browser switch;
+  a launch mode without an executable fails closed; unsupported intents never dispatch
+  (`force_new_window`, `force_new_instance`); the real backend's argument rules.
+* **Observation facts (3):** a visible window can be unfocused; foreground and process are
+  reported separately; a minimized window is not claimed as open.
+* **Browser-installed apps (6):** shortcut arguments are discovered as a distinct entry
+  point; two entry points of one executable stay distinct; the same entry point in two
+  Start Menu roots deduplicates; PWA title verification tolerates the site's own dynamic
+  title and rejects a different app in the same browser; bounded name matching is not
+  fuzzy; the resolver matches a shorter installed label and keeps genuinely ambiguous
+  matches ambiguous.
+* **Focus input injection (3):** the Alt nudge is injected at most once per interval while
+  the ordinary activation still runs; it may inject again after the interval; the ordinary
+  strategies inject nothing.
+
+## E. Validation result (Arena, after the fixes)
+
+```
+$ .venv/bin/python -m pytest -q tests/
+620 passed, 1 skipped, 140 subtests passed in 36.2s
+
+$ .venv/bin/python -m ruff check .
+All checks passed!
+
+$ .venv/bin/python -m ruff format --check .
+1 file would be reformatted, 129 files already formatted
+  -> test_nvidia_gateway.py  (pre-existing at HEAD, untouched by any of this work)
+
+$ .venv/bin/python -m compileall -q src tests
+exit 0
+```
+
+Type checking: unchanged from before — the repository configures no type checker
+(`pyproject.toml` dev extras are `pytest`, `pytest-asyncio`, `ruff`), so the type gate is
+`ruff`'s `E/F/I/UP/B` rules plus `compileall`, both clean.
+
+Diff churn for this review: **163 insertions, 14 deletions across 3 source files**, plus
+one new test file — no reformatting of unrelated code, no moved or renamed modules.
+
+## F. Real-Windows tests to run after merging (not claimable from Arena)
+
+```powershell
+# 0. Setup
+python -m venv .venv; .\.venv\Scripts\pip install -e ".[dev]"; .\.venv\Scripts\pip install pytest-subtests
+.\.venv\Scripts\python -m pytest -q tests
+
+# 1. Multi-application command (regression guard for audit #6)
+#    "Open Spotify, calculator, file explorer, settings and camera"
+#    Expect: five system.app_launch steps, five independent verifications,
+#            one failure must not erase the others' diagnostics.
+
+# 2. Launch intents
+#    "Open Chrome"                 -> reuse_existing_if_available: no new process
+#    "Open a new Chrome window"    -> force_new_window: NEW window id required
+#    "Open another Notepad instance" -> force_new_instance (or LAUNCH_MODE_UNSUPPORTED)
+#    "Open a new window" for an app that does not advertise it -> LAUNCH_MODE_UNSUPPORTED
+#    Check the diagnostic: launch_intent, mode, activation_argument_count.
+
+# 3. Focus separation (run ARISE from a background console)
+#    Chrome already open -> "Open Chrome"
+#    Expect: no duplicate process; focus_verified true/false matching reality;
+#            focus_strategy recorded; never WINDOW_NOT_FOUND for a live window.
+#    Then a locked-foreground case: expect focus_verified=false, launch still succeeds,
+#            and NO duplicate instance.
+
+# 4. Packaged applications
+#    Calculator, Settings, Photos, Camera -> AUMID/package identity verified,
+#    window owned by ApplicationFrameHost still verifies by app identity.
+
+# 5. Browser-installed applications (PWA) - the previously failing case
+#    Install a PWA from Edge and from Chrome (e.g. WhatsApp Web), then:
+#      a) Confirm the shortcut is discovered:
+#         check the catalog entry name, activation_method, is_web_app, shortcut_path
+#         and (on the machine) the shortcut target/arguments.
+#      b) "Open WhatsApp Web" (and "Open WhatsApp") -> resolves and launches the PWA,
+#         verified by executable identity + a window the launch changed.
+#      c) Confirm the browser itself is still launched by its own shortcut and is NOT
+#         misdetected as a PWA.
+#      d) "Open a new window" for the PWA -> LAUNCH_MODE_UNSUPPORTED (by design).
+
+# 6. Long-running wait
+#    system.wait_for_condition on a real file/process event: event-driven wake,
+#    bounded backoff, and a timeout that never claims completion.
+
+# 7. Voice
+#    Real device: wake, barge-in mid-sentence, three-segment response.
+#    Expect: all three segments audible, no interleaving, no stale generation.
+```
+
+**Arena-verified (this sandbox):** all routing, resolution, discovery, identity,
+dispatch, focus-evidence, wait and lifecycle *logic*, with fakes standing in for Win32,
+COM, the registry, UIA, PWAs and audio devices; the full suite, lint, format and compile.
+
+**Windows-only pending:** every statement about real Windows behaviour — foreground-lock
+refusal and strategy outcomes, real PWA shortcut representation and discovery, real
+launch/reuse/new-window semantics per application, ApplicationFrameHost identity for
+packaged apps, DOM/CDP access to the user's browser (still a gap, audit `#7`), audio
+device behaviour, and all timing/performance characteristics.

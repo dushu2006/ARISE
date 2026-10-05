@@ -11,10 +11,11 @@ import asyncio
 import hashlib
 import re
 import sys
+import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -75,6 +76,13 @@ _MAX_TREE_NODES = 1024
 _FOCUS_MAX_ATTEMPTS = 3
 _FOCUS_VERIFY_CHECKS = 5
 _FOCUS_VERIFY_DELAY_SECONDS = 0.02
+# The last strategy injects a synthetic Alt key to release the foreground lock.
+# That is global input, so it is rate limited: activation is retried on every
+# launch-poll iteration, and without a floor this would type Alt into the user's
+# session several times per second while a launch is still settling.
+_ALT_NUDGE_MIN_INTERVAL_SECONDS = 5.0
+_alt_nudge_lock = threading.Lock()
+_last_alt_nudge_monotonic = 0.0
 _MAX_TREE_DEPTH = 16
 _KEY_PATTERN = re.compile(r"^[A-Za-z0-9+_-]{1,64}$")
 
@@ -599,7 +607,25 @@ class Win32UiaBackend:
         )
 
     @staticmethod
-    def _apply_focus_strategy(user32: Any, hwnd: int, strategy: FocusStrategy) -> None:
+    def _alt_nudge_allowed(clock: Callable[[], float] = time.monotonic) -> bool:
+        """Rate-limit the synthetic Alt injection used by the last strategy."""
+
+        global _last_alt_nudge_monotonic
+        with _alt_nudge_lock:
+            now = float(clock())
+            if now - _last_alt_nudge_monotonic < _ALT_NUDGE_MIN_INTERVAL_SECONDS:
+                return False
+            _last_alt_nudge_monotonic = now
+            return True
+
+    @staticmethod
+    def _apply_focus_strategy(
+        user32: Any,
+        hwnd: int,
+        strategy: FocusStrategy,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         """Apply one bounded activation route. Never raises on a refused request."""
 
         if strategy is FocusStrategy.SET_FOREGROUND:
@@ -640,11 +666,14 @@ class Win32UiaBackend:
         if strategy is FocusStrategy.ALT_NUDGE:
             # A synthetic Alt press makes Windows treat the caller as if the user
             # had just interacted with it, which releases the foreground lock.
-            try:
-                user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
-                user32.keybd_event(0x12, 0, 0x0002, 0)  # KEYEVENTF_KEYUP
-            except Exception:
-                pass
+            # It is global input, so it is only injected once per interval; the
+            # ordinary activation still runs when the nudge is withheld.
+            if Win32UiaBackend._alt_nudge_allowed(clock=clock):
+                try:
+                    user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+                    user32.keybd_event(0x12, 0, 0x0002, 0)  # KEYEVENTF_KEYUP
+                except Exception:
+                    pass
             user32.SetForegroundWindow(hwnd)
 
     @staticmethod

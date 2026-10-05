@@ -354,6 +354,46 @@ KNOWN_ALIASES: dict[str, KnownAppAlias] = {
 ResolvedApplication = ApplicationDescriptor
 
 
+_MIN_CONTAINMENT_NAME_LENGTH = 6
+
+
+def _bounded_name_match(query_key: str, candidate_key: str) -> bool:
+    """True when one whole application name is a bounded prefix/suffix of the other.
+
+    Short names never match by containment, so "word" cannot resolve to "WordPad"
+    and "go" cannot resolve to "Google Chrome".
+    """
+
+    if not query_key or not candidate_key or query_key == candidate_key:
+        return False
+    shorter, longer = sorted((query_key, candidate_key), key=len)
+    return len(shorter) >= _MIN_CONTAINMENT_NAME_LENGTH and (
+        longer.startswith(shorter) or longer.endswith(shorter)
+    )
+
+
+def _web_app_title_matches(title: str, normalized_name: str) -> bool:
+    """Match a browser-installed application window to the application's name.
+
+    A PWA window shows the site's own title, which changes as the page changes
+    ("WhatsApp", "WhatsApp Web", "Inbox (3) - Mail"). Requiring exact equality
+    made correct launches unverifiable, so a bounded prefix/suffix match is used
+    instead. This is deliberately weaker than executable identity, which is still
+    checked separately for every window, and it can only ever widen the choice
+    among windows that the launch actually changed.
+    """
+
+    normalized_title = normalize_application_name(title)
+    if not normalized_title or not normalized_name:
+        return False
+    if normalized_title == normalized_name:
+        return True
+    shorter, longer = sorted((normalized_title, normalized_name), key=len)
+    return len(shorter) >= _MIN_CONTAINMENT_NAME_LENGTH and (
+        longer.startswith(shorter) or longer.endswith(shorter)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _RankedApplication:
     descriptor: ApplicationDescriptor
@@ -528,6 +568,12 @@ class WindowsApplicationResolver:
                 # The alias is a query-to-canonical-name hint, not evidence that
                 # every discovered catalog entry represents that application.
                 score, matched_by = 95, "known_alias_canonical_name"
+            elif _bounded_name_match(query_key, descriptor.normalized_name):
+                # Installed applications are often listed under a shorter label
+                # than the one a user says ("WhatsApp" for "WhatsApp Web"). This is
+                # a bounded whole-name containment check, not fuzzy search: two
+                # equally plausible matches stay ambiguous and are refused.
+                score, matched_by = 85, "catalog_name_containment"
             if score:
                 ranked.append(_RankedApplication(descriptor, score, matched_by))
         return ranked
@@ -777,14 +823,24 @@ class Win32AppLaunchBackend:
         matching launch-mode capability, and they are never shell-interpolated.
         """
         if arguments:
-            if application.activation_method is not ActivationMethod.EXECUTABLE:
+            # Launch-mode switches are advertised capability metadata, and only a
+            # direct executable launch can carry them. A Start Menu link or a
+            # browser-installed application must keep its own activation path:
+            # handing the browser a bare switch would open the browser instead of
+            # the application the shortcut points at, so that refuses instead.
+            if application.is_web_app:
                 raise ComputerAdapterError(
                     ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED,
-                    "Only direct-executable activation can carry launch arguments.",
+                    "A browser-installed application is launched by its own link and "
+                    "cannot carry a launch-mode switch.",
                     source=PerceptionSource.APPLICATION_API,
                 )
             if not application.executable_path:
-                raise OSError("Resolved application has no executable to launch.")
+                raise ComputerAdapterError(
+                    ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED,
+                    "The resolved application has no executable that can carry this launch mode.",
+                    source=PerceptionSource.APPLICATION_API,
+                )
             return await self.launch_process(application.executable_path, arguments=arguments)
         if application.activation_method is ActivationMethod.PACKAGED_AUMID:
             return await asyncio.to_thread(activate_packaged_application, application.aumid or "")
@@ -1062,9 +1118,8 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self, window: WindowRecord, snapshot: DesktopSnapshot, resolved: ResolvedApplication
     ) -> bool:
         """Fail closed unless the window owner has exact observed app identity."""
-        if (
-            resolved.is_web_app
-            and normalize_application_name(window.title) != resolved.normalized_name
+        if resolved.is_web_app and not _web_app_title_matches(
+            window.title, resolved.normalized_name
         ):
             return False
         owner_pid, identities = self._window_owner_identity(window, snapshot)

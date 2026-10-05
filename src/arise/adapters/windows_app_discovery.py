@@ -34,6 +34,8 @@ _MAX_START_APPS_BYTES = 1_000_000
 # switch spelling only, validated at the descriptor boundary.
 _LAUNCH_SWITCH = re.compile(r"^-{1,2}[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 _MAX_LAUNCH_SWITCHES = 4
+# Bounded Start Menu launch arguments kept only to distinguish entry points.
+_MAX_LAUNCH_ARGUMENTS = 16
 # Windows registers browsers in its own StartMenuInternet list. That registration
 # is the generic signal that an application is a browser; nothing here names a
 # vendor, and an application absent from the list simply advertises nothing.
@@ -120,6 +122,11 @@ class ApplicationDescriptor:
     source: str = "resolved"
     aliases: tuple[str, ...] = ()
     is_web_app: bool = False
+    # Launch arguments carried by a Start Menu shortcut. They distinguish two
+    # entry points that share one executable (a browser and the browser-installed
+    # applications launched through it), and they are never user input: they come
+    # from the shortcut itself and are never shell-interpolated.
+    launch_arguments: tuple[str, ...] = ()
     # Generic launch-mode capabilities. They are populated from discovered
     # metadata (for example Windows' own registered-browser list), never from an
     # application name, and a mode that is not advertised is refused rather than
@@ -175,6 +182,16 @@ class ApplicationDescriptor:
         object.__setattr__(self, "source", source)
         if not isinstance(self.is_web_app, bool):
             raise ValueError("is_web_app must be a boolean")
+        if len(self.launch_arguments) > _MAX_LAUNCH_ARGUMENTS or any(
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item) > 256
+            or "\x00" in item
+            or item.strip() != item
+            for item in self.launch_arguments
+        ):
+            raise ValueError("launch arguments must be bounded, trimmed strings")
+        object.__setattr__(self, "launch_arguments", tuple(self.launch_arguments))
         for label, switches in (
             ("new_window_arguments", self.new_window_arguments),
             ("new_instance_arguments", self.new_instance_arguments),
@@ -231,6 +248,13 @@ class ApplicationDescriptor:
             return f"package:{self.package_family_name.casefold()}"
         executable_key = normalized_executable_key(self.executable_path)
         if executable_key:
+            if (
+                self.launch_arguments
+                and self.activation_method is ActivationMethod.START_MENU_SHORTCUT
+            ):
+                return (
+                    f"shortcut-app:{executable_key}:{_launch_arguments_key(self.launch_arguments)}"
+                )
             return f"executable:{executable_key}"
         if self.shortcut_path:
             return f"shortcut:{normalized_executable_key(self.shortcut_path)}"
@@ -387,7 +411,10 @@ class WindowsApplicationCatalog:
                         target_path
                     ):
                         continue
-                    is_web_app = bool(re.search(r"(?i)(?:--app-id=|--app=)", str(arguments or "")))
+                    arguments_text = str(arguments or "").strip()
+                    is_web_app = bool(
+                        re.search(r"(?i)(?:--app-id=|--app=)", arguments_text)
+                    ) or _launches_browser_installed_app(target_path, arguments_text)
                     results.append(
                         ApplicationDescriptor(
                             name=label,
@@ -397,6 +424,7 @@ class WindowsApplicationCatalog:
                             shortcut_path=shortcut_path,
                             source="start_menu_shortcut",
                             is_web_app=is_web_app,
+                            launch_arguments=tuple(arguments_text.split())[:_MAX_LAUNCH_ARGUMENTS],
                         )
                     )
         return results
@@ -659,6 +687,41 @@ def advertise_launch_capabilities(
     return descriptor
 
 
+def _launch_arguments_key(arguments: Sequence[str]) -> str:
+    """Stable, opaque key for the launch arguments of one shortcut entry point."""
+
+    joined = " ".join(str(item) for item in arguments)
+    return hashlib.sha256(joined.encode("utf-8", "ignore")).hexdigest()[:16]
+
+
+def _launches_browser_installed_app(target_path: str, arguments: str) -> bool:
+    """True when a shortcut launches an application installed *through* a browser.
+
+    Browser-installed applications (PWAs) and app-specific browser profiles are
+    Start Menu shortcuts whose target is a browser executable plus launch
+    arguments that select the application (an --app-id= switch, an --app= switch,
+    a site identifier, ...). Both halves are checked generically: the browser test
+    uses the operating system's own registered-browser list, and the application
+    test only asks whether the arguments select something. No vendor is named
+    here, and a plain browser shortcut (no selecting arguments) is still the
+    browser.
+    """
+
+    text = str(arguments or "").strip()
+    if not text:
+        return False
+    browsers = registered_browser_executables()
+    if not browsers:
+        return False
+    executable_key = normalized_executable_key(target_path)
+    if not executable_key or executable_key not in browsers:
+        return False
+    if re.search(r"(?i)--app(?:-id|-name|-url|-launch-url|-short-name)?[= ]", text):
+        return True
+    # A non-switch argument names the application or site to open.
+    return any(not token.startswith("-") for token in text.split())
+
+
 def _aumid_from_shell_link(target: str, arguments: str) -> str | None:
     joined = f"{target} {arguments}"
     match = re.search(
@@ -770,6 +833,7 @@ def _deduplicate_descriptors(
                 source=current.source,
                 aliases=aliases,
                 is_web_app=current.is_web_app or descriptor.is_web_app,
+                launch_arguments=current.launch_arguments or descriptor.launch_arguments,
                 new_window_supported=(
                     current.new_window_supported or descriptor.new_window_supported
                 ),
@@ -799,6 +863,7 @@ def _deduplicate_descriptors(
                 source=chosen.source,
                 aliases=aliases,
                 is_web_app=current.is_web_app or descriptor.is_web_app,
+                launch_arguments=current.launch_arguments or descriptor.launch_arguments,
                 new_window_supported=(
                     current.new_window_supported or descriptor.new_window_supported
                 ),
