@@ -43,6 +43,7 @@ from arise.core.ports import ToolNotFoundError, ToolRegistry
 from arise.core.redaction import DEFAULT_REDACTOR, SecretRedactor
 from arise.core.runtime import ActionRunResult, AgentRuntime
 from arise.core.tasks import (
+    WAITING_STATUSES,
     ActionStep,
     DuplicateActionError,
     StepStatus,
@@ -252,6 +253,9 @@ class TaskEngine:
             session_id=chosen_session,
             parent_task_id=parent_task_id,
             correlation_id=request.request_id,
+        )
+        task.transition_to(
+            TaskStatus.RECEIVED, reason="Request received from an authenticated caller."
         )
         task.transition_to(TaskStatus.QUEUED, reason="Accepted and queued for planning.")
         task, _ = self.tasks.create_or_get(task, request_fingerprint=request_fingerprint)
@@ -1424,6 +1428,7 @@ class TaskEngine:
                         self.tasks.save(task)
                     continue
                 old_status = task.status
+                waiting_for = task.waiting_reason
                 if old_status in {
                     TaskStatus.WAITING_USER,
                     TaskStatus.WAITING_AUTH,
@@ -1440,6 +1445,12 @@ class TaskEngine:
                         "Runtime restarted mid-task; reconcile current state "
                         "before any further action."
                     )
+                    if old_status in WAITING_STATUSES and waiting_for:
+                        reason = (
+                            f"Runtime restarted while waiting for {waiting_for}; "
+                            "reconcile current state before any further action."
+                        )
+                task.end_wait()
                 task.transition_to(target, reason=reason)
                 task = self.tasks.save(task)
                 if target is TaskStatus.REQUIRES_USER_INPUT:

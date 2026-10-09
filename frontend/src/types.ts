@@ -102,6 +102,7 @@ export type CapabilityStatus =
 
 export type TaskState =
   | 'created'
+  | 'received'
   | 'queued'
   | 'understanding'
   | 'planning'
@@ -112,6 +113,11 @@ export type TaskState =
   | 'waiting_resource'
   | 'waiting_user'
   | 'waiting_auth'
+  | 'waiting_for_application'
+  | 'waiting_for_browser'
+  | 'waiting_for_external_result'
+  | 'waiting_for_verification'
+  | 'resuming'
   | 'requires_user_input'
   | 'verifying'
   | 'recovering'
@@ -159,6 +165,8 @@ export interface TaskSnapshot {
   created_at: string;
   updated_at: string;
   status_reason: string | null;
+  waiting_reason: string | null;
+  resume_count: number;
   steps: TaskStep[];
   version: number;
 }

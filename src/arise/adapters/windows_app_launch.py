@@ -34,16 +34,20 @@ from arise.adapters.windows_app_discovery import (
     ApplicationDescriptor,
     WindowsApplicationCatalog,
     activate_packaged_application,
+    advertise_launch_capabilities,
     normalize_application_name,
     normalized_executable_key,
     package_family_name_for_pid,
+    registered_browser_executables,
     shell_execute_shortcut,
 )
 from arise.core.computer import (
     ComputerFailureCode,
+    FocusStrategy,
     InstalledApplication,
     PerceptionSource,
     RunningApplication,
+    WindowFocusEvidence,
     WindowRecord,
 )
 from arise.core.computer_ports import ApplicationProvider, ComputerAdapterError
@@ -82,6 +86,9 @@ _LAUNCH_REQUIRED_STABLE_CHECKS = 2
 _LAUNCH_EXIT_GRACE_CHECKS = 2
 _MIN_LAUNCH_TIMEOUT_SECONDS = 2.0
 _MAX_LAUNCH_TIMEOUT_SECONDS = 15.0
+# Launch arguments are a fixed, capability-advertised switch list. They are never
+# user text: shell metacharacters, quotes and whitespace are rejected outright.
+_LAUNCH_ARGUMENT = re.compile(r"^-{1,2}[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 
 def _safe_basename(path: str) -> str:
@@ -347,6 +354,46 @@ KNOWN_ALIASES: dict[str, KnownAppAlias] = {
 ResolvedApplication = ApplicationDescriptor
 
 
+_MIN_CONTAINMENT_NAME_LENGTH = 6
+
+
+def _bounded_name_match(query_key: str, candidate_key: str) -> bool:
+    """True when one whole application name is a bounded prefix/suffix of the other.
+
+    Short names never match by containment, so "word" cannot resolve to "WordPad"
+    and "go" cannot resolve to "Google Chrome".
+    """
+
+    if not query_key or not candidate_key or query_key == candidate_key:
+        return False
+    shorter, longer = sorted((query_key, candidate_key), key=len)
+    return len(shorter) >= _MIN_CONTAINMENT_NAME_LENGTH and (
+        longer.startswith(shorter) or longer.endswith(shorter)
+    )
+
+
+def _web_app_title_matches(title: str, normalized_name: str) -> bool:
+    """Match a browser-installed application window to the application's name.
+
+    A PWA window shows the site's own title, which changes as the page changes
+    ("WhatsApp", "WhatsApp Web", "Inbox (3) - Mail"). Requiring exact equality
+    made correct launches unverifiable, so a bounded prefix/suffix match is used
+    instead. This is deliberately weaker than executable identity, which is still
+    checked separately for every window, and it can only ever widen the choice
+    among windows that the launch actually changed.
+    """
+
+    normalized_title = normalize_application_name(title)
+    if not normalized_title or not normalized_name:
+        return False
+    if normalized_title == normalized_name:
+        return True
+    shorter, longer = sorted((normalized_title, normalized_name), key=len)
+    return len(shorter) >= _MIN_CONTAINMENT_NAME_LENGTH and (
+        longer.startswith(shorter) or longer.endswith(shorter)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _RankedApplication:
     descriptor: ApplicationDescriptor
@@ -521,6 +568,12 @@ class WindowsApplicationResolver:
                 # The alias is a query-to-canonical-name hint, not evidence that
                 # every discovered catalog entry represents that application.
                 score, matched_by = 95, "known_alias_canonical_name"
+            elif _bounded_name_match(query_key, descriptor.normalized_name):
+                # Installed applications are often listed under a shorter label
+                # than the one a user says ("WhatsApp" for "WhatsApp Web"). This is
+                # a bounded whole-name containment check, not fuzzy search: two
+                # equally plausible matches stay ambiguous and are refused.
+                score, matched_by = 85, "catalog_name_containment"
             if score:
                 ranked.append(_RankedApplication(descriptor, score, matched_by))
         return ranked
@@ -580,16 +633,36 @@ class WindowsApplicationResolver:
         custom = self._custom_aliases.get(normalize_application_name(clean_name))
         if custom is not None:
             descriptors.append(custom)
+        # The registered-alias flag is captured before capability advertising because
+        # that step returns new descriptor objects. Losing the flag here silently
+        # handed resolution to an OS-path fallback on any host that registers a
+        # browser, discarding the alias' explicit configuration (``allow_reuse``,
+        # launch arguments, ...); canonical identity is not a safe substitute
+        # because a path fallback can resolve to the very same executable.
+        ranked: list[tuple[ApplicationDescriptor, bool]] = [
+            (item, item is custom) for item in descriptors
+        ]
+
+        # Generic launch-mode capabilities come from OS metadata, not app names, so
+        # alias/App Paths/PATH resolutions advertise the same capabilities as the
+        # catalog does.
+        if ranked:
+            browsers = registered_browser_executables()
+            if browsers:
+                ranked = [
+                    (advertise_launch_capabilities(item, browser_executables=browsers), is_custom)
+                    for item, is_custom in ranked
+                ]
 
         # Fallbacks are intentionally lower priority than installed catalog metadata;
         # an explicitly registered alias only outranks OS path fallbacks.
         return [
             _RankedApplication(
                 item,
-                90 if item is custom else 80,
-                "registered_alias_exact" if item is custom else f"{item.source}_exact",
+                90 if is_custom else 80,
+                "registered_alias_exact" if is_custom else f"{item.source}_exact",
             )
-            for item in descriptors
+            for item, is_custom in ranked
         ]
 
     @staticmethod
@@ -690,9 +763,13 @@ class WindowsAppLaunchBackend(Protocol):
 
     async def list_running_processes(self) -> Sequence[dict[str, Any]]: ...
 
-    async def launch_process(self, executable_path: str) -> int: ...
+    async def launch_process(
+        self, executable_path: str, *, arguments: Sequence[str] = ()
+    ) -> int: ...
 
-    async def activate_application(self, application: ApplicationDescriptor) -> int | None: ...
+    async def activate_application(
+        self, application: ApplicationDescriptor, *, arguments: Sequence[str] = ()
+    ) -> int | None: ...
 
     async def is_process_alive(self, pid: int) -> bool: ...
 
@@ -746,8 +823,34 @@ class Win32AppLaunchBackend:
     async def launch_process(self, executable_path: str) -> int:
         return await asyncio.to_thread(self._sync_launch_process, executable_path)
 
-    async def activate_application(self, application: ApplicationDescriptor) -> int | None:
-        """Dispatch through the descriptor's safe native activation mechanism."""
+    async def activate_application(
+        self, application: ApplicationDescriptor, *, arguments: Sequence[str] = ()
+    ) -> int | None:
+        """Dispatch through the descriptor's safe native activation mechanism.
+
+        Extra arguments are only accepted for applications that advertise the
+        matching launch-mode capability, and they are never shell-interpolated.
+        """
+        if arguments:
+            # Launch-mode switches are advertised capability metadata, and only a
+            # direct executable launch can carry them. A Start Menu link or a
+            # browser-installed application must keep its own activation path:
+            # handing the browser a bare switch would open the browser instead of
+            # the application the shortcut points at, so that refuses instead.
+            if application.is_web_app:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED,
+                    "A browser-installed application is launched by its own link and "
+                    "cannot carry a launch-mode switch.",
+                    source=PerceptionSource.APPLICATION_API,
+                )
+            if not application.executable_path:
+                raise ComputerAdapterError(
+                    ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED,
+                    "The resolved application has no executable that can carry this launch mode.",
+                    source=PerceptionSource.APPLICATION_API,
+                )
+            return await self.launch_process(application.executable_path, arguments=arguments)
         if application.activation_method is ActivationMethod.PACKAGED_AUMID:
             return await asyncio.to_thread(activate_packaged_application, application.aumid or "")
         if application.activation_method is ActivationMethod.START_MENU_SHORTCUT:
@@ -756,7 +859,7 @@ class Win32AppLaunchBackend:
             return await self.launch_process(application.executable_path)
         raise OSError("Resolved application has no supported activation target.")
 
-    def _sync_launch_process(self, executable_path: str) -> int:
+    def _sync_launch_process(self, executable_path: str, *, arguments: Sequence[str] = ()) -> int:
         if sys.platform != "win32":
             raise ComputerAdapterError(
                 ComputerFailureCode.ADAPTER_UNAVAILABLE,
@@ -769,12 +872,17 @@ class Win32AppLaunchBackend:
         if not os.path.isfile(norm_path):
             raise FileNotFoundError("Resolved executable is no longer available.")
 
+        extra_arguments = tuple(str(item) for item in arguments)
+        for argument in extra_arguments:
+            if not _LAUNCH_ARGUMENT.fullmatch(argument):
+                raise ValueError("launch arguments contain unsupported characters")
+
         creationflags = 0
         if sys.platform == "win32":
             creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 
         proc = subprocess.Popen(
-            [norm_path],
+            [norm_path, *extra_arguments],
             shell=False,
             close_fds=True,
             creationflags=creationflags,
@@ -814,6 +922,34 @@ class Win32AppLaunchBackend:
             ComputerFailureCode.UIA_NOT_AVAILABLE,
             "Windows focus is unavailable for launch verification.",
             source=PerceptionSource.APPLICATION_API,
+        )
+
+    async def focus_window_evidence(self, window_id: str) -> WindowFocusEvidence:
+        """Report separable focus states instead of reducing them to one boolean."""
+
+        evidence_fn = (
+            getattr(self._uia_backend, "focus_window_evidence", None)
+            if self._uia_backend is not None
+            else None
+        )
+        if callable(evidence_fn):
+            return await evidence_fn(window_id)
+        try:
+            await self.focus_window(window_id)
+        except ComputerAdapterError as exc:
+            return WindowFocusEvidence(
+                window_id=window_id,
+                window_exists=exc.code is not ComputerFailureCode.WINDOW_NOT_FOUND,
+                focus_requested=True,
+                focus_error=exc.code.value,
+            )
+        return WindowFocusEvidence(
+            window_id=window_id,
+            window_exists=True,
+            window_visible=True,
+            focus_requested=True,
+            focus_strategy=FocusStrategy.SET_FOREGROUND,
+            foreground_window_id=window_id,
         )
 
 
@@ -909,6 +1045,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self._resolver = resolver or WindowsApplicationResolver()
         self._observations: OrderedDict[str, ObservationLease] = OrderedDict()
         self._launch_diagnostic: dict[str, Any] = {}
+        self._last_focus_evidence: WindowFocusEvidence | None = None
 
     @property
     def launch_diagnostic(self) -> dict[str, Any]:
@@ -990,9 +1127,8 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self, window: WindowRecord, snapshot: DesktopSnapshot, resolved: ResolvedApplication
     ) -> bool:
         """Fail closed unless the window owner has exact observed app identity."""
-        if (
-            resolved.is_web_app
-            and normalize_application_name(window.title) != resolved.normalized_name
+        if resolved.is_web_app and not _web_app_title_matches(
+            window.title, resolved.normalized_name
         ):
             return False
         owner_pid, identities = self._window_owner_identity(window, snapshot)
@@ -1065,6 +1201,91 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             for window_id, window in snapshot.windows.items()
             if window.process_id is not None and window.process_id in process_ids
         }
+
+    async def _focus_window(self, window_id: str) -> WindowFocusEvidence:
+        """Request focus and obtain separable evidence from a fresh observation.
+
+        A backend that raises is never treated as proof of either outcome: the
+        error is recorded, and callers still re-observe the desktop themselves.
+        """
+
+        evidence_fn = getattr(self._backend, "focus_window_evidence", None)
+        if callable(evidence_fn):
+            evidence = await evidence_fn(window_id)
+            if isinstance(evidence, WindowFocusEvidence):
+                return evidence
+        try:
+            await self._backend.focus_window(window_id)
+        except ComputerAdapterError as exc:
+            return WindowFocusEvidence(
+                window_id=window_id,
+                window_exists=exc.code is not ComputerFailureCode.WINDOW_NOT_FOUND,
+                focus_requested=True,
+                focus_error=exc.code.value,
+            )
+        except Exception as exc:
+            return WindowFocusEvidence(
+                window_id=window_id,
+                window_exists=True,
+                focus_requested=True,
+                focus_error=type(exc).__name__[:64],
+            )
+        return WindowFocusEvidence(
+            window_id=window_id,
+            window_exists=True,
+            window_visible=True,
+            focus_requested=True,
+            focus_strategy=FocusStrategy.SET_FOREGROUND,
+            foreground_window_id=window_id,
+        )
+
+    @staticmethod
+    def _reconcile_focus_evidence(
+        evidence: WindowFocusEvidence, snapshot: DesktopSnapshot, window_id: str
+    ) -> WindowFocusEvidence:
+        """Override an adapter's focus claim with the fresh observation.
+
+        A backend that reports success cannot prove foreground: only the desktop
+        snapshot taken after the attempt can. This is what separates
+        "focus requested" from "focus verified".
+        """
+
+        observed = snapshot.windows.get(window_id)
+        foreground_id = snapshot.foreground_window_id
+        foreground_window = snapshot.windows.get(foreground_id) if foreground_id else None
+        return WindowFocusEvidence(
+            window_id=window_id,
+            window_exists=observed is not None,
+            window_visible=bool(observed.visible) if observed is not None else False,
+            window_minimized=(
+                bool(observed.minimized) if observed is not None else evidence.window_minimized
+            ),
+            focus_requested=evidence.focus_requested,
+            focus_error=evidence.focus_error,
+            focus_strategy=evidence.focus_strategy,
+            foreground_window_id=foreground_id,
+            foreground_process_id=(
+                foreground_window.process_id if foreground_window is not None else None
+            ),
+            target_process_id=(
+                observed.process_id
+                if observed is not None and observed.process_id
+                else evidence.target_process_id
+            ),
+            attempts=evidence.attempts,
+        )
+
+    def _record_focus_evidence(self, evidence: WindowFocusEvidence) -> None:
+        self._last_focus_evidence = evidence
+        self._launch_diagnostic.update(
+            focus_requested=evidence.focus_requested,
+            focus_verified=evidence.focus_verified,
+            focus_error=evidence.focus_error,
+            focus_strategy=evidence.focus_strategy.value,
+            focus_attempts=evidence.attempts,
+            focus_window_visible=evidence.window_visible,
+            focus_owner_matches_foreground=evidence.owner_matches_foreground,
+        )
 
     async def _snapshot_desktop(self) -> DesktopSnapshot:
         """Take one bounded read-only desktop snapshot; oversized inventories fail closed."""
@@ -1143,29 +1364,33 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         )
 
     async def launch_application(
-        self, application_id: str, *, timeout_seconds: float = 10.0,
+        self,
+        application_id: str,
+        *,
+        timeout_seconds: float = 10.0,
         launch_intent: str = "reuse_existing_if_available",
     ) -> RunningApplication:
         """Launch according to semantic intent, never inferred from app name.
 
-        ``reuse_existing_if_available`` is the safe default. Explicit new-window
-        and new-instance requests are fail-closed until the resolved backend
-        advertises the corresponding capability; they must never silently degrade
-        into ordinary activation.
+        ``reuse_existing_if_available`` is the safe default: an already open,
+        verifiably owned window is reused and no process is spawned.
+        ``launch_if_not_running`` treats an existing application *process* as
+        sufficient and does not dispatch. ``force_new_window`` and
+        ``force_new_instance`` are honoured only when the resolved application
+        advertises the corresponding capability in its discovered metadata; they
+        fail closed with ``LAUNCH_MODE_UNSUPPORTED`` rather than degrading into
+        ordinary activation or silently reusing an existing window.
         """
         valid_intents = {
-            "reuse_existing_if_available", "launch_if_not_running",
-            "force_new_window", "force_new_instance",
+            "reuse_existing_if_available",
+            "launch_if_not_running",
+            "force_new_window",
+            "force_new_instance",
         }
         if launch_intent not in valid_intents:
             raise ComputerAdapterError(
-                ComputerFailureCode.INVALID_TARGET, "Unsupported launch intent.",
-                source=PerceptionSource.APPLICATION_API,
-            )
-        if launch_intent in {"force_new_window", "force_new_instance"}:
-            raise ComputerAdapterError(
-                ComputerFailureCode.ADAPTER_UNAVAILABLE,
-                f"Resolved application does not advertise {launch_intent} support.",
+                ComputerFailureCode.INVALID_TARGET,
+                "Unsupported launch intent.",
                 source=PerceptionSource.APPLICATION_API,
             )
         self._launch_diagnostic = {"stage": "resolution", "mode": "not_dispatched"}
@@ -1198,19 +1423,65 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         baseline_processes = self._application_process_ids(baseline, resolved)
         baseline_windows = self._application_windows(baseline, resolved, baseline_processes)
         self._launch_diagnostic.update(
+            launch_intent=launch_intent,
             baseline_application_processes=len(baseline_processes),
             baseline_application_windows=len(baseline_windows),
             baseline_foreground_window_observed=baseline.foreground_window_id is not None,
         )
 
+        # Explicit new-window/instance requests never reuse, and are only attempted
+        # when the resolved application advertises the capability.
+        arguments: tuple[str, ...] = ()
+        require_new_window = False
+        if launch_intent in {"force_new_window", "force_new_instance"}:
+            supported = (
+                resolved.new_window_supported
+                if launch_intent == "force_new_window"
+                else resolved.new_instance_supported
+            )
+            arguments = (
+                resolved.new_window_arguments
+                if launch_intent == "force_new_window"
+                else resolved.new_instance_arguments
+            )
+            if not supported or not arguments:
+                self._launch_diagnostic.update(
+                    stage="capability_check",
+                    mode="launch_mode_unsupported",
+                    failure_reason="launch_mode_unsupported",
+                    failure_code=ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED.value,
+                )
+                raise ComputerAdapterError(
+                    ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED,
+                    f"The resolved application does not advertise {launch_intent} support.",
+                    source=PerceptionSource.APPLICATION_API,
+                )
+            require_new_window = True
+        elif launch_intent == "launch_if_not_running" and baseline_processes:
+            # Already running: the request explicitly asked for that fallback only,
+            # so no process is dispatched and no window is required.
+            self._launch_diagnostic.update(
+                stage="already_running",
+                mode="launch_if_not_running",
+                process_id=min(baseline_processes),
+                baseline_application_windows=len(baseline_windows),
+            )
+            return RunningApplication(
+                process_id=min(baseline_processes),
+                name=resolved.name,
+                executable_path=resolved.executable_path,
+                window_ids=tuple(sorted(baseline_windows)),
+                package_family_name=resolved.package_family_name,
+            )
+
         # A background process is not an open application. Reuse only an observed
         # window belonging to the resolved executable, and do not swallow focus errors.
-        if resolved.allow_reuse:
+        if resolved.allow_reuse and launch_intent == "reuse_existing_if_available":
             reused = await self._reuse_existing_window(resolved, baseline_windows)
             if reused is not None:
                 return reused
 
-        dispatched_pid = await self._dispatch_process(resolved)
+        dispatched_pid = await self._dispatch_process(resolved, arguments=arguments)
         if not self._requires_window:
             if dispatched_pid is None:
                 raise ComputerAdapterError(
@@ -1231,6 +1502,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 dispatched_pid,
                 deadline,
                 excluded_window_ids=frozenset(rejected_window_ids),
+                require_new_window=require_new_window,
             )
             confirmed = await self._confirm_window_evidence(resolved, evidence, dispatched_pid)
             if confirmed is not None:
@@ -1248,21 +1520,45 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                     source=PerceptionSource.APPLICATION_API,
                 )
 
-    async def _dispatch_process(self, resolved: ApplicationDescriptor) -> int | None:
+    async def _dispatch_process(
+        self, resolved: ApplicationDescriptor, *, arguments: Sequence[str] = ()
+    ) -> int | None:
         self._launch_diagnostic.update(
             stage="activation_dispatch",
             mode="activation_attempt",
             activation_method=str(resolved.activation_method),
+            activation_argument_count=len(tuple(arguments)),
         )
         try:
             activate = getattr(self._backend, "activate_application", None)
             if callable(activate):
-                pid = await activate(resolved)
+                try:
+                    pid = (
+                        await activate(resolved)
+                        if not arguments
+                        else await activate(resolved, arguments=arguments)
+                    )
+                except TypeError:
+                    # Backends that cannot carry arguments must not silently drop an
+                    # explicit new-window request: fail closed instead.
+                    if arguments:
+                        raise ComputerAdapterError(
+                            ComputerFailureCode.LAUNCH_MODE_UNSUPPORTED,
+                            "The activation backend cannot dispatch this launch mode.",
+                            source=PerceptionSource.APPLICATION_API,
+                        ) from None
+                    pid = await activate(resolved)
             elif (
                 resolved.activation_method is ActivationMethod.EXECUTABLE
                 and resolved.executable_path
             ):
-                pid = await self._backend.launch_process(resolved.executable_path)
+                pid = (
+                    await self._backend.launch_process(resolved.executable_path)
+                    if not arguments
+                    else await self._backend.launch_process(
+                        resolved.executable_path, arguments=arguments
+                    )
+                )
             else:
                 raise OSError("The selected backend does not support this activation method.")
         except ComputerAdapterError as exc:
@@ -1332,13 +1628,20 @@ class WindowsAppLaunchProvider(ApplicationProvider):
     async def _reuse_existing_window(
         self, resolved: ResolvedApplication, baseline_windows: Mapping[str, WindowRecord]
     ) -> RunningApplication | None:
-        """Reuse a visible application window, or return None so the caller dispatches.
+        """Reuse an already open application window, or return None so the caller dispatches.
 
         Reuse is idempotent: no process is spawned. The intended window is selected
         deterministically and must be confirmed by a *fresh* observation after the
-        focus attempt; the record returned by ``focus_window`` is never evidence. If
-        activation cannot be confirmed, the caller dispatches the executable so the
-        application's own single-instance logic can activate its window.
+        focus attempt; the record returned by ``focus_window`` is never evidence.
+
+        "The application is open" and "the application received foreground focus"
+        are deliberately different outcomes. A visible, non-minimized, ownership
+        verified window satisfies an ordinary "open X" request even when Windows
+        refuses to hand over foreground (the foreground lock does exactly this when
+        ARISE is not itself foreground). Spawning another instance in that situation
+        is the defect this method must not repeat: focus is recorded separately as
+        ``focus_verified`` so the caller can report "opened, but not focused"
+        instead of silently opening a duplicate.
         """
         target = self._select_existing_window(
             baseline_windows, prefer_foreground=self._requires_window
@@ -1349,7 +1652,28 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self._launch_diagnostic.update(stage="focus_existing_window", mode="reuse_attempt")
         if not self._requires_window:
             # Alternate backends keep the existing behavior: a focus error propagates.
-            await self._backend.focus_window(target.window_id)
+            try:
+                await self._backend.focus_window(target.window_id)
+            except ComputerAdapterError as exc:
+                self._record_focus_evidence(
+                    WindowFocusEvidence(
+                        window_id=target.window_id,
+                        window_exists=True,
+                        focus_requested=True,
+                        focus_error=exc.code.value,
+                    )
+                )
+                raise
+            self._record_focus_evidence(
+                WindowFocusEvidence(
+                    window_id=target.window_id,
+                    window_exists=True,
+                    window_visible=True,
+                    focus_requested=True,
+                    focus_strategy=FocusStrategy.SET_FOREGROUND,
+                    foreground_window_id=target.window_id,
+                )
+            )
             self._launch_diagnostic.update(
                 stage="focus_existing_window", mode="reuse", process_id=target.process_id
             )
@@ -1361,27 +1685,26 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 package_family_name=resolved.package_family_name,
             )
 
-        focus_error: str | None = None
-        try:
-            await self._backend.focus_window(target.window_id)
-        except ComputerAdapterError as exc:
-            focus_error = exc.code.value
-        except Exception as exc:
-            focus_error = type(exc).__name__
+        evidence = await self._focus_window(target.window_id)
 
         confirmation = await self._snapshot_desktop()
+        # The fresh observation, not the activation call, decides whether focus was
+        # actually obtained.
+        evidence = self._reconcile_focus_evidence(evidence, confirmation, target.window_id)
+        self._record_focus_evidence(evidence)
         confirmed = confirmation.windows.get(target.window_id)
         if (
-            focus_error is None
-            and confirmed is not None
-            and self._window_is_active(confirmed)
+            confirmed is not None
+            and confirmed.visible
+            and not confirmed.minimized
             and self._window_owner_verified(confirmed, confirmation, resolved)
         ):
             self._launch_diagnostic.update(
                 stage="focus_existing_window",
                 mode="reuse",
                 process_id=int(confirmed.process_id or target.process_id),
-                focus_verified=True,
+                focus_verified=evidence.focus_verified,
+                window_foreground=bool(confirmed.foreground),
             )
             return RunningApplication(
                 process_id=int(confirmed.process_id or target.process_id),
@@ -1396,7 +1719,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         self._launch_diagnostic.update(
             stage="focus_existing_window",
             mode="reuse_unconfirmed",
-            reuse_focus_error=focus_error or "activation_not_observed",
+            reuse_focus_error=evidence.focus_error or "window_not_observable",
         )
         return None
 
@@ -1512,6 +1835,8 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         snapshot: DesktopSnapshot,
         baseline_windows: Mapping[str, WindowRecord],
         excluded_window_ids: frozenset[str] = frozenset(),
+        *,
+        require_new_window: bool = False,
     ) -> list[WindowEvidence]:
         """Windows that this dispatch can explain, in deterministic preference order.
 
@@ -1520,7 +1845,9 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         foreground now and was not foreground (or was minimized) in the baseline.
 
         An unchanged pre-existing application window is never evidence, so an
-        unrelated Chrome window cannot satisfy verification for this launch.
+        unrelated Chrome window cannot satisfy verification for this launch. An
+        explicit new-window/new-instance request accepts only ``new_window``
+        evidence; re-activating the old window is not a new window.
         """
         candidates: list[WindowEvidence] = []
         for window_id, window in snapshot.windows.items():
@@ -1536,6 +1863,8 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             prior = baseline_windows.get(window_id)
             if prior is None:
                 kind = WindowEvidenceKind.NEW_WINDOW
+            elif require_new_window:
+                continue
             elif window.foreground and (not prior.foreground or prior.minimized):
                 kind = WindowEvidenceKind.ACTIVATED_EXISTING_WINDOW
             else:
@@ -1559,6 +1888,7 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         deadline: float,
         *,
         excluded_window_ids: frozenset[str] = frozenset(),
+        require_new_window: bool = False,
     ) -> WindowEvidence:
         """Require stable, newly observed window ownership before accepting launch."""
         self._launch_diagnostic.update(
@@ -1596,7 +1926,11 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                     ownership_rejections.add(window_id)
 
             candidates = self._window_evidence_candidates(
-                resolved, snapshot, baseline_windows, excluded_window_ids
+                resolved,
+                snapshot,
+                baseline_windows,
+                excluded_window_ids,
+                require_new_window=require_new_window,
             )
             if candidates:
                 exit_checks = 0
@@ -1700,17 +2034,13 @@ class WindowsAppLaunchProvider(ApplicationProvider):
             focus_verified=False,
             confirmation_failed=False,
         )
-        try:
-            await self._backend.focus_window(window_id)
-        except Exception as exc:
-            self._launch_diagnostic.update(
-                focus_failed=True,
-                focus_error=(
-                    exc.code.value if isinstance(exc, ComputerAdapterError) else type(exc).__name__
-                ),
-            )
-
+        focus_evidence = await self._focus_window(window_id)
         confirmation = await self._snapshot_desktop()
+        focus_evidence = self._reconcile_focus_evidence(focus_evidence, confirmation, window_id)
+        self._record_focus_evidence(focus_evidence)
+        self._launch_diagnostic.update(
+            focus_failed=focus_evidence.focus_error is not None or not focus_evidence.focus_verified
+        )
         confirmed = confirmation.windows.get(window_id)
         if (
             confirmed is None
@@ -1792,6 +2122,8 @@ class WindowsAppLaunchProvider(ApplicationProvider):
         pid: int | None = None
         window_ids: list[str] = []
         observation_error: str | None = None
+        application_windows: dict[str, WindowRecord] = {}
+        snapshot_foreground_window_id: str | None = None
 
         if app_name:
             try:
@@ -1820,18 +2152,36 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                     for window_id, window in application_windows.items()
                     if not window.minimized
                 ]
+                snapshot_foreground_window_id = snapshot.foreground_window_id
             except Exception as exc:
                 observation_error = (
                     exc.code.value if isinstance(exc, ComputerAdapterError) else type(exc).__name__
                 )
 
+        # "The application is running", "a window is visible", and "the application
+        # owns the foreground window" are separate facts. They are reported
+        # separately so a plan can require focus without conflating it with launch.
+        visible_windows = {
+            window_id: window
+            for window_id, window in application_windows.items()
+            if window.visible and not window.minimized
+        }
+        foreground_owned = (
+            snapshot_foreground_window_id is not None
+            and snapshot_foreground_window_id in visible_windows
+        )
         facts: dict[str, Any] = {
             "application": str(app_name),
             "application.name": str(resolved_name),
             "application.running": is_running,
             "process.running": is_running,
             "process_id": pid,
-            "window.open": len(window_ids) > 0,
+            "window.open": len(visible_windows) > 0,
+            "window.visible": len(visible_windows) > 0,
+            "window.count": len(visible_windows),
+            "window.minimized_count": len(application_windows) - len(visible_windows),
+            "window.foreground": foreground_owned,
+            "application.focused": foreground_owned,
             "window_ids": list(window_ids),
             "domain": "system.application",
             "observation.error": observation_error,
@@ -1924,10 +2274,22 @@ class WindowsAppLaunchProvider(ApplicationProvider):
                 ),
             )
 
-        observed_summary = (
-            f"Resolved application process (PID {pid}) and visible window were observed."
-            if self._requires_window
-            else f"Application '{app_name}' verified running (PID {pid})."
+        window_open = bool(observation.facts.get("window.open"))
+        focused = bool(observation.facts.get("application.focused"))
+        if self._requires_window and window_open:
+            observed_summary = (
+                f"Resolved application process (PID {pid}) and visible window were observed; "
+                f"the application {'owns' if focused else 'does not own'} the foreground window."
+            )
+        elif self._requires_window:
+            observed_summary = (
+                f"Resolved application process (PID {pid}) was observed without a visible window."
+            )
+        else:
+            observed_summary = f"Application '{app_name}' verified running (PID {pid})."
+        self._launch_diagnostic.update(
+            verification_window_open=window_open,
+            verification_application_focused=focused,
         )
         return VerificationResult(
             status=VerificationStatus.PASSED,
@@ -1997,8 +2359,10 @@ class AppLaunchTool(ActionTool):
             raise ValueError("application name exceeds maximum length of 128 characters")
         launch_intent = parameters.get("launch_intent", "reuse_existing_if_available")
         if launch_intent not in {
-            "reuse_existing_if_available", "launch_if_not_running",
-            "force_new_window", "force_new_instance",
+            "reuse_existing_if_available",
+            "launch_if_not_running",
+            "force_new_window",
+            "force_new_instance",
         }:
             raise ValueError("launch_intent is not a supported semantic launch intent")
         self.provider.resolver.validate_name(app_name)

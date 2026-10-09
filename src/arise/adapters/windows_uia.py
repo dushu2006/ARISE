@@ -11,10 +11,11 @@ import asyncio
 import hashlib
 import re
 import sys
+import threading
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Protocol
@@ -27,6 +28,7 @@ from arise.core.computer import (
     CoordinateSpace,
     DisplayGeometry,
     EnvironmentFingerprint,
+    FocusStrategy,
     PerceptionSource,
     Point,
     Rect,
@@ -36,6 +38,7 @@ from arise.core.computer import (
     TargetDescriptor,
     TargetQuery,
     TargetResolution,
+    WindowFocusEvidence,
     WindowRecord,
 )
 from arise.core.computer_ports import ComputerAdapterError, SensitiveText
@@ -67,6 +70,19 @@ from arise.core.resources import ResourceLease, ResourceLeaseLost
 
 _MAX_OBSERVATIONS = 64
 _MAX_TREE_NODES = 1024
+# Focus is asynchronous on Windows and may be refused by the foreground lock, so
+# activation is retried with progressively stronger strategies and every attempt
+# ends with an independent foreground observation.
+_FOCUS_MAX_ATTEMPTS = 3
+_FOCUS_VERIFY_CHECKS = 5
+_FOCUS_VERIFY_DELAY_SECONDS = 0.02
+# The last strategy injects a synthetic Alt key to release the foreground lock.
+# That is global input, so it is rate limited: activation is retried on every
+# launch-poll iteration, and without a floor this would type Alt into the user's
+# session several times per second while a launch is still settling.
+_ALT_NUDGE_MIN_INTERVAL_SECONDS = 5.0
+_alt_nudge_lock = threading.Lock()
+_last_alt_nudge_monotonic = 0.0
 _MAX_TREE_DEPTH = 16
 _KEY_PATTERN = re.compile(r"^[A-Za-z0-9+_-]{1,64}$")
 
@@ -485,26 +501,206 @@ class Win32UiaBackend:
         return await asyncio.to_thread(self._sync_focus_window, window_id)
 
     def _sync_focus_window(self, window_id: str) -> WindowRecord:
-        user32 = self._get_user32()
-        hwnd = _parse_hwnd(window_id)
-        if not bool(user32.IsWindow(hwnd)):
+        """Activate a window and require fresh evidence that it became foreground.
+
+        A missing window and a window that refused activation are different
+        failures and are reported with different codes. ``SetForegroundWindow``
+        returns ``BOOL`` and silently fails under the Windows foreground lock, so
+        its return value is never treated as proof: every attempt ends with an
+        independent ``GetForegroundWindow`` observation.
+        """
+
+        evidence = self._sync_focus_window_evidence(window_id)
+        if not evidence.window_exists:
             raise ComputerAdapterError(
                 ComputerFailureCode.WINDOW_NOT_FOUND,
                 "Requested Windows UIA window handle does not exist.",
                 source=PerceptionSource.UI_AUTOMATION,
             )
-        if bool(user32.IsIconic(hwnd)):
-            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-        user32.SetForegroundWindow(hwnd)
-        fg_hwnd = int(user32.GetForegroundWindow() or 0)
-        rec = self._window_record_from_hwnd(hwnd, fg_hwnd=fg_hwnd)
-        if rec is None or fg_hwnd != hwnd:
+        hwnd = _parse_hwnd(window_id)
+        fg_hwnd = (
+            _parse_hwnd(evidence.foreground_window_id)
+            if evidence.foreground_window_id is not None
+            else 0
+        )
+        record = self._window_record_from_hwnd(hwnd, fg_hwnd=fg_hwnd)
+        if record is None:
             raise ComputerAdapterError(
                 ComputerFailureCode.WINDOW_NOT_FOUND,
-                "Requested Windows UIA window could not be brought to foreground.",
+                "Requested Windows UIA window handle does not exist.",
                 source=PerceptionSource.UI_AUTOMATION,
             )
-        return rec
+        if not evidence.focus_verified:
+            raise ComputerAdapterError(
+                ComputerFailureCode.FOCUS_FAILED,
+                "The window exists but Windows did not report it as the foreground "
+                "window after activation.",
+                source=PerceptionSource.UI_AUTOMATION,
+            )
+        return record
+
+    async def focus_window_evidence(self, window_id: str) -> WindowFocusEvidence:
+        """Return separable focus evidence instead of raising on an activation refusal."""
+
+        self._require_windows()
+        return await asyncio.to_thread(self._sync_focus_window_evidence, window_id)
+
+    def _sync_focus_window_evidence(self, window_id: str) -> WindowFocusEvidence:
+        user32 = self._get_user32()
+        hwnd = _parse_hwnd(window_id)
+        if not bool(user32.IsWindow(hwnd)):
+            return WindowFocusEvidence(window_id=window_id, window_exists=False)
+        if bool(user32.IsIconic(hwnd)):
+            try:
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            except Exception:
+                pass
+
+        strategies = (
+            FocusStrategy.SET_FOREGROUND,
+            FocusStrategy.ATTACH_THREAD_INPUT,
+            FocusStrategy.ALT_NUDGE,
+        )
+        attempts = 0
+        last_error: str | None = None
+        strategy_used = FocusStrategy.NONE
+        for attempt in range(_FOCUS_MAX_ATTEMPTS):
+            strategy = strategies[min(attempt, len(strategies) - 1)]
+            attempts += 1
+            strategy_used = strategy
+            try:
+                self._apply_focus_strategy(user32, hwnd, strategy)
+            except Exception:
+                last_error = "focus_strategy_error"
+            foreground_hwnd = self._await_foreground(user32, hwnd)
+            if foreground_hwnd == hwnd:
+                return WindowFocusEvidence(
+                    window_id=window_id,
+                    window_exists=True,
+                    window_visible=bool(user32.IsWindowVisible(hwnd)),
+                    window_minimized=bool(user32.IsIconic(hwnd)),
+                    focus_requested=True,
+                    focus_strategy=strategy,
+                    foreground_window_id=f"hwnd-{hwnd}",
+                    foreground_process_id=self._pid_for_hwnd(user32, hwnd),
+                    target_process_id=self._pid_for_hwnd(user32, hwnd),
+                    attempts=attempts,
+                )
+            if foreground_hwnd == 0:
+                last_error = "no_foreground_window"
+
+        foreground_hwnd = int(user32.GetForegroundWindow() or 0)
+        return WindowFocusEvidence(
+            window_id=window_id,
+            window_exists=True,
+            window_visible=bool(user32.IsWindowVisible(hwnd)),
+            window_minimized=bool(user32.IsIconic(hwnd)),
+            focus_requested=True,
+            focus_error=last_error or "foreground_not_observed",
+            focus_strategy=strategy_used,
+            foreground_window_id=(f"hwnd-{foreground_hwnd}" if foreground_hwnd else None),
+            foreground_process_id=(
+                self._pid_for_hwnd(user32, foreground_hwnd) if foreground_hwnd else None
+            ),
+            target_process_id=self._pid_for_hwnd(user32, hwnd),
+            attempts=attempts,
+        )
+
+    @staticmethod
+    def _alt_nudge_allowed(clock: Callable[[], float] = time.monotonic) -> bool:
+        """Rate-limit the synthetic Alt injection used by the last strategy."""
+
+        global _last_alt_nudge_monotonic
+        with _alt_nudge_lock:
+            now = float(clock())
+            if now - _last_alt_nudge_monotonic < _ALT_NUDGE_MIN_INTERVAL_SECONDS:
+                return False
+            _last_alt_nudge_monotonic = now
+            return True
+
+    @staticmethod
+    def _apply_focus_strategy(
+        user32: Any,
+        hwnd: int,
+        strategy: FocusStrategy,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Apply one bounded activation route. Never raises on a refused request."""
+
+        if strategy is FocusStrategy.SET_FOREGROUND:
+            user32.SetForegroundWindow(hwnd)
+            return
+        if strategy is FocusStrategy.ATTACH_THREAD_INPUT:
+            kernel32 = None
+            try:
+                import ctypes
+
+                kernel32 = ctypes.windll.kernel32  # noqa: SLF001 - backend boundary
+            except Exception:
+                kernel32 = None
+            current_thread = int(kernel32.GetCurrentThreadId()) if kernel32 is not None else 0
+            fg_hwnd = int(user32.GetForegroundWindow() or 0)
+            fg_thread = int(user32.GetWindowThreadProcessId(fg_hwnd, None) or 0) if fg_hwnd else 0
+            target_thread = int(user32.GetWindowThreadProcessId(hwnd, None) or 0)
+            attached = False
+            if current_thread and fg_thread and fg_thread != current_thread:
+                try:
+                    attached = bool(user32.AttachThreadInput(current_thread, fg_thread, True))
+                except Exception:
+                    attached = False
+            try:
+                try:
+                    user32.BringWindowToTop(hwnd)
+                except Exception:
+                    pass
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    try:
+                        user32.AttachThreadInput(current_thread, fg_thread, False)
+                    except Exception:
+                        pass
+            del target_thread
+            return
+        if strategy is FocusStrategy.ALT_NUDGE:
+            # A synthetic Alt press makes Windows treat the caller as if the user
+            # had just interacted with it, which releases the foreground lock.
+            # It is global input, so it is only injected once per interval; the
+            # ordinary activation still runs when the nudge is withheld.
+            if Win32UiaBackend._alt_nudge_allowed(clock=clock):
+                try:
+                    user32.keybd_event(0x12, 0, 0, 0)  # VK_MENU down
+                    user32.keybd_event(0x12, 0, 0x0002, 0)  # KEYEVENTF_KEYUP
+                except Exception:
+                    pass
+            user32.SetForegroundWindow(hwnd)
+
+    @staticmethod
+    def _await_foreground(user32: Any, hwnd: int) -> int:
+        """Poll the foreground window briefly; activation is asynchronous."""
+
+        for _ in range(_FOCUS_VERIFY_CHECKS):
+            foreground = int(user32.GetForegroundWindow() or 0)
+            if foreground == hwnd:
+                return foreground
+            time.sleep(_FOCUS_VERIFY_DELAY_SECONDS)
+        return int(user32.GetForegroundWindow() or 0)
+
+    @staticmethod
+    def _pid_for_hwnd(user32: Any, hwnd: int) -> int | None:
+        if not hwnd:
+            return None
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        except Exception:
+            return None
+        value = int(pid.value)
+        return value if value > 0 else None
 
     @staticmethod
     def _focused_hwnd_for_window(user32: Any, window_hwnd: int) -> int | None:
@@ -1043,6 +1239,46 @@ class WindowsUiaProvider:
     async def focus_window(self, window_id: str) -> WindowRecord:
         validate_safe_token(window_id, "window_id")
         return await self._backend.focus_window(window_id)
+
+    async def focus_window_evidence(self, window_id: str) -> WindowFocusEvidence:
+        """Activate a window and report separable focus states.
+
+        Adapters that cannot report evidence fall back to the raising
+        ``focus_window`` contract: success then means "the backend observed the
+        window in foreground", and a refusal is reported as ``focus_error``
+        instead of being swallowed.
+        """
+
+        validate_safe_token(window_id, "window_id")
+        evidence_fn = getattr(self._backend, "focus_window_evidence", None)
+        if callable(evidence_fn):
+            evidence = await evidence_fn(window_id)
+            if isinstance(evidence, WindowFocusEvidence):
+                return evidence
+        try:
+            await self._backend.focus_window(window_id)
+        except ComputerAdapterError as exc:
+            return WindowFocusEvidence(
+                window_id=window_id,
+                window_exists=exc.code is not ComputerFailureCode.WINDOW_NOT_FOUND,
+                focus_requested=True,
+                focus_error=exc.code.value,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            return WindowFocusEvidence(
+                window_id=window_id,
+                window_exists=True,
+                focus_requested=True,
+                focus_error=type(exc).__name__[:64],
+            )
+        return WindowFocusEvidence(
+            window_id=window_id,
+            window_exists=True,
+            window_visible=True,
+            focus_requested=True,
+            focus_strategy=FocusStrategy.SET_FOREGROUND,
+            foreground_window_id=window_id,
+        )
 
     async def inspect_tree(
         self,

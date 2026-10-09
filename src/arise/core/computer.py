@@ -106,6 +106,8 @@ class ComputerFailureCode(StrEnum):
     INVALID_COORDINATE = "INVALID_COORDINATE"
     INVALID_TARGET = "INVALID_TARGET"
     INTERNAL_ADAPTER_ERROR = "INTERNAL_ADAPTER_ERROR"
+    FOCUS_FAILED = "FOCUS_FAILED"
+    LAUNCH_MODE_UNSUPPORTED = "LAUNCH_MODE_UNSUPPORTED"
 
 
 class ReconciliationStatus(StrEnum):
@@ -645,6 +647,94 @@ class WindowRecord:
             raise ValueError("window package family name exceeds the size limit")
         if self.aumid is not None and len(self.aumid) > 512:
             raise ValueError("window AUMID exceeds the size limit")
+
+
+class FocusStrategy(StrEnum):
+    """Which Windows activation route finally produced (or failed) foreground state."""
+
+    NONE = "none"
+    SET_FOREGROUND = "set_foreground"
+    ATTACH_THREAD_INPUT = "attach_thread_input"
+    ALT_NUDGE = "alt_nudge"
+
+
+@dataclass(frozen=True, slots=True)
+class WindowFocusEvidence:
+    """Separable focus states; a focus request is never accepted as its own proof.
+
+    ``window_exists``, ``window_visible``, ``foreground_window_id``,
+    ``focus_requested`` and ``focus_verified`` are distinct facts. Only a fresh
+    observation of the foreground window can set ``focus_verified``; an adapter
+    that cannot observe it must leave the value ``False`` rather than infer it
+    from a successful activation call.
+    """
+
+    window_id: str
+    window_exists: bool = False
+    window_visible: bool = False
+    window_minimized: bool = False
+    focus_requested: bool = False
+    focus_error: str | None = None
+    focus_strategy: FocusStrategy = FocusStrategy.NONE
+    foreground_window_id: str | None = None
+    foreground_process_id: int | None = None
+    target_process_id: int | None = None
+    attempts: int = 0
+
+    def __post_init__(self) -> None:
+        if not self.window_id.strip() or len(self.window_id) > 256:
+            raise ValueError("window_id must be non-empty and bounded")
+        if self.focus_error is not None and (
+            not self.focus_error.strip() or len(self.focus_error) > 64
+        ):
+            raise ValueError("focus error code must be bounded")
+        if not isinstance(self.focus_strategy, FocusStrategy):
+            raise ValueError("focus_strategy must be a FocusStrategy")
+        if self.attempts < 0 or self.attempts > 4096:
+            raise ValueError("focus attempt count is out of range")
+
+    @property
+    def focus_verified(self) -> bool:
+        """True only when a fresh observation saw this exact window in foreground."""
+
+        return (
+            self.focus_requested
+            and self.focus_error is None
+            and self.foreground_window_id is not None
+            and self.foreground_window_id == self.window_id
+        )
+
+    @property
+    def owner_matches_foreground(self) -> bool:
+        """True when the foreground window belongs to the target's owning process.
+
+        Chromium-style applications can present the intended top-level window
+        from a different process than the one that owns a sibling window, so this
+        is a weaker signal than :attr:`focus_verified` and is reported separately.
+        """
+
+        return (
+            self.foreground_process_id is not None
+            and self.target_process_id is not None
+            and self.foreground_process_id == self.target_process_id
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "window_id": self.window_id,
+            "window_exists": self.window_exists,
+            "window_visible": self.window_visible,
+            "window_minimized": self.window_minimized,
+            "focus_requested": self.focus_requested,
+            "focus_verified": self.focus_verified,
+            "focus_error": self.focus_error,
+            "focus_strategy": self.focus_strategy.value,
+            "foreground_window_id": self.foreground_window_id,
+            "foreground_process_id": self.foreground_process_id,
+            "target_process_id": self.target_process_id,
+            "owner_matches_foreground": self.owner_matches_foreground,
+            "attempts": self.attempts,
+        }
 
 
 @dataclass(frozen=True, slots=True)

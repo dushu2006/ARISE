@@ -162,8 +162,7 @@ def correction_instruction(category: str, detail: str) -> str:
     condition_guidance = ""
     type_guidance = ""
     if any(
-        marker in safe_detail
-        for marker in ("verification_checkpoint", "bool_type", "bool_parsing")
+        marker in safe_detail for marker in ("verification_checkpoint", "bool_type", "bool_parsing")
     ):
         type_guidance += (
             " Set steps[].verification_checkpoint to a JSON boolean true or false, "
@@ -172,11 +171,9 @@ def correction_instruction(category: str, detail: str) -> str:
     if any(marker in safe_detail for marker in ("fallback_policy", "model_type")):
         type_guidance += (
             " Set steps[].fallback_policy to an object such as "
-            "{\"strategy\":\"none\",\"fallback_action\":null,\"reason\":\"\"}, not a string."
+            '{"strategy":"none","fallback_action":null,"reason":""}, not a string.'
         )
-    if any(
-        marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")
-    ):
+    if any(marker in safe_detail for marker in (".preconditions", ".postconditions", ".condition")):
         condition_example = json.dumps(
             _condition_object_example(), ensure_ascii=False, separators=(",", ":")
         )
@@ -305,6 +302,13 @@ def _schema_lines() -> tuple[str, ...]:
         "the registered adapter actually observes. Do not use target presence, a tool return, or "
         "an assumed success as a substitute for the requested result. Never invent fact keys or "
         "expected values; if the requested result is not observable, ask for clarification.",
+        "- Current system.app_launch observation facts are: application.running, "
+        "process.running, process_id, window.open, window.visible, window.count, "
+        "window.foreground, application.focused. 'window.open'/'window.visible' prove an "
+        "observed visible window owned by the resolved application; "
+        "'application.focused' proves that application owns the foreground window. "
+        "Use application.focused equals true only when the request explicitly requires "
+        "focus; ordinary 'open X' is satisfied by window.open. "
         "- Current Windows UIA observation facts are: window.id, window.foreground, "
         "window.element_count, window.focused_element (the name of the first observed focused "
         "element, or null), display.topology_hash, uia.state_hash. The native Win32 backend can "
@@ -326,7 +330,7 @@ def _schema_lines() -> tuple[str, ...]:
         "- EXACT TYPES (these are not strings or descriptive labels): PlanStep.condition is "
         "null or a ConditionModel object; verification_checkpoint is a JSON boolean (true/false); "
         "fallback_policy is a StepFallbackPolicy object, never a strategy string. Its strategy "
-        "is exactly one of \"none\", \"fallback_action\", \"reground\", \"abort\" and its "
+        'is exactly one of "none", "fallback_action", "reground", "abort" and its '
         "fallback_action is null or an ActionProposal object.",
         "- Live field schemas (generated from the current Pydantic models; follow these exactly): "
         + json.dumps(
@@ -335,7 +339,8 @@ def _schema_lines() -> tuple[str, ...]:
                 "verification_checkpoint": _live_field_schema(PlanStep, "verification_checkpoint"),
                 "fallback_policy": _live_field_schema(PlanStep, "fallback_policy"),
             },
-            ensure_ascii=False, separators=(",", ":"),
+            ensure_ascii=False,
+            separators=(",", ":"),
         ),
         "- The ConditionModel JSON Schema below is generated from the live typed contract; "
         "unknown condition-object keys are rejected: "
@@ -407,8 +412,17 @@ def build_system_prompt(specs: Sequence[ToolSpec]) -> str:
         "fail closed rather than silently reusing or launching normally.",
         "18. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
         "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
-        "17. Every consequential action (proposed or tool-minimum risk R2+) needs at least one "
-        "action-specific, verifier-observable postcondition. Do not omit it or invent its fact.",
+        "19. Decompose a request that names several distinct applications or several "
+        "independent deliverables into one step per application or deliverable, each with its "
+        "own parameters, target, and postconditions. Do not fold unrelated applications or "
+        "artifacts into a single step, and do not invent a tool that performs the whole "
+        "request at once. Use depends_on only for ordering that the request actually requires.",
+        "20. Waiting is an action, not an assumption. When a step depends on long-running or "
+        "externally produced completion (another service, a download, a build, a slow "
+        "application state), propose system.wait_for_condition with a bounded timeout_seconds "
+        "and the observed fact that proves completion, then verify it with the postconditions. "
+        "Never propose a step that merely assumes the result arrived, and never claim that "
+        "external work completed because a previous step returned without an error.",
         "",
         *_schema_lines(),
         "",
