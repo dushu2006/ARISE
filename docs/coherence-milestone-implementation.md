@@ -391,8 +391,9 @@ only be confirmed on that machine (section F).
 
 ## B. Regressions found
 
-**None.** The full suite passed before and after every fix (602 → 620 tests, the delta
-being new tests). No existing test was weakened: the five `test_production_desktop_path`
+**None in the Arena gate.** The full suite passed before and after every fix (602 → 620
+tests, the delta being new tests). Real-Windows CI then found one genuine defect — see
+section G, which also records its fix. No existing test was weakened: the five `test_production_desktop_path`
 rewrites from the earlier stage were re-verified against the new contract, and no test in
 this review was changed to accommodate new behaviour.
 
@@ -523,3 +524,81 @@ refusal and strategy outcomes, real PWA shortcut representation and discovery, r
 launch/reuse/new-window semantics per application, ApplicationFrameHost identity for
 packaged apps, DOM/CDP access to the user's browser (still a gap, audit `#7`), audio
 device behaviour, and all timing/performance characteristics.
+
+## G. Regressions found by real-Windows CI after the PR was opened (fixed)
+
+Section B's "no regressions" claim held for the Arena gate. The first real-Windows
+execution of the suite (PR #14, `windows-latest` × Python 3.11 and 3.12) found one
+failure that Linux cannot produce, and it was **a product defect, not a flaky test**:
+
+```
+tests/test_production_desktop_path.py::test_preexisting_application_window_is_not_evidence_of_a_new_launch
+  Failed: DID NOT RAISE ComputerAdapterError
+```
+
+### Root cause
+
+`WindowsApplicationResolver._rank_fallback_matches` gave an explicitly registered alias
+priority over OS path fallbacks (`90` vs `80`) by testing **object identity**
+(`item is custom`). The review-stage change that advertises `--new-window` support from
+generic OS metadata rebuilds the fallback descriptors through
+`advertise_launch_capabilities`, so after that rebuild no descriptor is the original
+object: the alias silently fell back to `80`, tied with the `known_alias_path` /
+`registry_app_paths` / `PATH` candidates, and deduplication kept the OS-path descriptor
+— which carries the alias defaults (`allow_reuse=True`).
+
+Consequence on a real Windows host: an explicitly registered application's configuration
+(`allow_reuse`, launch arguments, web-app entry point) was discarded whenever the host
+registers a browser (i.e. on essentially every Windows machine), and a request that must
+spawn a new instance reused the pre-existing window instead. Invisible on Linux, where
+the registered-browser list is empty and the rebuild is skipped.
+
+Reproduced deterministically by emulating the host metadata (environment variables, App
+Paths, `PATH`, registered-browser list) — verified across four host states, before and
+after the fix.
+
+### Fix
+
+`src/arise/adapters/windows_app_launch.py` (+23/-8): the registered-alias flag is
+captured **before** capability advertising and carried through the rebuild as a
+`(descriptor, is_registered_alias)` pair, so the alias keeps score `90` and wins against
+OS path fallbacks on every host. Canonical identity was deliberately *not* used as the
+marker: a path fallback can resolve to the very same executable, which would tie again.
+Generic capability advertising is unchanged — the resolved application still advertises
+`new_window_supported` from OS metadata.
+
+### Tests added (2, in `tests/test_production_desktop_path.py`)
+
+* `test_registered_alias_keeps_its_configuration_when_host_registers_a_browser` — the
+  alias' `allow_reuse=False` survives on a host that registers the browser, and the
+  generic `--new-window` capability still applies.
+* `test_preexisting_window_is_not_reused_when_host_registers_a_browser` — full
+  launch/verify contract (no reuse, spawn attempted, `ACTION_VERIFICATION_FAILED`) with
+  the host pinned; this is the CI failure reproduced on demand.
+
+Both **fail without the fix** (the second with the exact CI message, `DID NOT RAISE`)
+and pass with it. A new `_emulate_browser_host()` helper pins the OS metadata the
+resolver reads, so no test in this file depends on whether Chrome is installed on the
+machine running the suite. These are fakes: they do not exercise Win32, COM, PowerShell
+or the registry.
+
+### Validation (Arena, after the fix)
+
+```
+$ .venv/bin/python -m pytest -q
+622 passed, 1 skipped, 140 subtests passed in 42.65s
+
+$ .venv/bin/python -m ruff check src/arise tests scripts
+All checks passed!
+$ .venv/bin/python -m ruff format --check src/arise tests scripts
+109 files already formatted
+$ .venv/bin/python -m compileall -q src tests scripts
+exit 0
+```
+
+**Arena-verified:** the resolution logic, the ranking/dedup precedence, the two new
+regression tests, and that they fail without the fix.
+
+**Windows-only pending:** that real Windows metadata (registered-browser list, App Paths,
+Start Menu) produces the same descriptor set this emulation assumes. The Windows CI run
+of the suite remains the only real-Windows evidence, and it is the gate for this fix.

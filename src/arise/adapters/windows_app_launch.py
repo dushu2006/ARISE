@@ -633,16 +633,25 @@ class WindowsApplicationResolver:
         custom = self._custom_aliases.get(normalize_application_name(clean_name))
         if custom is not None:
             descriptors.append(custom)
+        # The registered-alias flag is captured before capability advertising because
+        # that step returns new descriptor objects. Losing the flag here silently
+        # handed resolution to an OS-path fallback on any host that registers a
+        # browser, discarding the alias' explicit configuration (``allow_reuse``,
+        # launch arguments, ...); canonical identity is not a safe substitute
+        # because a path fallback can resolve to the very same executable.
+        ranked: list[tuple[ApplicationDescriptor, bool]] = [
+            (item, item is custom) for item in descriptors
+        ]
 
         # Generic launch-mode capabilities come from OS metadata, not app names, so
         # alias/App Paths/PATH resolutions advertise the same capabilities as the
         # catalog does.
-        if descriptors:
+        if ranked:
             browsers = registered_browser_executables()
             if browsers:
-                descriptors = [
-                    advertise_launch_capabilities(item, browser_executables=browsers)
-                    for item in descriptors
+                ranked = [
+                    (advertise_launch_capabilities(item, browser_executables=browsers), is_custom)
+                    for item, is_custom in ranked
                 ]
 
         # Fallbacks are intentionally lower priority than installed catalog metadata;
@@ -650,10 +659,10 @@ class WindowsApplicationResolver:
         return [
             _RankedApplication(
                 item,
-                90 if item is custom else 80,
-                "registered_alias_exact" if item is custom else f"{item.source}_exact",
+                90 if is_custom else 80,
+                "registered_alias_exact" if is_custom else f"{item.source}_exact",
             )
-            for item in descriptors
+            for item, is_custom in ranked
         ]
 
     @staticmethod

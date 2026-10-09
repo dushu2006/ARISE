@@ -1,7 +1,9 @@
 """Composition inspection and FAKE-backend regressions, not live Windows evidence."""
 
 import json
+import os
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from typing import Any
 from unittest.mock import patch
@@ -13,7 +15,10 @@ from test_windows_uia_and_perception import FakeUiaBackend
 
 from arise.adapters.memory import InMemoryEnvironment, SetFactTool
 from arise.adapters.secrets import MemorySecretProvider
-from arise.adapters.windows_app_discovery import WindowsApplicationCatalog
+from arise.adapters.windows_app_discovery import (
+    WindowsApplicationCatalog,
+    normalized_executable_key,
+)
 from arise.adapters.windows_app_launch import (
     ResolvedApplication,
     Win32AppLaunchBackend,
@@ -386,6 +391,110 @@ async def test_preexisting_application_window_is_not_evidence_of_a_new_launch():
         await provider.launch_application("chrome", timeout_seconds=2)
 
     # A pre-existing Chrome process/window and an unrelated foreground window prove nothing.
+    assert failure.value.code is ComputerFailureCode.ACTION_VERIFICATION_FAILED
+    assert backend.launched_paths == [CHROME_EXE]
+    assert "hwnd-existing-chrome" not in backend.focus_calls
+
+
+# ---------------------------------------------------------------------------------
+# Host-state emulation.
+#
+# The fallback resolution path reads OS metadata: environment variables, the App
+# Paths registry, ``PATH``, and the list of applications Windows registers as
+# browsers. Tests that touch it must not depend on whether Chrome is installed on
+# the machine running the suite, so the metadata is pinned here. These are fakes:
+# they do not exercise Win32, COM, PowerShell or the registry, and they are not
+# Windows evidence -- they only make the outcome host-independent.
+# ---------------------------------------------------------------------------------
+
+_LAUNCH_MODULE = "arise.adapters.windows_app_launch"
+
+
+@contextmanager
+def _emulate_browser_host():
+    """Emulate a Windows host on which the browser above is installed and registered."""
+
+    real_isfile, real_expandvars = os.path.isfile, os.path.expandvars
+
+    def _expandvars(value: str) -> str:
+        expanded = (
+            value.replace("%ProgramFiles(x86)%", r"C:\Program Files (x86)")
+            .replace("%ProgramFiles%", r"C:\Program Files")
+            .replace("%LocalAppData%", r"C:\Users\tester\AppData\Local")
+        )
+        return real_expandvars(expanded)
+
+    def _isfile(value: str) -> bool:
+        return value == CHROME_EXE or real_isfile(value)
+
+    with ExitStack() as stack:
+        stack.enter_context(patch(f"{_LAUNCH_MODULE}.sys.platform", "win32"))
+        stack.enter_context(patch(f"{_LAUNCH_MODULE}.os.path.isfile", _isfile))
+        stack.enter_context(patch(f"{_LAUNCH_MODULE}.os.path.expandvars", _expandvars))
+        stack.enter_context(patch(f"{_LAUNCH_MODULE}.shutil.which", lambda _candidate: None))
+        stack.enter_context(
+            patch(
+                f"{_LAUNCH_MODULE}.registered_browser_executables",
+                lambda: frozenset({normalized_executable_key(CHROME_EXE)}),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                WindowsApplicationResolver,
+                "_query_windows_app_paths_candidates",
+                lambda _self, _alias, _name: (CHROME_EXE,),
+            )
+        )
+        yield
+
+
+@pytest.mark.asyncio
+async def test_registered_alias_keeps_its_configuration_when_host_registers_a_browser():
+    """An explicitly registered alias outranks OS path fallbacks on any host.
+
+    Capability advertising (``--new-window`` for applications Windows registers as
+    browsers) rebuilds the fallback descriptors. That rebuild must not demote a
+    registered alias to the same score as a path fallback: the fallback carries the
+    alias defaults and would silently override the registered configuration. This
+    is host-independent by construction, not Windows evidence.
+    """
+
+    with _emulate_browser_host():
+        resolver = _empty_catalog_resolver()
+        resolver.register_alias(
+            "chrome",
+            ResolvedApplication(
+                name="Google Chrome",
+                executable_path=CHROME_EXE,
+                process_names=("chrome.exe",),
+                allow_reuse=False,
+            ),
+        )
+        descriptor = resolver.resolve("chrome")
+
+    assert descriptor.allow_reuse is False
+    assert descriptor.executable_path == CHROME_EXE
+    # Generic capability advertising still applies; only the alias' priority changed.
+    assert descriptor.new_window_supported is True
+
+
+@pytest.mark.asyncio
+async def test_preexisting_window_is_not_reused_when_host_registers_a_browser():
+    """Same contract as the reuse-refusal test above, with the host pinned.
+
+    The reusable behaviour of an application is configuration, not ambient host
+    state: a host that registers the same executable as a browser must not turn a
+    ``allow_reuse=False`` alias back into a reuse.
+    """
+
+    backend, provider, _ = multi_process_fixture(allow_reuse=False)
+    browser_pid = backend.add_process(7100, CHROME_EXE)
+    backend.add_window("hwnd-existing-chrome", browser_pid)
+
+    with _emulate_browser_host():
+        with pytest.raises(ComputerAdapterError) as failure:
+            await provider.launch_application("chrome", timeout_seconds=2)
+
     assert failure.value.code is ComputerFailureCode.ACTION_VERIFICATION_FAILED
     assert backend.launched_paths == [CHROME_EXE]
     assert "hwnd-existing-chrome" not in backend.focus_calls
